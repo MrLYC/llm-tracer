@@ -1,0 +1,1347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM-Tracer · eBPF 大模型通信与会话串联观测台</title>
+  <style>
+    :root {
+      --bg-base: #0b0f14;
+      --bg-panel: #111720;
+      --bg-card: #161e2a;
+      --bg-elevated: #1c2635;
+      --border: #253244;
+      --border-strong: #354760;
+      --text-main: #e6edf5;
+      --text-muted: #8b9bb0;
+      --text-dim: #5d6e84;
+      --amber: #f59e0b;
+      --amber-soft: rgba(245, 158, 11, 0.14);
+      --teal: #10b981;
+      --teal-soft: rgba(16, 185, 129, 0.14);
+      --cyan: #06b6d4;
+      --cyan-soft: rgba(6, 182, 212, 0.14);
+      --coral: #f43f5e;
+      --coral-soft: rgba(244, 63, 94, 0.15);
+      --mono: "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--sans);
+      background-color: var(--bg-base);
+      background-image:
+        radial-gradient(circle at 12% 0%, rgba(245, 158, 11, 0.06), transparent 35%),
+        radial-gradient(circle at 88% 100%, rgba(16, 185, 129, 0.06), transparent 35%),
+        linear-gradient(rgba(37, 50, 68, 0.18) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(37, 50, 68, 0.18) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 28px 28px, 28px 28px;
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    /* Top Header */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 18px;
+      background: rgba(17, 23, 32, 0.92);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+      gap: 14px;
+      flex-shrink: 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .brand-mark {
+      width: 12px;
+      height: 24px;
+      background: linear-gradient(180deg, var(--amber), var(--teal));
+      border-radius: 3px;
+      box-shadow: 0 0 12px rgba(245, 158, 11, 0.45);
+    }
+    .brand-title {
+      font-family: var(--mono);
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.4px;
+      color: var(--text-main);
+    }
+    .brand-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      padding-left: 8px;
+      border-left: 1px solid var(--border);
+    }
+    .top-badges {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .pill {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 9px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .pill.live { border-color: rgba(16,185,129,0.4); color: var(--teal); background: var(--teal-soft); }
+    .pill.amber { border-color: rgba(245,158,11,0.4); color: var(--amber); background: var(--amber-soft); }
+    .pill.coral { border-color: rgba(244,63,94,0.4); color: var(--coral); background: var(--coral-soft); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
+    .btn {
+      font-family: var(--sans);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover { border-color: var(--amber); color: var(--amber); }
+    .btn.primary { background: var(--amber); color: #0b0f14; border-color: var(--amber); }
+    .btn.primary:hover { filter: brightness(1.08); }
+    .btn.danger { border-color: rgba(244,63,94,0.5); color: var(--coral); }
+
+    /* Timeline Bar */
+    .timeline-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 8px 18px;
+      background: #0e141c;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .tl-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--amber);
+      white-space: nowrap;
+    }
+    .tl-presets {
+      display: flex;
+      gap: 4px;
+    }
+    .tl-preset {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .tl-preset.active {
+      background: var(--amber-soft);
+      color: var(--amber);
+      border-color: var(--amber);
+    }
+    .tl-scrubber {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      position: relative;
+    }
+    .tl-histogram {
+      height: 18px;
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      padding: 0 2px;
+    }
+    .tl-bar {
+      flex: 1;
+      background: rgba(139, 155, 176, 0.22);
+      min-height: 2px;
+      border-radius: 1px 1px 0 0;
+      transition: background 0.15s;
+    }
+    .tl-bar.in-window { background: var(--amber); }
+    .tl-slider-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .tl-slider-row input[type=range] {
+      flex: 1;
+      accent-color: var(--amber);
+      height: 4px;
+      cursor: pointer;
+    }
+    .tl-range-text {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      min-width: 245px;
+      text-align: right;
+    }
+
+    /* Main 3-Column Workspace */
+    .workspace {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 330px 1fr 410px;
+      overflow: hidden;
+    }
+    @media (max-width: 1200px) {
+      .workspace { grid-template-columns: 280px 1fr 340px; }
+    }
+    .pane {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .pane:last-child { border-right: none; }
+    .pane-header {
+      padding: 10px 14px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .pane-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .search-row {
+      display: flex;
+      gap: 6px;
+    }
+    .input, select.input {
+      background: var(--bg-base);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 6px 9px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-family: var(--sans);
+      width: 100%;
+    }
+    .input:focus { outline: none; border-color: var(--amber); }
+    .pane-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px;
+    }
+
+    /* Left Session List */
+    .sess-card {
+      padding: 11px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: all 0.14s ease;
+    }
+    .sess-card:hover { border-color: var(--border-strong); background: var(--bg-card); }
+    .sess-card.active {
+      border-color: var(--amber);
+      background: linear-gradient(90deg, rgba(245, 158, 11, 0.1), var(--bg-card));
+    }
+    .sess-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-main);
+      margin-bottom: 6px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .sess-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .proto-tag {
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+    .proto-systemone { background: var(--amber-soft); color: var(--amber); border: 1px solid rgba(245,158,11,0.4); }
+    .proto-openai_chat, .proto-openai_responses { background: var(--teal-soft); color: var(--teal); border: 1px solid rgba(16,185,129,0.4); }
+    .proto-anthropic { background: rgba(249, 115, 22, 0.16); color: #fb923c; border: 1px solid rgba(249,115,22,0.4); }
+    .proto-gemini, .proto-ollama { background: var(--cyan-soft); color: var(--cyan); border: 1px solid rgba(6,182,212,0.4); }
+
+    /* Center Event Timeline */
+    .event-card {
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--bg-panel);
+      margin-bottom: 12px;
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+    .event-card:hover { border-color: var(--border-strong); }
+    .event-card.selected { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(245,158,11,0.35); }
+    .event-card.child-corr { margin-left: 22px; border-left: 3px solid var(--cyan); }
+    .event-head {
+      padding: 9px 13px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+    }
+    .event-head-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .step-badge {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 3px;
+      background: var(--bg-elevated);
+      color: var(--amber);
+      border: 1px solid var(--border-strong);
+    }
+    .corr-badge {
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(6, 182, 212, 0.12);
+      color: var(--cyan);
+    }
+    .event-body {
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* SystemOne JEV Step View */
+    .s1-page-box {
+      padding: 8px 10px;
+      border-radius: 5px;
+      background: var(--bg-base);
+      border: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .s1-url { font-family: var(--mono); color: var(--cyan); font-size: 11px; word-break: break-all; }
+    .s1-decision-banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 8px 11px;
+      border-radius: 5px;
+      background: rgba(245, 158, 11, 0.09);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .s1-op { font-weight: 700; color: var(--amber); }
+    .s1-q-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .s1-q-box {
+      background: var(--bg-base);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 9px 11px;
+    }
+    .s1-q-header {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .prob-row {
+      margin-bottom: 5px;
+      font-size: 11px;
+    }
+    .prob-label-line {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      margin-bottom: 2px;
+      gap: 6px;
+    }
+    .prob-opt-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text-main);
+    }
+    .prob-bar-bg {
+      height: 6px;
+      background: var(--bg-elevated);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .prob-bar-fill {
+      height: 100%;
+      background: var(--cyan);
+      border-radius: 3px;
+    }
+    .prob-bar-fill.winner { background: var(--amber); }
+
+    /* Chat Turn View */
+    .prefix-fold {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 10px;
+      background: var(--bg-base);
+      border: 1px dashed var(--border-strong);
+      border-radius: 4px;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .msg-bubble {
+      padding: 8px 11px;
+      border-radius: 5px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--border);
+    }
+    .msg-user { background: rgba(6, 182, 212, 0.08); border-color: rgba(6, 182, 212, 0.3); }
+    .msg-assistant { background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.3); }
+    .msg-thinking {
+      background: rgba(245, 158, 11, 0.06);
+      border-color: rgba(245, 158, 11, 0.25);
+      color: var(--text-muted);
+      font-family: var(--mono);
+      font-size: 11.5px;
+    }
+    .msg-role {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+      color: var(--text-muted);
+    }
+
+    /* Right Inspector */
+    .kv-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      margin-bottom: 12px;
+    }
+    .kv-table td {
+      padding: 5px 6px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      word-break: break-all;
+    }
+    .kv-table td:first-child {
+      color: var(--text-muted);
+      width: 105px;
+      white-space: nowrap;
+    }
+    pre.code-block {
+      background: var(--bg-base);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 10px;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--text-main);
+      overflow-x: auto;
+      max-height: 320px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 8, 12, 0.78);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      width: 720px;
+      max-width: 94vw;
+      max-height: 86vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+    }
+    .modal-header {
+      padding: 13px 16px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .modal-body {
+      padding: 16px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .empty-state {
+      padding: 36px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-title">LLM-TRACER</div>
+      <div class="brand-sub">eCapture / uprobe 多协议大模型通信与会话串联</div>
+    </div>
+    <div class="top-badges">
+      <span id="sseStatusPill" class="pill live"><span class="dot"></span>SSE 实时流已连接</span>
+      <span id="headerPrivacyPill" class="pill amber">请求头: 默认不记录(防凭据泄露)</span>
+      <button class="btn" onclick="openScopeModal()">范围与探针 (<span id="probeCountText">0</span>)</button>
+      <button class="btn" onclick="openSelfmonModal()">
+        自监控 OK:<span id="smOkCount" style="color:var(--teal)">0</span>
+        异常:<span id="smErrCount" style="color:var(--coral)">0</span>
+      </button>
+      <button class="btn danger" onclick="openCleanModal()">清理缓存</button>
+    </div>
+  </header>
+
+  <!-- 10-Minute Default Time-Window & Interactive Timeline Slider -->
+  <section class="timeline-bar">
+    <div class="tl-label">时间窗按需加载</div>
+    <div class="tl-presets">
+      <button class="tl-preset active" data-win="600000" onclick="selectWindowPreset(600000, this)">最近10分钟(默认)</button>
+      <button class="tl-preset" data-win="1800000" onclick="selectWindowPreset(1800000, this)">30分钟</button>
+      <button class="tl-preset" data-win="3600000" onclick="selectWindowPreset(3600000, this)">1小时</button>
+      <button class="tl-preset" data-win="21600000" onclick="selectWindowPreset(21600000, this)">6小时</button>
+      <button class="tl-preset" data-win="0" onclick="selectWindowPreset(0, this)">全部历史</button>
+    </div>
+    <div class="tl-scrubber">
+      <div id="tlHistogram" class="tl-histogram"></div>
+      <div class="tl-slider-row">
+        <button class="tl-preset" onclick="shiftTimeline(-0.5)" title="向过去滑动">◀ 较早</button>
+        <input id="tlEndSlider" type="range" min="0" max="1000" value="1000" oninput="onTimelineSlide(this.value)" />
+        <button class="tl-preset" onclick="shiftTimeline(0.5)" title="向现在滑动">较新 ▶</button>
+      </div>
+    </div>
+    <div id="tlRangeLabel" class="tl-range-text">窗口: 最近 10 分钟 (实时跟随)</div>
+  </section>
+
+  <!-- Main 3-Pane Workspace -->
+  <main class="workspace">
+    <!-- Left: Correlated Sessions -->
+    <section class="pane">
+      <div class="pane-header">
+        <div class="pane-title-row">
+          <span>会话流列表 (<span id="sessionCount">0</span>)</span>
+          <button class="tl-preset" onclick="refreshAll()">刷新</button>
+        </div>
+        <div class="search-row">
+          <select id="protoFilter" class="input" style="width: 120px" onchange="loadSessions()">
+            <option value="">全部协议</option>
+            <option value="systemone">SystemOne (JEV)</option>
+            <option value="openai_chat">OpenAI Chat</option>
+            <option value="openai_responses">Responses API</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="gemini">Gemini</option>
+            <option value="ollama">Ollama</option>
+          </select>
+          <input id="pidFilter" class="input" style="width: 72px" placeholder="PID" oninput="debounceLoadSessions()" />
+          <input id="keywordFilter" class="input" placeholder="过滤进程 / Goal / 关键词..." oninput="debounceLoadSessions()" />
+        </div>
+      </div>
+      <div id="sessionList" class="pane-body"></div>
+    </section>
+
+    <!-- Center: Session Correlated Timeline -->
+    <section class="pane">
+      <div class="pane-header">
+        <div class="pane-title-row">
+          <span id="activeSessionHeader">会话串联时间线</span>
+          <span id="activeSessionStats" style="font-family:var(--mono);font-size:11px;"></span>
+        </div>
+      </div>
+      <div id="timelineEvents" class="pane-body">
+        <div class="empty-state">在左侧选择一个会话，或等待本机程序发起大模型 / SystemOne 请求...</div>
+      </div>
+    </section>
+
+    <!-- Right: Event Raw & Process Inspector -->
+    <section class="pane">
+      <div class="pane-header">
+        <div class="pane-title-row">
+          <span>单次通信与进程上下文详情</span>
+          <span id="inspectorEventId" style="font-family:var(--mono);font-size:11px;color:var(--amber)"></span>
+        </div>
+      </div>
+      <div id="inspectorBody" class="pane-body">
+        <div class="empty-state">点击中间时间线中的任意 Step / Turn 卡片查看进程树、串联依据与原始报文。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Self-Monitoring Modal -->
+  <div id="selfmonModal" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-header">
+        <span>自监控中心 (探针 / 进程树 / 流重组 / 解析 / 串联 / 存储 全记录)</span>
+        <button class="btn" onclick="closeModal('selfmonModal')">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <select id="smStatusFilter" class="input" style="width:130px" onchange="loadSelfmon()">
+            <option value="">全部状态</option>
+            <option value="ok">成功 (OK)</option>
+            <option value="warn">警告 (Warn)</option>
+            <option value="error">异常 (Error)</option>
+          </select>
+          <select id="smStageFilter" class="input" style="width:150px" onchange="loadSelfmon()">
+            <option value="">全部模块</option>
+            <option value="probe">probe (探针)</option>
+            <option value="tracker">tracker (进程树)</option>
+            <option value="stream">stream (流重组)</option>
+            <option value="parser">parser (协议解析)</option>
+            <option value="correlator">correlator (串联)</option>
+            <option value="store">store (存储清理)</option>
+            <option value="auth">auth (认证)</option>
+          </select>
+          <button class="btn" onclick="loadSelfmon()">刷新记录</button>
+        </div>
+        <div id="smStageSummary" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+        <div id="smEventList" style="max-height:420px;overflow-y:auto;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scope & Probes Modal -->
+  <div id="scopeModal" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-header">
+        <span>抓取范围过滤与 eCapture/ELF 探针状态</span>
+        <button class="btn" onclick="closeModal('scopeModal')">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div style="font-size:12px;color:var(--text-muted)">已解析探针目标 (OpenSSL / GoTLS):</div>
+        <div id="probeTargetsBox" style="font-family:var(--mono);font-size:11px;background:var(--bg-base);padding:10px;border-radius:5px;border:1px solid var(--border)"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">指定 PID (逗号分隔):</label>
+            <input id="scopePids" class="input" placeholder="如 12345, 23456" />
+          </div>
+          <div style="display:flex;align-items:flex-end;gap:14px;padding-bottom:4px;">
+            <label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="scopePidOnly" /> 仅抓取指定 PID 本身 (不抓子进程)
+            </label>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">二进制路径 (--exe):</label>
+            <input id="scopeExes" class="input" placeholder="如 /usr/bin/python3" />
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">工作目录 (--cwd):</label>
+            <input id="scopeCwds" class="input" placeholder="如 /home/user/project" />
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">命令特征 (--cmd):</label>
+            <input id="scopeCmds" class="input" placeholder="如 jev-release, codex, claude" />
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--text-muted)">目标域名 (--host):</label>
+            <input id="scopeHosts" class="input" placeholder="如 api.bamboonode.dev" />
+          </div>
+        </div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--amber)">
+          <input type="checkbox" id="scopeRecordHeaders" /> 记录 HTTP 请求/响应头 (默认关闭，开启后可能包含凭据)
+        </label>
+        <div style="display:flex;justify-content:flex-end;gap:8px;">
+          <button class="btn primary" onclick="saveScope()">应用范围配置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Clean Cache Modal -->
+  <div id="cleanModal" class="modal-backdrop">
+    <div class="modal" style="width:480px">
+      <div class="modal-header">
+        <span>清理本地文件缓存</span>
+        <button class="btn" onclick="closeModal('cleanModal')">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label style="font-size:12px;color:var(--text-muted)">清理范围:</label>
+          <select id="cleanOlderThan" class="input" style="margin-top:4px;">
+            <option value="10m">早于 10 分钟的数据</option>
+            <option value="1h">早于 1 小时的数据</option>
+            <option value="24h" selected>早于 24 小时的数据</option>
+            <option value="ALL">全部缓存数据 (--all)</option>
+          </select>
+        </div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="cleanIncludeSelfmon" /> 同时清理自监控历史日志
+        </label>
+        <div id="cleanResultBox" style="font-family:var(--mono);font-size:11.5px;color:var(--teal);min-height:20px;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;">
+          <button class="btn" onclick="runCleanCache(true)">Dry-Run 预览</button>
+          <button class="btn danger" onclick="runCleanCache(false)">确认删除</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOTP Login Modal -->
+  <div id="totpModal" class="modal-backdrop">
+    <div class="modal" style="width:390px">
+      <div class="modal-header">
+        <span>TOTP 动态码认证</span>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:12.5px;color:var(--text-muted)">当前实例已开启 TOTP 保护，请输入 6 位动态验证码：</p>
+        <input id="totpCodeInput" class="input" placeholder="6 位数字验证码" maxlength="6" style="font-family:var(--mono);font-size:18px;text-align:center;letter-spacing:4px;" onkeydown="if(event.key==='Enter')submitTOTP()" />
+        <div id="totpErrorBox" style="color:var(--coral);font-size:12px;min-height:18px;"></div>
+        <button class="btn primary" style="justify-content:center;" onclick="submitTOTP()">验证并进入</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let state = {
+      windowMs: 600000, // Default 10 minutes
+      liveFollow: true,
+      minTs: Date.now() - 600000,
+      maxTs: Date.now(),
+      customTo: 0,
+      sessions: [],
+      activeSessionId: null,
+      activeEvents: [],
+      selectedEventId: null,
+      unfoldedPrefixes: {},
+    };
+    let searchTimer = null;
+
+    async function apiFetch(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (res.status === 401) {
+        document.getElementById('totpModal').classList.add('open');
+        throw new Error('unauthorized');
+      }
+      return res.json();
+    }
+
+    async function initApp() {
+      const auth = await fetch('/api/auth/status').then(r => r.json());
+      if (auth.totp_enabled && !auth.authenticated) {
+        document.getElementById('totpModal').classList.add('open');
+        return;
+      }
+      await refreshAll();
+      loadScopeInfo();
+      loadSelfmonStats();
+      connectSSE();
+    }
+
+    async function submitTOTP() {
+      const code = document.getElementById('totpCodeInput').value.trim();
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({code})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        document.getElementById('totpErrorBox').textContent = data.error || '验证失败';
+        return;
+      }
+      document.getElementById('totpModal').classList.remove('open');
+      initApp();
+    }
+
+    function getActiveTimeRange() {
+      const now = Date.now();
+      const to = state.liveFollow ? now + 2000 : state.customTo;
+      if (state.windowMs === 0) {
+        return { from: Math.max(1, state.minTs - 1000), to };
+      }
+      return { from: to - state.windowMs, to };
+    }
+
+    async function refreshAll() {
+      await loadTimeline();
+      await loadSessions();
+      if (state.activeSessionId) {
+        await selectSession(state.activeSessionId, true);
+      }
+    }
+
+    async function loadTimeline() {
+      try {
+        const tl = await apiFetch('/api/timeline?buckets=40');
+        state.minTs = tl.min_ts;
+        state.maxTs = Math.max(tl.max_ts, Date.now());
+        renderHistogram(tl.buckets || []);
+        updateRangeLabel();
+      } catch (_) {}
+    }
+
+    function renderHistogram(buckets) {
+      const box = document.getElementById('tlHistogram');
+      const maxCount = Math.max(1, ...buckets.map(b => b.count || 0));
+      const range = getActiveTimeRange();
+      box.innerHTML = buckets.map(b => {
+        const h = Math.max(2, Math.round((b.count / maxCount) * 18));
+        const inWin = b.end_ts >= range.from && b.start_ts <= range.to;
+        return `<div class="tl-bar ${inWin ? 'in-window' : ''}" style="height:${h}px" title="${fmtTime(b.start_ts)}: ${b.count} 事件"></div>`;
+      }).join('');
+    }
+
+    function selectWindowPreset(winMs, btn) {
+      document.querySelectorAll('.tl-presets .tl-preset').forEach(el => el.classList.remove('active'));
+      btn.classList.add('active');
+      state.windowMs = winMs;
+      state.liveFollow = true;
+      document.getElementById('tlEndSlider').value = 1000;
+      refreshAll();
+    }
+
+    function onTimelineSlide(val) {
+      const ratio = Number(val) / 1000;
+      if (ratio >= 0.99) {
+        state.liveFollow = true;
+      } else {
+        state.liveFollow = false;
+        const span = Math.max(60000, state.maxTs - state.minTs);
+        state.customTo = Math.round(state.minTs + span * ratio);
+      }
+      updateRangeLabel();
+      debounceLoadSessions();
+    }
+
+    function shiftTimeline(factor) {
+      const step = (state.windowMs || 600000) * factor;
+      const curTo = state.liveFollow ? Date.now() : state.customTo;
+      const nextTo = Math.min(Date.now(), Math.max(state.minTs + 60000, curTo + step));
+      state.liveFollow = nextTo >= Date.now() - 3000;
+      state.customTo = nextTo;
+      updateRangeLabel();
+      refreshAll();
+    }
+
+    function updateRangeLabel() {
+      const r = getActiveTimeRange();
+      const lbl = document.getElementById('tlRangeLabel');
+      if (state.liveFollow && state.windowMs === 600000) {
+        lbl.textContent = `窗口: 最近 10 分钟 (实时跟随)`;
+      } else {
+        lbl.textContent = `${fmtTime(r.from)} ~ ${state.liveFollow ? '现在(Live)' : fmtTime(r.to)}`;
+      }
+    }
+
+    function debounceLoadSessions() {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        loadSessions();
+        if (state.activeSessionId) selectSession(state.activeSessionId, true);
+      }, 180);
+    }
+
+    async function loadSessions() {
+      const r = getActiveTimeRange();
+      const proto = document.getElementById('protoFilter').value;
+      const pid = (document.getElementById('pidFilter')?.value || '').trim();
+      const q = document.getElementById('keywordFilter').value.trim();
+      const url = `/api/sessions?from=${r.from}&to=${r.to}&protocol=${encodeURIComponent(proto)}&pid=${encodeURIComponent(pid)}&q=${encodeURIComponent(q)}`;
+      const data = await apiFetch(url);
+      state.sessions = data.sessions || [];
+      document.getElementById('sessionCount').textContent = state.sessions.length;
+      renderSessionList();
+      if (!state.activeSessionId && state.sessions.length > 0) {
+        selectSession(state.sessions[0].id, true);
+      }
+    }
+
+    function renderSessionList() {
+      const box = document.getElementById('sessionList');
+      if (!state.sessions.length) {
+        box.innerHTML = `<div class="empty-state">当前时间窗口内暂无会话。<br/>可拖动顶部时间轴滑块加载更早的历史分片。</div>`;
+        return;
+      }
+      box.innerHTML = state.sessions.map(s => {
+        const active = s.id === state.activeSessionId ? 'active' : '';
+        const protos = (s.protocols || [s.primary_protocol]).map(p =>
+          `<span class="proto-tag proto-${esc(p)}">${esc(p)}</span>`
+        ).join('');
+        const countText = s.step_count > 0 ? `${s.step_count} Steps` : `${s.turn_count} Turns`;
+        return `
+          <div class="sess-card ${active}" onclick="selectSession('${esc(s.id)}')">
+            <div class="sess-title">${esc(s.title || s.id)}</div>
+            <div class="sess-meta">
+              ${protos}
+              <span>PID:${s.root_pid || '-'} (${esc(s.root_comm || 'proc')})</span>
+              <span>${countText} / ${s.event_count} reqs</span>
+              <span>${s.total_duration_ms}ms</span>
+              <span>${fmtTime(s.updated_at)}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function selectSession(id, keepSelectedEvent = false) {
+      state.activeSessionId = id;
+      renderSessionList();
+      const r = getActiveTimeRange();
+      const data = await apiFetch(`/api/sessions/${encodeURIComponent(id)}?from=${r.from}&to=${r.to}`);
+      const sess = data.session;
+      state.activeEvents = data.events || [];
+      document.getElementById('activeSessionHeader').textContent = `${sess.title || sess.id}`;
+      document.getElementById('activeSessionStats').textContent =
+        `PID ${sess.root_pid} (${sess.root_comm || '-'}) · ${state.activeEvents.length} 事件 · 耗时 ${sess.total_duration_ms}ms`;
+      renderTimelineEvents();
+      if (!keepSelectedEvent || !state.selectedEventId) {
+        if (state.activeEvents.length > 0) {
+          inspectEvent(state.activeEvents[state.activeEvents.length - 1].id);
+        }
+      } else {
+        inspectEvent(state.selectedEventId);
+      }
+    }
+
+    function renderTimelineEvents() {
+      const box = document.getElementById('timelineEvents');
+      if (!state.activeEvents.length) {
+        box.innerHTML = `<div class="empty-state">该会话在当前时间窗内无事件，拖动时间轴可加载更早记录。</div>`;
+        return;
+      }
+      box.innerHTML = state.activeEvents.map(ev => {
+        const isSel = ev.id === state.selectedEventId ? 'selected' : '';
+        const isChild = ev.correlation_level === 'L3_proctree' ? 'child-corr' : '';
+        const badge = ev.protocol === 'systemone'
+          ? `Step #${ev.step_index || 1}`
+          : (ev.step_index ? `Step #${ev.step_index} · Turn #${ev.turn_index}` : `Turn #${ev.turn_index || 1}`);
+        const streamPill = ev.status === 'streaming'
+          ? `<span class="pill live" style="padding:1px 6px;font-size:10px;"><span class="dot"></span>STREAMING (${ev.stream_chunks || 1})</span>`
+          : '';
+        return `
+          <div class="event-card ${isSel} ${isChild}" id="evcard_${esc(ev.id)}">
+            <div class="event-head" onclick="inspectEvent('${esc(ev.id)}')">
+              <div class="event-head-left">
+                <span class="step-badge">${esc(badge)}</span>
+                <span class="proto-tag proto-${esc(ev.protocol)}">${esc(ev.protocol)}</span>
+                <span class="corr-badge" title="${esc(ev.correlation_reason || '')}">${esc(ev.correlation_level)}</span>
+                ${streamPill}
+                <span style="font-family:var(--mono);font-size:11px;color:var(--text-muted)">${esc(ev.method)} ${esc(ev.path)}</span>
+              </div>
+              <div style="font-family:var(--mono);font-size:11px;color:var(--text-muted)">
+                HTTP ${ev.http_status || '...'} · ${ev.duration_ms}ms · ${fmtTime(ev.timestamp)}
+              </div>
+            </div>
+            <div class="event-body" onclick="inspectEvent('${esc(ev.id)}')">
+              ${ev.protocol === 'systemone' && ev.systemone ? renderSystemOneBody(ev) : renderChatBody(ev)}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderSystemOneBody(ev) {
+      const s1 = ev.systemone;
+      const page = s1.page || {};
+      const questionsHtml = (s1.questions || []).map(q => {
+        const probs = q.probabilities || {};
+        const keys = Object.keys(probs).sort((a, b) => (probs[b] || 0) - (probs[a] || 0)).slice(0, 6);
+        const bars = keys.map(k => {
+          const p = probs[k] || 0;
+          const pct = (p * 100).toFixed(1);
+          const desc = (q.options && q.options[k]) ? `${k}: ${q.options[k]}` : k;
+          const isWin = k === q.top_choice ? 'winner' : '';
+          return `
+            <div class="prob-row">
+              <div class="prob-label-line">
+                <span class="prob-opt-name" title="${esc(desc)}">${esc(desc)}</span>
+                <span>${pct}%</span>
+              </div>
+              <div class="prob-bar-bg"><div class="prob-bar-fill ${isWin}" style="width:${Math.min(100, p*100)}%"></div></div>
+            </div>
+          `;
+        }).join('');
+        const guidesHtml = (q.guides && q.guides.length)
+          ? `<div style="margin-top:6px;font-size:11px;color:var(--amber);border-top:1px dashed var(--border);padding-top:4px;">Guide: ${q.guides.map(esc).join(' | ')}</div>`
+          : '';
+        return `
+          <div class="s1-q-box">
+            <div class="s1-q-header">
+              <span>Q: <strong>${esc(q.id)}</strong> (${esc(q.type)})</span>
+              <span>conf: ${((q.confidence || 0)*100).toFixed(0)}%</span>
+            </div>
+            ${bars || '<div style="font-size:11px;color:var(--text-dim)">无概率分布数据</div>'}
+            ${guidesHtml}
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class="s1-page-box">
+          <div class="s1-url">${esc(page.url || '(无页面 URL)')}</div>
+          <div style="margin-top:3px;color:var(--text-muted)">
+            标题: <strong>${esc(page.title || '-')}</strong> · 可交互元素: <strong>${page.element_count || 0}</strong> · 历史动作: <strong>${s1.recent_action_count || 0}</strong>
+          </div>
+        </div>
+        <div class="s1-decision-banner">
+          <span>决策动作: <span class="s1-op">${esc(s1.selected_operation || '-')}</span></span>
+          ${s1.selected_element ? `<span>目标元素: <strong>${esc(s1.selected_element)}</strong></span>` : ''}
+          ${s1.selected_text ? `<span>输入文本: <strong>"${esc(s1.selected_text)}"</strong></span>` : ''}
+          <span>置信度: ${((s1.op_confidence || 0)*100).toFixed(1)}%</span>
+          ${s1.fallback_reason ? `<span style="color:var(--coral)">[兜底: ${esc(s1.fallback_reason)}]</span>` : ''}
+        </div>
+        <div class="s1-q-grid">${questionsHtml}</div>
+      `;
+    }
+
+    function renderChatBody(ev) {
+      const chat = ev.chat;
+      if (!chat) {
+        return `<pre class="code-block">${esc(ev.response_raw || ev.request_raw || '')}</pre>`;
+      }
+      const prefixCnt = chat.prefix_count || 0;
+      const unfolded = !!state.unfoldedPrefixes[ev.id];
+      let msgsHtml = '';
+      if (prefixCnt > 0 && !unfolded) {
+        msgsHtml += `<div class="prefix-fold" onclick="event.stopPropagation();togglePrefix('${esc(ev.id)}')">
+          ➕ 已自动折叠前 ${prefixCnt} 条历史上下文消息 (L2 前缀指纹匹配，点击展开)
+        </div>`;
+      } else if (prefixCnt > 0 && unfolded) {
+        msgsHtml += `<div class="prefix-fold" onclick="event.stopPropagation();togglePrefix('${esc(ev.id)}')">
+          ➖ 收起前 ${prefixCnt} 条历史上下文消息
+        </div>`;
+        msgsHtml += (chat.messages || []).slice(0, prefixCnt).map(m => `
+          <div class="msg-bubble" style="opacity:0.65">
+            <div class="msg-role">${esc(m.role)} (历史前缀)</div>
+            <div>${esc(m.content || '')}</div>
+          </div>
+        `).join('');
+      }
+      const newMsgs = (chat.new_messages && chat.new_messages.length) ? chat.new_messages : (chat.messages || []).slice(prefixCnt);
+      msgsHtml += newMsgs.map(m => `
+        <div class="msg-bubble msg-user">
+          <div class="msg-role">${esc(m.role)} (本轮新增)</div>
+          <div>${esc(m.content || '')}</div>
+        </div>
+      `).join('');
+
+      if (chat.reasoning_text) {
+        msgsHtml += `
+          <div class="msg-bubble msg-thinking">
+            <div class="msg-role">Thinking / Reasoning</div>
+            <div>${esc(chat.reasoning_text)}</div>
+          </div>
+        `;
+      }
+      if (chat.tool_calls && chat.tool_calls.length) {
+        msgsHtml += chat.tool_calls.map(tc => `
+          <div class="msg-bubble" style="border-color:var(--amber)">
+            <div class="msg-role" style="color:var(--amber)">Tool Call · ${esc(tc.name)}</div>
+            <div style="font-family:var(--mono);font-size:11.5px;">${esc(tc.arguments || '')}</div>
+          </div>
+        `).join('');
+      }
+      if (chat.response_text) {
+        msgsHtml += `
+          <div class="msg-bubble msg-assistant">
+            <div class="msg-role">Assistant (${esc(chat.model || ev.protocol)}) · Tokens: ${chat.usage?.total_tokens || 0}</div>
+            <div>${esc(chat.response_text)}</div>
+          </div>
+        `;
+      }
+      return msgsHtml;
+    }
+
+    function togglePrefix(evId) {
+      state.unfoldedPrefixes[evId] = !state.unfoldedPrefixes[evId];
+      renderTimelineEvents();
+    }
+
+    function inspectEvent(evId) {
+      state.selectedEventId = evId;
+      document.querySelectorAll('.event-card').forEach(el => el.classList.remove('selected'));
+      const card = document.getElementById('evcard_' + evId);
+      if (card) card.classList.add('selected');
+
+      const ev = state.activeEvents.find(x => x.id === evId);
+      if (!ev) return;
+      document.getElementById('inspectorEventId').textContent = ev.id;
+      const p = ev.process || {};
+      const hdrNotice = ev.headers_recorded
+        ? `<pre class="code-block">${esc(JSON.stringify({request: ev.request_headers, response: ev.response_headers}, null, 2))}</pre>`
+        : `<div class="pill amber" style="margin-bottom:10px;">安全默认：未记录 HTTP 请求头/响应头（防止 API Key 泄露，可通过 --record-headers 开启）</div>`;
+
+      document.getElementById('inspectorBody').innerHTML = `
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+          <button class="btn" onclick="copySanitizedCurl('${esc(ev.id)}')">复制脱敏 cURL</button>
+          <button class="btn" onclick="exportActiveSessionJSON()">导出会话 JSON</button>
+          <span id="copyActionFeedback" style="font-family:var(--mono);font-size:11px;color:var(--teal);align-self:center;"></span>
+        </div>
+        <table class="kv-table">
+          <tr><td>事件 ID</td><td>${esc(ev.id)}</td></tr>
+          <tr><td>所属会话</td><td>${esc(ev.session_id)}</td></tr>
+          <tr><td>父事件 ID</td><td>${esc(ev.parent_event_id || '(根节点)')}</td></tr>
+          <tr><td>串联层级</td><td>${esc(ev.correlation_level)} (${esc(ev.correlation_reason || '-')})</td></tr>
+          <tr><td>协议 / 模型</td><td>${esc(ev.protocol)} / ${esc(ev.systemone?.model || ev.chat?.model || '-')}</td></tr>
+          <tr><td>目标 URL</td><td>${esc(ev.method)} ${esc(ev.url)} (${esc(ev.http_version || 'HTTP')})</td></tr>
+          <tr><td>进程 PID/PPID</td><td>PID ${p.pid || 0} / PPID ${p.ppid || 0} (${esc(p.comm || '-')})</td></tr>
+          <tr><td>二进制路径</td><td>${esc(p.exe || '-')}</td></tr>
+          <tr><td>工作目录</td><td>${esc(p.cwd || '-')}</td></tr>
+          <tr><td>完整命令行</td><td>${esc(p.cmdline || '-')}</td></tr>
+          <tr><td>采集通道</td><td>${esc(p.tls_mode || 'ebpf_uprobe')}</td></tr>
+        </table>
+        <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:6px;">HTTP 头信息</div>
+        ${hdrNotice}
+        <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:8px 0 4px;">原始请求负载 (${ev.request_bytes} B)</div>
+        <pre class="code-block">${esc(prettyJSON(ev.request_raw))}</pre>
+        <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:8px 0 4px;">原始响应负载 (${ev.response_bytes} B)</div>
+        <pre class="code-block">${esc(prettyJSON(ev.response_raw))}</pre>
+      `;
+    }
+
+    function copySanitizedCurl(evId) {
+      const ev = state.activeEvents.find(x => x.id === evId);
+      if (!ev) return;
+      const bodyEsc = (ev.request_raw || '').replace(/'/g, "'\\''");
+      const curlCmd = [
+        `curl -X ${ev.method || 'POST'} '${ev.url}'`,
+        `  -H 'Content-Type: application/json'`,
+        `  -H 'Authorization: Bearer $API_KEY'`,
+        bodyEsc ? `  --data-raw '${bodyEsc}'` : ''
+      ].filter(Boolean).join(" \\\n");
+      navigator.clipboard?.writeText(curlCmd);
+      const fb = document.getElementById('copyActionFeedback');
+      if (fb) {
+        fb.textContent = '已复制脱敏 cURL';
+        setTimeout(() => { fb.textContent = ''; }, 2000);
+      }
+    }
+
+    function exportActiveSessionJSON() {
+      const sess = state.sessions.find(s => s.id === state.activeSessionId);
+      const payload = JSON.stringify({ session: sess || { id: state.activeSessionId }, events: state.activeEvents }, null, 2);
+      const blob = new Blob([payload], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${state.activeSessionId || 'trace-session'}.json`;
+      a.click();
+    }
+
+    async function loadScopeInfo() {
+      try {
+        const data = await apiFetch('/api/scope');
+        const scope = data.scope || {};
+        const probes = data.probes || [];
+        document.getElementById('probeCountText').textContent = probes.length;
+        const hdrPill = document.getElementById('headerPrivacyPill');
+        if (scope.record_headers) {
+          hdrPill.textContent = '请求头: 已开启记录(--record-headers)';
+          hdrPill.className = 'pill coral';
+        } else {
+          hdrPill.textContent = '请求头: 默认不记录(防凭据泄露)';
+          hdrPill.className = 'pill amber';
+        }
+        document.getElementById('scopePids').value = (scope.pids || []).join(', ');
+        document.getElementById('scopePidOnly').checked = !!scope.pid_only;
+        document.getElementById('scopeExes').value = (scope.exes || []).join(', ');
+        document.getElementById('scopeCwds').value = (scope.cwds || []).join(', ');
+        document.getElementById('scopeCmds').value = (scope.cmds || []).join(', ');
+        document.getElementById('scopeHosts').value = (scope.hosts || []).join(', ');
+        document.getElementById('scopeRecordHeaders').checked = !!scope.record_headers;
+        document.getElementById('probeTargetsBox').innerHTML = probes.map(p =>
+          `<div style="margin-bottom:4px;">[${esc(p.type)}] <strong>${esc(p.binary_path)}</strong> — ${esc(p.note || '')} ${p.symbols ? JSON.stringify(p.symbols) : ''}</div>`
+        ).join('') || '未发现探针目标';
+      } catch (_) {}
+    }
+
+    async function saveScope() {
+      const splitClean = s => s.split(',').map(x => x.trim()).filter(Boolean);
+      const pids = splitClean(document.getElementById('scopePids').value).map(Number).filter(n => n > 0);
+      const payload = {
+        pids,
+        pid_only: document.getElementById('scopePidOnly').checked,
+        exes: splitClean(document.getElementById('scopeExes').value),
+        cwds: splitClean(document.getElementById('scopeCwds').value),
+        cmds: splitClean(document.getElementById('scopeCmds').value),
+        hosts: splitClean(document.getElementById('scopeHosts').value),
+        record_headers: document.getElementById('scopeRecordHeaders').checked,
+      };
+      await apiFetch('/api/scope', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      await loadScopeInfo();
+      closeModal('scopeModal');
+    }
+
+    async function loadSelfmonStats() {
+      try {
+        const st = await apiFetch('/api/selfmon/stats');
+        document.getElementById('smOkCount').textContent = st.total_ok || 0;
+        document.getElementById('smErrCount').textContent = (st.total_error || 0) + (st.total_warn || 0);
+      } catch (_) {}
+    }
+
+    async function loadSelfmon() {
+      const status = document.getElementById('smStatusFilter').value;
+      const stage = document.getElementById('smStageFilter').value;
+      const r = getActiveTimeRange();
+      const data = await apiFetch(`/api/selfmon/events?from=${r.from}&to=${r.to}&status=${status}&stage=${stage}&limit=150`);
+      const st = data.stats || {};
+      document.getElementById('smOkCount').textContent = st.total_ok || 0;
+      document.getElementById('smErrCount').textContent = (st.total_error || 0) + (st.total_warn || 0);
+
+      const byStage = st.by_stage || {};
+      document.getElementById('smStageSummary').innerHTML = Object.keys(byStage).map(k => {
+        const m = byStage[k];
+        return `<span class="pill"><strong>${esc(k)}</strong>: OK ${m.ok} / Warn ${m.warn} / Err ${m.error}</span>`;
+      }).join('');
+
+      const evs = data.events || [];
+      document.getElementById('smEventList').innerHTML = evs.map(e => {
+        const color = e.status === 'ok' ? 'var(--teal)' : (e.status === 'warn' ? 'var(--amber)' : 'var(--coral)');
+        return `
+          <div style="padding:7px 9px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;">
+            <span style="color:${color};font-weight:700">[${esc(e.status.toUpperCase())}]</span>
+            <span style="color:var(--amber)">[${esc(e.stage)}]</span>
+            <strong>${esc(e.action)}</strong>
+            ${e.pid ? `PID:${e.pid}(${esc(e.comm || '')})` : ''}
+            <span style="color:var(--text-muted)">${fmtTime(e.ts)}</span>
+            ${e.error ? `<div style="color:var(--coral);margin-top:2px;">Error: ${esc(e.error)}</div>` : ''}
+            ${e.detail ? `<div style="color:var(--text-muted);margin-top:2px;">${esc(JSON.stringify(e.detail))}</div>` : ''}
+          </div>
+        `;
+      }).join('') || '<div class="empty-state">暂无匹配的自监控记录</div>';
+    }
+
+    async function runCleanCache(dryRun) {
+      const val = document.getElementById('cleanOlderThan').value;
+      const payload = {
+        older_than: val === 'ALL' ? '' : val,
+        all: val === 'ALL',
+        dry_run: dryRun,
+        include_selfmon: document.getElementById('cleanIncludeSelfmon').checked,
+      };
+      const res = await apiFetch('/api/cache/clean', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const prefix = dryRun ? '[Dry-Run 预览]' : '[已清理完成]';
+      document.getElementById('cleanResultBox').textContent =
+        `${prefix} 会话: ${res.deleted_sessions} 个，文件: ${res.deleted_files} 个，释放空间: ${(res.freed_bytes / 1024).toFixed(1)} KB`;
+      if (!dryRun) {
+        state.activeSessionId = null;
+        await refreshAll();
+      }
+    }
+
+    function connectSSE() {
+      const es = new EventSource('/api/stream');
+      const pill = document.getElementById('sseStatusPill');
+      es.addEventListener('trace', e => {
+        if (!state.liveFollow) return;
+        const up = JSON.parse(e.data);
+        loadTimeline();
+        loadSessions();
+        if (up.event && up.event.session_id === state.activeSessionId) {
+          selectSession(state.activeSessionId, true);
+        }
+      });
+      es.addEventListener('selfmon', () => {
+        loadSelfmonStats();
+      });
+      es.onerror = () => {
+        pill.className = 'pill coral';
+        pill.innerHTML = '<span class="dot"></span>SSE 重连中...';
+      };
+      es.onopen = () => {
+        pill.className = 'pill live';
+        pill.innerHTML = '<span class="dot"></span>SSE 实时流已连接';
+      };
+    }
+
+    function openScopeModal() { loadScopeInfo(); document.getElementById('scopeModal').classList.add('open'); }
+    function openSelfmonModal() { loadSelfmon(); document.getElementById('selfmonModal').classList.add('open'); }
+    function openCleanModal() { document.getElementById('cleanResultBox').textContent = ''; document.getElementById('cleanModal').classList.add('open'); }
+    function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+    function fmtTime(ms) {
+      if (!ms) return '-';
+      const d = new Date(ms);
+      return d.toTimeString().split(' ')[0];
+    }
+    function prettyJSON(str) {
+      if (!str) return '';
+      try { return JSON.stringify(JSON.parse(str), null, 2); } catch (_) { return str; }
+    }
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    initApp();
+  </script>
+</body>
+</html>

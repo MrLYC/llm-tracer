@@ -1,0 +1,7 @@
+/bin/
+/llm-tracer
+/traces/
+/.cache/
+*.so
+*.test
+*.out
