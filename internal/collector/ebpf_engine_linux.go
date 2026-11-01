@@ -190,6 +190,29 @@ func patchExitJumps(insns []BPFInsn) []BPFInsn {
 	return insns
 }
 
+// appendSyscallHTTPFilter reads the first 4 bytes of user buffer R8 onto stack [fp-24] before reserving ringbuf space.
+// Only HTTP requests/responses, SSE chunks, or JSON payloads on syscall tracepoints proceed to ringbuf reservation.
+func appendSyscallHTTPFilter(insns []BPFInsn) []BPFInsn {
+	return append(insns,
+		bpfStMemW(bpfReg10, -24, 0),
+		bpfMov64Reg(bpfReg1, bpfReg10),
+		bpfAdd64Imm(bpfReg1, -24),
+		bpfMov64Imm(bpfReg2, 4),
+		bpfMov64Reg(bpfReg3, bpfReg8),
+		bpfCall(bpfFuncProbeReadUser),
+		bpfLdXMemW(bpfReg0, bpfReg10, -24),
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x54534f50, 8), // "POST"
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x20544547, 7), // "GET "
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x20545550, 6), // "PUT "
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x454c4544, 5), // "DELE"
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x50545448, 4), // "HTTP"
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x61746164, 3), // "data"
+		bpfAnd64Imm(bpfReg0, 0xff),
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x7b, 1),      // '{'
+		bpfJmpImm(bpfJGE, bpfReg9, 0, -1),        // non-HTTP syscall payload -> exit without reserving ringbuf
+	)
+}
+
 // BuildWriteProbeProgram constructs a verifier-safe eBPF program that reads (conn_tag, buf_ptr, len)
 // from pt_regs or tracepoint context, copies up to 4072 bytes via bpf_probe_read_user, and submits to RingBuf.
 // For x86_64:
@@ -230,6 +253,9 @@ func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isS
 	// Cap R9 to ebpfMaxPayload (4072)
 	insns = append(insns, bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1))
 	insns = append(insns, bpfMov64Imm(bpfReg9, ebpfMaxPayload))
+	if isSyscall {
+		insns = appendSyscallHTTPFilter(insns)
+	}
 
 	// R0 = bpf_ringbuf_reserve(ringbufMapFD, ebpfEventSize, 0)
 	insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
@@ -380,6 +406,9 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 		bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1),
 		bpfMov64Imm(bpfReg9, ebpfMaxPayload),
 	)
+	if isSyscall {
+		insns = appendSyscallHTTPFilter(insns)
+	}
 	// Reserve ringbuf
 	insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
 	insns = append(insns,

@@ -470,7 +470,11 @@ func main() {
 `, `{"model":"qwen3:8b","messages":[{"role":"user","content":"hello from unhooked go tls"}],"stream":false}`, ts.URL)
 		require.NoError(t, os.WriteFile(goSrc, []byte(goCode), 0o644))
 		buildCmd := exec.Command(goExecutable, "build", "-o", goBin, goSrc)
-		buildCmd.Env = append(os.Environ(), "GOCACHE=/tmp/go-build")
+		if os.Getenv("GOCACHE") != "" {
+			buildCmd.Env = os.Environ()
+		} else if _, err := os.Stat("/home/liuyicong"); err == nil {
+			buildCmd.Env = append(os.Environ(), "GOCACHE=/tmp/go-build")
+		}
 		out, err := buildCmd.CombinedOutput()
 		require.NoError(t, err, string(out))
 
@@ -550,7 +554,7 @@ int main(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
     const char *req = "POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n{\"model\":\"gpt-5-codex\",\"input\":\"static binary via kernel ebpf tracepoint\"}";
-    const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":\"resp_static_tp\",\"object\":\"response\",\"model\":\"gpt-5-codex\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"static pie ebpf tracepoint ok\"}]}]}";
+    const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 188\r\n\r\n{\"id\":\"resp_static_tp\",\"object\":\"response\",\"model\":\"gpt-5-codex\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"static pie ebpf tracepoint ok\"}]}]}";
     char req_buf[512], resp_buf[512], sink[512];
     memcpy(req_buf, req, strlen(req) + 1);
     memcpy(resp_buf, resp, strlen(resp) + 1);
@@ -560,6 +564,7 @@ int main(void) {
     read(sv[1], sink, sizeof(sink));
     write(sv[1], resp_buf, strlen(resp_buf));
     read(sv[0], sink, sizeof(sink));
+    usleep(10000);
     close(sv[0]);
     close(sv[1]);
     return 0;
