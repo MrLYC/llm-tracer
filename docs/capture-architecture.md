@@ -37,7 +37,7 @@
 
 ---
 
-## 三、六大采集机制原理详解
+## 三、七大采集机制原理详解（内核态 eBPF + 用户态六层自适应）
 
 所有采集通道在提取到明文 HTTP/1.1 或 HTTP/2 载荷后，统一封装为 **24 字节定长 `LLMT` 二进制帧** 写入本地 Unix Domain Socket (`LLM_TRACER_SOCK`) 或追加管道文件 (`LLM_TRACER_PIPE`)，再交由 `StreamReassembler` 进行流重组：
 
@@ -49,6 +49,22 @@
 |                                           Payload (Len Bytes, Raw HTTP/1.1 or H2)                                     |
 +-----------------------------------------------------------------------------------------------------------------------+
 ```
+
+### 机制 0：纯 Go 内核态 eBPF 数据面 — Uprobe + Syscall Tracepoint + RingBuf (`internal/collector/ebpf_engine_linux.go`)
+
+- **适用场景**：具备 `root` 或 `CAP_BPF` + `CAP_PERFMON` 权限时，对 **任意正在运行中的进程 (`--pid <pid>`、`--exe`、全局范围)** 进行零侵入内核态抓取，无需注入环境变量、无需重启目标进程、零 `ptrace` 停顿开销。
+- **实现原理**：
+  1. **零外部依赖字节码生成**：不依赖外部 `clang` / `llvm` 或内核头文件，直接在 `ebpf_engine_linux.go` 中构造通过 Linux eBPF Verifier 校验的原语指令序列（`BPFInsn`），通过 `unix.Syscall(unix.SYS_BPF, ...)` 完成 Map 创建与程序加载。
+  2. **三内核 Map 隔离架构（防嵌套覆盖）**：
+     - `BPF_MAP_TYPE_RINGBUF`（1 MiB 环形缓冲区）：各探针通过 `bpf_ringbuf_reserve`（Helper `#131`）分配 4096 字节槽位（24B `LLMT` 头 + 4072B 载荷），调用 `bpf_probe_read_user`（Helper `#112`）读取用户态明文后由 `bpf_ringbuf_submit`（Helper `#132`）提交；
+     - `active_ssl_read`（`BPF_MAP_TYPE_HASH`，24B Value `{conn_tag, buf_ptr, len_ptr}`）：专供 `uprobe/SSL_read`、`uprobe/SSL_read_ex` 与 `uretprobe/SSL_read` 使用；支持自动解引用 OpenSSL 3 `SSL_read_ex` 的第 4 参数 `size_t *readbytes`（`RCX`）；
+     - `active_sys_read`（`BPF_MAP_TYPE_HASH`，24B Value）：专供 `tracepoint/syscalls/sys_enter_read`、`sys_enter_recvfrom` 与 `sys_exit_read`、`sys_exit_recvfrom` 使用。将 TLS 读表与系统调用读表物理隔离，彻底防止 `SSL_read` 内部调用底层 Socket `read()` 系统调用时在同一 `pid_tgid` 上覆盖或提前删除外层 `SSL_read` 的明文缓冲区指针。
+  3. **三类内核探针挂载 (`perf_event_open` + `PERF_EVENT_IOC_SET_BPF`)**：
+     - **OpenSSL / 静态 OpenSSL Uprobe & Uretprobe**：自动挂载至系统 `libssl.so.3` 以及 `node`、`uv python3.14` 内部的静态 `SSL_write` / `SSL_write_ex` / `SSL_read` / `SSL_read_ex` 偏移（读取 `pt_regs->di/si/dx/cx/ax`），输出模式标记为 `ebpf_uprobe`；
+     - **GoTLS 寄存器 ABI Uprobe**：自动挂载至 Go 二进制的 `crypto/tls.(*Conn).Write` 偏移（按 Go 1.17+ 寄存器 ABI 读取 `RAX=conn`、`RBX=slice.ptr`、`RCX=slice.len`）；
+     - **内核 Syscall Tracepoints**：挂载 `syscalls/sys_enter_write`、`sys_enter_sendto`、`sys_enter_read`、`sys_enter_recvfrom`、`sys_exit_read`、`sys_exit_recvfrom`，在内核态直接捕获 `claude.exe`、`codex` 等进程的明文 Socket I/O，输出模式标记为 `ebpf_tracepoint`。
+  4. **双映射零拷贝 RingBuf 消费 (`Flush` / `consumeRingBufLoop`)**：
+     - 通过 `unix.Mmap` 映射可写 `consumer_pos` 页与只读 `producer_pos + 2*ringBytes` 双倍镜像数据区，使用原子操作无锁消费内核事件并自动按 `userHookPIDs` 去重。
 
 ### 机制 1：动态 `libssl.so` PLT 函数拦截 (`internal/collector/preload_hook.go`)
 
@@ -145,5 +161,31 @@
 运行验证命令：
 
 ```bash
+# 非特权模式运行 6 大运行时兼容矩阵 + eBPF 字节码与 RingBuf 单元测试
 mise exec go@1.26.5 -- go test -v -count=1 ./internal/collector -run TestCompatibilityMatrixAllRuntimeScenarios
+
+# Root 权限下运行真实 Linux 内核 eBPF Verifier (11 个程序) + 15 大零注入内核 eBPF 实测场景
+sudo /path/to/go test -v -count=1 ./internal/collector -run 'TestEBPF|TestRealKernelEBPF'
 ```
+
+---
+
+## 五、Root 内核态 eBPF 15 大场景实测矩阵 (`internal/collector/ebpf_engine_test.go`)
+
+在 Root (`CAP_BPF` + `CAP_PERFMON`) 环境下，`TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot` 在不注入任何用户态环境变量（无 `LD_PRELOAD`、无 `PYTHONPATH`、无 `NODE_OPTIONS`、无 `ptrace`）的条件下，端到端验证 11 个 eBPF 程序通过 Linux 内核 Verifier 并挂载 19 个内核探针（12 个 Uprobe/Uretprobe + 7 个 Syscall Tracepoint），覆盖以下 15 个真实场景：
+
+1. **`EBPF_Scenario1_DynamicLibSSL_TLS13_MultiTurn_And_SSE`**：动态 `libssl.so.3` Uprobe/Uretprobe 抓取 TLS 1.3 多轮对话与 SSE 流式响应。
+2. **`EBPF_Scenario2_PythonMemoryBIO_NoSocketFD_SystemOneJEV`**：抓取无底层 Socket FD (`SSL_get_fd == -1`) 的 Python `ssl.MemoryBIO` 内存态 TLS 流与 `systemone` TypeSafe JEV 协议（以 `SSL*` 指针作为连接键）。
+3. **`EBPF_Scenario3_StaticLocalOpenSSLSymbols_InExecutable`**：动态解析可执行文件 `.symtab` 中的 `static` 局部符号 `SSL_write` / `SSL_read` (`STB_LOCAL`) 并挂载内核 Uprobe/Uretprobe。
+4. **`EBPF_Scenario4_NodeJS_StaticEmbeddedOpenSSL_UnhookedHTTPS`**：零 `NODE_OPTIONS` 抓取静态内嵌 OpenSSL 3 的 Node.js v24 原生 HTTPS 客户端请求。
+5. **`EBPF_Scenario5_NativeGoBinary_GoTLS_WriteAndReadRetUprobes`**：自动定位 Go `crypto/tls.(*Conn).Write` 与 `(*Conn).Read` 栈扩容检查（`morestack`）后的入口偏移及函数内所有 `RET` (`0xc3`) 指令偏移，以 `(pid<<32)|uint32(R14)`（Goroutine `g` 指针）关联寄存器 ABI 参数（`RAX`/`RBX`/`RCX`），避免传统 `uretprobe` 破坏 Go 动态栈导致崩溃。
+6. **`EBPF_Scenario6_StrippedBinary_ScatterGatherWritevTracepoint`**：通过 `tp/syscalls/sys_enter_writev` 在内核态展开 `struct iovec iov[0..1]`，抓取剥离符号表二进制（如 Bun/`claude.exe`）的分散-聚集 `writev` 请求。
+7. **`EBPF_Scenario7_FullStaticStrippedBinary_SyscallTracepoint`**：零 `ptrace` 抓取 `gcc -static -O2 -s` 全静态无符号 ELF（如 `codex` `static-pie`）的底层系统调用流量。
+8. **`EBPF_Scenario8_UnhookedSystemCurl_HTTPS_GeminiGenerateContent`**：直接抓取系统原生 `/usr/bin/curl -k --http1.1` 的 HTTPS Google Gemini `generateContent` 通信。
+9. **`EBPF_Scenario9_OpenSSL3_ExAPI_SSLWriteEx_And_SSLReadEx_PointerDereference`**：抓取显式调用 OpenSSL 3.x `SSL_write_ex` 与 `SSL_read_ex` 的 C 程序，验证 eBPF 在 `SSL_read_ex` 返回时对 `RCX` (`size_t *readbytes`) 用户态指针的二次解引用。
+10. **`EBPF_Scenario10_StrippedBinary_SendtoRecvfrom_Tracepoints`**：通过 `sys_enter_sendto` / `sys_enter_recvfrom` / `sys_exit_recvfrom` 抓取使用 `sendto`/`recvfrom` 的剥离符号二进制。
+11. **`EBPF_Scenario11_ProcessTreeScope_SubtreeInheritance_vs_PIDOnlyMode`**：验证默认后代子进程树自动继承抓取（`PIDOnly=false`）与 `--pid-only` 单 PID 严格隔离模式（`PIDOnly=true`）。
+12. **`EBPF_Scenario12_GzipChunkedResponse_And_HeaderRedactionPrivacy`**：验证内核 Uprobe 下的 HTTP/1.1 `Transfer-Encoding: chunked` + `Content-Encoding: gzip` 自动解压，以及默认不记录请求头防凭据泄露（`RecordHeaders=false`）与 `--record-headers` 显式开启。
+13. **`EBPF_Scenario13_ScopeFilters_Exe_Cwd_Cmd_And_HostFilter`**：验证 `--exe`、`--cwd`、`--cmd`、`--host` 四维范围过滤在内核 eBPF 采集链路下的命中与拦截。
+14. **`EBPF_Scenario14_ConcurrentMultiProcess_ParallelTLSStreams_And_Correlation`**：验证多进程高并发 TLS 流并行抓取零串流与会话独立关联。
+15. **`EBPF_Scenario15_LaunchCommand_SubprocessTree_And_SelfMonitoringAudit`**：验证 `LaunchCommand` (`-- <cmd>`) 包装脚本子进程树端到端抓取与 `selfmon` 自监控指标审计。

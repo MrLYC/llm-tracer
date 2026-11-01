@@ -337,6 +337,7 @@ func ParseSystemOne(reqBody []byte, respBody []byte) (*model.SystemOneStepSummar
 			if ans, ok := answersMap[qid]; ok {
 				if ch, ok := ans["choice"].(string); ok {
 					qItem.AnswerChoice = ch
+					qItem.TopChoice = ch
 				}
 				if conf, ok := asFloat(ans["confidence"]); ok {
 					qItem.Confidence = conf

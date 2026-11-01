@@ -31,6 +31,8 @@ type Collector struct {
 	preloadPath  string
 	runtimeHooks *RuntimeHookPaths
 	loopbackTap  *LoopbackTap
+	ebpfEngine   *EBPFEngine
+	userHookPIDs map[int]bool
 	activeTapPID int
 	listener     net.Listener
 	tracker      *ProcessTracker
@@ -75,12 +77,13 @@ func NewCollector(
 ) (*Collector, error) {
 	tracker := NewProcessTracker(scope, mon)
 	c := &Collector{
-		cacheDir:   cacheDir,
-		tracker:    tracker,
-		correlator: corr,
-		store:      st,
-		mon:        mon,
-		stopCh:     make(chan struct{}),
+		cacheDir:     cacheDir,
+		userHookPIDs: make(map[int]bool),
+		tracker:      tracker,
+		correlator:   corr,
+		store:        st,
+		mon:          mon,
+		stopCh:       make(chan struct{}),
 	}
 	c.reassembler = parser.NewStreamReassembler(scope.RecordHeaders, scope.Hosts, mon, c.handleReassembledEvent)
 	return c, nil
@@ -164,6 +167,30 @@ func (c *Collector) Start(ctx context.Context) error {
 
 	scope := c.tracker.GetScope()
 	probes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
+	if eng, err := StartEBPFEngine(probes, c.mon, func(pid, tid int, connID string, dir parser.Direction, payload []byte, mode string) {
+		c.mu.RLock()
+		alreadyHooked := c.userHookPIDs[pid]
+		c.mu.RUnlock()
+		if alreadyHooked {
+			return
+		}
+		c.IngestRawChunk(pid, tid, connID, dir, payload, mode)
+	}); err == nil && eng != nil {
+		c.mu.Lock()
+		c.ebpfEngine = eng
+		c.mu.Unlock()
+		for i := range probes {
+			if len(probes[i].Symbols) > 0 {
+				probes[i].Attached = eng.Active()
+				probes[i].Note = fmt.Sprintf("eBPF kernel engine active (attached=%d)", eng.AttachedCount())
+			}
+		}
+		if c.mon != nil {
+			c.mon.RecordOK(selfmon.StageProbe, "start_ebpf_engine", map[string]any{
+				"attached_count": eng.AttachedCount(),
+			})
+		}
+	}
 	c.mu.Lock()
 	c.probes = probes
 	c.mu.Unlock()
@@ -180,12 +207,16 @@ func (c *Collector) Stop() {
 		ln := c.listener
 		sock := c.sockPath
 		tap := c.loopbackTap
+		ebpf := c.ebpfEngine
 		c.mu.RUnlock()
 		if ln != nil {
 			_ = ln.Close()
 		}
 		if tap != nil {
 			tap.Close()
+		}
+		if ebpf != nil {
+			ebpf.Close()
 		}
 		if sock != "" {
 			_ = os.Remove(sock)
@@ -209,6 +240,12 @@ func (c *Collector) UpdateScope(scope model.ScopeFilter) {
 	c.tracker.SetScope(scope)
 	c.reassembler.SetScope(scope.RecordHeaders, scope.Hosts)
 	probes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
+	c.mu.RLock()
+	ebpf := c.ebpfEngine
+	c.mu.RUnlock()
+	if ebpf != nil {
+		ebpf.AttachTargets(probes)
+	}
 	c.mu.Lock()
 	c.probes = probes
 	c.mu.Unlock()
@@ -223,6 +260,25 @@ func (c *Collector) UpdateScope(scope model.ScopeFilter) {
 			"record_headers": scope.RecordHeaders,
 		})
 	}
+}
+
+// AttachBinaryTargets resolves ELF symbols (OpenSSL, Static-OpenSSL, GoTLS) for the specified executables
+// and dynamically attaches kernel eBPF uprobes/uretprobes when EBPFEngine is active.
+func (c *Collector) AttachBinaryTargets(exes ...string) []ProbeTarget {
+	extra := ProbeAndRecordTargets(nil, exes, c.mon)
+	if len(extra) == 0 {
+		return nil
+	}
+	c.mu.RLock()
+	ebpf := c.ebpfEngine
+	c.mu.RUnlock()
+	if ebpf != nil {
+		ebpf.AttachTargets(extra)
+	}
+	c.mu.Lock()
+	c.probes = append(c.probes, extra...)
+	c.mu.Unlock()
+	return extra
 }
 
 // LaunchCommand starts a child command (`-- <cmd> [args...]`), immediately registers its PID in the ProcessTracker
@@ -243,6 +299,12 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 	if prof != nil {
 		extraProbes := ProbeAndRecordTargets(nil, []string{prof.ResolvedELF}, c.mon)
 		if len(extraProbes) > 0 {
+			c.mu.RLock()
+			ebpf := c.ebpfEngine
+			c.mu.RUnlock()
+			if ebpf != nil {
+				ebpf.AttachTargets(extraProbes)
+			}
 			c.mu.Lock()
 			c.probes = append(c.probes, extraProbes...)
 			c.mu.Unlock()
@@ -251,6 +313,12 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 
 	// Inspect if target binary is a Go binary for GoTLS uprobe resolution
 	if gt, err := InspectGoTLSTarget(binPath); err == nil && gt != nil {
+		c.mu.RLock()
+		ebpf := c.ebpfEngine
+		c.mu.RUnlock()
+		if ebpf != nil {
+			ebpf.AttachTargets([]ProbeTarget{*gt})
+		}
 		c.mu.Lock()
 		c.probes = append(c.probes, *gt)
 		c.mu.Unlock()
@@ -563,6 +631,9 @@ func (c *Collector) handleHookConn(conn net.Conn) {
 	if dirVal != 0 {
 		dir = parser.DirRead
 	}
+	c.mu.Lock()
+	c.userHookPIDs[pid] = true
+	c.mu.Unlock()
 	connID := fmt.Sprintf("ssl_%x", sslLow)
 	c.IngestRawChunk(pid, tid, connID, dir, payload, "openssl_hook")
 }
@@ -571,7 +642,11 @@ func (c *Collector) handleHookConn(conn net.Conn) {
 func (c *Collector) Flush() {
 	c.mu.RLock()
 	pipePath := c.pipePath
+	ebpf := c.ebpfEngine
 	c.mu.RUnlock()
+	if ebpf != nil {
+		ebpf.Flush()
+	}
 	if pipePath == "" {
 		return
 	}
@@ -617,6 +692,9 @@ func (c *Collector) drainPipeFile(pipePath string) {
 		if dirVal != 0 {
 			dir = parser.DirRead
 		}
+		c.mu.Lock()
+		c.userHookPIDs[pid] = true
+		c.mu.Unlock()
 		connID := fmt.Sprintf("ssl_%x", sslLow)
 		c.IngestRawChunk(pid, tid, connID, dir, payload, "openssl_hook")
 	}

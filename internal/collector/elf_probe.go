@@ -2,11 +2,13 @@ package collector
 
 import (
 	"bufio"
+	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -16,13 +18,14 @@ import (
 )
 
 type ProbeTarget struct {
-	BinaryPath string            `json:"binary_path"`
-	Type       string            `json:"type"` // openssl | static_openssl | gotls | static_pie | stripped_tls
-	LinkMode   string            `json:"link_mode,omitempty"`
-	GoVersion  string            `json:"go_version,omitempty"`
-	Symbols    map[string]uint64 `json:"symbols"`
-	Attached   bool              `json:"attached"`
-	Note       string            `json:"note,omitempty"`
+	BinaryPath          string            `json:"binary_path"`
+	Type                string            `json:"type"` // openssl | static_openssl | gotls | static_pie | stripped_tls
+	LinkMode            string            `json:"link_mode,omitempty"`
+	GoVersion           string            `json:"go_version,omitempty"`
+	Symbols             map[string]uint64 `json:"symbols"`
+	GoTLSReadRetOffsets []uint64          `json:"gotls_read_ret_offsets,omitempty"`
+	Attached            bool              `json:"attached"`
+	Note                string            `json:"note,omitempty"`
 }
 
 type BinaryProfile struct {
@@ -248,6 +251,12 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	if err != nil {
 		return nil, err
 	}
+	rawFile, err := os.Open(realPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rawFile.Close()
+
 	f, err := elf.Open(realPath)
 	if err != nil {
 		return nil, err
@@ -255,22 +264,61 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	defer f.Close()
 
 	syms := make(map[string]uint64)
+	var readRetOffsets []uint64
 	if elfSyms, err := f.Symbols(); err == nil {
 		for _, s := range elfSyms {
 			switch s.Name {
 			case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
 				if s.Value > 0 {
-					syms[s.Name] = vaddrToFileOffset(f, s.Value)
+					baseOff := vaddrToFileOffset(f, s.Value)
+					entryOff := baseOff
+					if f.Machine == elf.EM_X86_64 && s.Size > 16 {
+						code := make([]byte, s.Size)
+						if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
+							// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
+							// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
+							prologueWindow := code
+							if len(prologueWindow) > 32 {
+								prologueWindow = prologueWindow[:32]
+							}
+							if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
+								entryOff = baseOff + uint64(idx)
+							}
+							if s.Name == "crypto/tls.(*Conn).Read" {
+								readRetOffsets = findGoX8664RetOffsets(baseOff, code)
+							}
+						}
+					}
+					syms[s.Name] = entryOff
 				}
 			}
 		}
 	}
 	return &ProbeTarget{
-		BinaryPath: realPath,
-		Type:       "gotls",
-		GoVersion:  bi.GoVersion,
-		Symbols:    syms,
+		BinaryPath:          realPath,
+		Type:                "gotls",
+		GoVersion:           bi.GoVersion,
+		Symbols:             syms,
+		GoTLSReadRetOffsets: readRetOffsets,
 	}, nil
+}
+
+// findGoX8664RetOffsets scans a Go amd64 function body for frame epilogues (`add $imm, %rsp; pop %rbp; ret`)
+// and returns the file offsets of the `ret` (0xc3) instructions so regular uprobes can capture return values
+// without installing kernel uretprobe trampolines on Go's growable goroutine stacks.
+func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
+	var out []uint64
+	for i := 0; i+1 < len(code); i++ {
+		if code[i] != 0x5d || code[i+1] != 0xc3 {
+			continue
+		}
+		isAddRspImm8 := i >= 4 && code[i-4] == 0x48 && code[i-3] == 0x83 && code[i-2] == 0xc4
+		isAddRspImm32 := i >= 7 && code[i-7] == 0x48 && code[i-6] == 0x81 && code[i-5] == 0xc4
+		if isAddRspImm8 || isAddRspImm32 {
+			out = append(out, baseOff+uint64(i)+1)
+		}
+	}
+	return out
 }
 
 // TryAttachKernelUprobe attempts to open a Linux uprobe perf_event for the target symbol offset.
@@ -284,15 +332,21 @@ func TryAttachKernelUprobe(binaryPath string, offset uint64) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("invalid uprobe pmu type: %w", err)
 	}
+	cPath, err := unix.BytePtrFromString(binaryPath)
+	if err != nil {
+		return -1, err
+	}
 
 	attr := unix.PerfEventAttr{
 		Type:   uint32(pmuType),
 		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+		Ext1:   uint64(uintptr(unsafe.Pointer(cPath))),
+		Ext2:   offset,
 		Sample: 1,
 		Wakeup: 1,
 	}
-	_ = offset
 	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	runtime.KeepAlive(cPath)
 	if err != nil {
 		return -1, fmt.Errorf("perf_event_open uprobe on %s: %w", filepath.Base(binaryPath), err)
 	}
