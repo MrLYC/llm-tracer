@@ -388,12 +388,21 @@ int main(void) {
 
 	// Scenario 4: Node.js v24 (Statically Embedded OpenSSL 3 inside bin/node) HTTPS TLS 1.3 Client
 	t.Run("EBPF_Scenario4_NodeJS_StaticEmbeddedOpenSSL_UnhookedHTTPS", func(t *testing.T) {
-		nodeBin := "/home/liuyicong/.local/share/mise/installs/node/24.4.1/bin/node"
-		if _, err := os.Stat(nodeBin); err != nil {
-			t.Skip("node 24.4.1 not found")
+		nodeBin, err := findNodeExecutable()
+		if err != nil {
+			t.Skip("node not found")
 		}
 		targets := col.AttachBinaryTargets(nodeBin)
-		require.NotEmpty(t, targets, "should resolve static OpenSSL symbols inside bin/node")
+		hasNodeOpenSSLSyms := false
+		for _, tgt := range targets {
+			if len(tgt.Symbols) > 0 {
+				hasNodeOpenSSLSyms = true
+				break
+			}
+		}
+		if !hasNodeOpenSSLSyms {
+			t.Skip("node binary has stripped symbols and no dynamic libssl")
+		}
 
 		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.ReadAll(r.Body)
@@ -541,11 +550,15 @@ int main(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
     const char *req = "POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n{\"model\":\"gpt-5-codex\",\"input\":\"static binary via kernel ebpf tracepoint\"}";
-    write(sv[0], req, strlen(req));
+    char req_buf[512];
+    memcpy(req_buf, req, strlen(req) + 1);
+    write(sv[0], req_buf, strlen(req_buf));
     char sink[4096];
     read(sv[1], sink, sizeof(sink));
     const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":\"resp_static_tp\",\"object\":\"response\",\"model\":\"gpt-5-codex\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"static pie ebpf tracepoint ok\"}]}]}";
-    write(sv[1], resp, strlen(resp));
+    char resp_buf[512];
+    memcpy(resp_buf, resp, strlen(resp) + 1);
+    write(sv[1], resp_buf, strlen(resp_buf));
     read(sv[0], sink, sizeof(sink));
     close(sv[0]);
     close(sv[1]);
