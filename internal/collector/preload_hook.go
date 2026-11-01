@@ -44,9 +44,9 @@ typedef int (*close_fn)(int fd);
 static __thread int in_ssl_hook = 0;
 static uint16_t tracked_http_gen[65536];
 
-static void *resolve_ssl_sym(const char *name) {
+static void *resolve_ssl_sym(const char *name, void *self_fn) {
     void *fn = dlsym(RTLD_NEXT, name);
-    if (fn) return fn;
+    if (fn && fn != self_fn) return fn;
     static void *ssl_handle = NULL;
     if (!ssl_handle) {
         const char *candidates[] = {
@@ -69,8 +69,9 @@ static void *resolve_ssl_sym(const char *name) {
     }
     if (ssl_handle) {
         fn = dlsym(ssl_handle, name);
+        if (fn && fn != self_fn) return fn;
     }
-    return fn;
+    return NULL;
 }
 
 static void send_tls_chunk(void *ssl, const void *buf, size_t len, uint32_t dir) {
@@ -128,7 +129,7 @@ static int runtime_tls_hook_active(void) {
 
 int SSL_write(void *ssl, const void *buf, int num) {
     static ssl_rw_fn real_fn = NULL;
-    if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_write");
+    if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_write", (void *)SSL_write);
     if (!real_fn) return -1;
     if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, (void *)buf, num);
     in_ssl_hook = 1;
@@ -142,7 +143,7 @@ int SSL_write(void *ssl, const void *buf, int num) {
 
 int SSL_write_ex(void *ssl, const void *buf, size_t num, size_t *written) {
     static ssl_rw_ex_fn real_fn = NULL;
-    if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_write_ex");
+    if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_write_ex", (void *)SSL_write_ex);
     if (!real_fn) return 0;
     if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, (void *)buf, num, written);
     in_ssl_hook = 1;
@@ -156,7 +157,7 @@ int SSL_write_ex(void *ssl, const void *buf, size_t num, size_t *written) {
 
 int SSL_read(void *ssl, void *buf, int num) {
     static ssl_rw_fn real_fn = NULL;
-    if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_read");
+    if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_read", (void *)SSL_read);
     if (!real_fn) return -1;
     if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, buf, num);
     in_ssl_hook = 1;
@@ -170,7 +171,7 @@ int SSL_read(void *ssl, void *buf, int num) {
 
 int SSL_read_ex(void *ssl, void *buf, size_t num, size_t *readbytes) {
     static ssl_rw_ex_fn real_fn = NULL;
-    if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_read_ex");
+    if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_read_ex", (void *)SSL_read_ex);
     if (!real_fn) return 0;
     if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, buf, num, readbytes);
     in_ssl_hook = 1;
@@ -362,6 +363,10 @@ func EnsureSSLPreloadHook(hooksDir string) (string, error) {
 	}
 	args := []string{"-shared", "-fPIC", "-O2", "-o", soPath, cPath, "-ldl"}
 	if runtime.GOOS == "darwin" {
+		fatArgs := []string{"-dynamiclib", "-arch", "arm64", "-arch", "arm64e", "-fPIC", "-O2", "-o", soPath, cPath}
+		if err := exec.Command(ccPath, fatArgs...).Run(); err == nil {
+			return soPath, nil
+		}
 		args = []string{"-dynamiclib", "-fPIC", "-O2", "-o", soPath, cPath}
 	}
 	cmd := exec.Command(ccPath, args...)

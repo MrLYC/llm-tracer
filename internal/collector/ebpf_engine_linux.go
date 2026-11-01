@@ -201,9 +201,15 @@ func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isS
 	if isSyscall {
 		dirImm = 2 // 2 = DirWrite (syscall tracepoint)
 	}
+	selfPID := int32(os.Getpid())
 	var insns []BPFInsn
-	// R6 = R1 (ctx)
-	insns = append(insns, bpfMov64Reg(bpfReg6, bpfReg1))
+	// R6 = R1 (ctx); filter out selfPID in kernel space
+	insns = append(insns,
+		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfRsh64Imm(bpfReg0, 32),
+		bpfJmpImm(bpfJEQ, bpfReg0, selfPID, -1),
+	)
 	// R7 = *(u64 *)(R6 + connOff)
 	insns = append(insns, bpfLdXMemDW(bpfReg7, bpfReg6, connOff))
 	if isSyscall {
@@ -276,6 +282,7 @@ func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isS
 // BuildReadEnterProgram stashes {conn_tag, buf_ptr, len_ptr} (24 bytes) into activeReadMapFD keyed by pid_tgid.
 // If lenPtrOff > 0 (e.g. SSL_read_ex where rcx at offset 88 holds size_t *readbytes), it records that pointer too.
 func BuildReadEnterProgram(activeReadMapFD int, connOff, bufOff, lenPtrOff int16, isSyscall bool) []BPFInsn {
+	selfPID := int32(os.Getpid())
 	var insns []BPFInsn
 	insns = append(insns,
 		bpfMov64Reg(bpfReg6, bpfReg1),
@@ -298,6 +305,9 @@ func BuildReadEnterProgram(activeReadMapFD int, connOff, bufOff, lenPtrOff int16
 		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
 		// Stack: [fp-8] = pid_tgid, [fp-32] = conn_tag, [fp-24] = buf_ptr, [fp-16] = len_ptr
 		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0),
+		bpfRsh64Imm(bpfReg1, 32),
+		bpfJmpImm(bpfJEQ, bpfReg1, selfPID, -1),
 		bpfStXMemDW(bpfReg10, bpfReg0, -8),
 		bpfStXMemDW(bpfReg10, bpfReg7, -32),
 		bpfStXMemDW(bpfReg10, bpfReg8, -24),
@@ -323,11 +333,15 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 	if isSyscall {
 		dirImm = 3 // 3 = DirRead (syscall tracepoint)
 	}
+	selfPID := int32(os.Getpid())
 	var insns []BPFInsn
 	insns = append(insns,
 		// R9 = return value (bytes read for SSL_read/read, or 1 for SSL_read_ex)
 		bpfLdXMemDW(bpfReg9, bpfReg1, retOff),
 		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0),
+		bpfRsh64Imm(bpfReg1, 32),
+		bpfJmpImm(bpfJEQ, bpfReg1, selfPID, -1),
 		bpfStXMemDW(bpfReg10, bpfReg0, -8),
 	)
 	// R0 = bpf_map_lookup_elem(activeReadMapFD, fp-8)
@@ -400,10 +414,14 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 // BuildWritevProbeProgram constructs a verifier-safe eBPF tracepoint program for `syscalls/sys_enter_writev(fd, vec, vlen)`
 // that unrolls and captures up to 2 scatter-gather `struct iovec { void *base; size_t len; }` segments (e.g. HTTP Header + Body in Bun/uSockets).
 func BuildWritevProbeProgram(ringbufMapFD int) []BPFInsn {
+	selfPID := int32(os.Getpid())
 	var insns []BPFInsn
-	// R6 = R1 (tracepoint ctx)
+	// R6 = R1 (tracepoint ctx); filter out selfPID in kernel space
 	insns = append(insns,
 		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfRsh64Imm(bpfReg0, 32),
+		bpfJmpImm(bpfJEQ, bpfReg0, selfPID, -1),
 		bpfLdXMemDW(bpfReg7, bpfReg6, 16), // fd
 		bpfJmpImm(bpfJSLE, bpfReg7, 2, -1),
 		bpfAnd64Imm(bpfReg7, 0xffff),
@@ -685,17 +703,23 @@ func StartEBPFEngine(
 	// Raise RLIMIT_MEMLOCK for kernels < 5.11 if permitted
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
 
-	ringBytes := 8 << 20 // 8 MiB ring buffer (~2036 max-sized 4 KiB events)
+	ringBytes := 16 << 20 // 16 MiB ring buffer (~4072 max-sized 4 KiB events)
 	ringFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_RINGBUF, 0, 0, uint32(ringBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create ringbuf map: %w", err)
 	}
-	sslReadMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 4096)
+	sslReadMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_LRU_HASH, 8, 24, 16384)
+	if err != nil {
+		sslReadMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 16384)
+	}
 	if err != nil {
 		_ = unix.Close(ringFD)
 		return nil, fmt.Errorf("create active_ssl_read hash map: %w", err)
 	}
-	sysReadMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 4096)
+	sysReadMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_LRU_HASH, 8, 24, 16384)
+	if err != nil {
+		sysReadMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 16384)
+	}
 	if err != nil {
 		_ = unix.Close(ringFD)
 		_ = unix.Close(sslReadMapFD)
@@ -1132,6 +1156,16 @@ func (e *EBPFEngine) parseAndDispatchRecord(raw []byte, selfPID int) {
 	if (dirVal & 2) != 0 {
 		mode = "ebpf_tracepoint"
 		connID = fmt.Sprintf("ebpf_fd_%x", connTag&0xffff)
+		// Quickly ignore binary ELF/object/file chunks (containing NUL byte in first 32 bytes) on syscall tracepoints
+		checkLen := len(payload)
+		if checkLen > 32 {
+			checkLen = 32
+		}
+		for i := 0; i < checkLen; i++ {
+			if payload[i] == 0 {
+				return
+			}
+		}
 	}
 	e.onEvent(pid, tid, connID, dir, payload, mode)
 }

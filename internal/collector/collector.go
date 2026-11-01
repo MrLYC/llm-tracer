@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,8 @@ import (
 	"github.com/liuyicong/llm-tracer/internal/selfmon"
 	"github.com/liuyicong/llm-tracer/internal/store"
 )
+
+var sockSeq uint64
 
 type Collector struct {
 	mu           sync.RWMutex
@@ -98,8 +101,8 @@ func (c *Collector) Start(ctx context.Context) error {
 
 	// Use a short socket path in /tmp if cacheDir path is long (AF_UNIX 108-byte limit)
 	sockPath := filepath.Join(hooksDir, "tls.sock")
-	if len(sockPath) > 96 {
-		sockPath = filepath.Join(os.TempDir(), fmt.Sprintf("llm-tracer-%d.sock", os.Getpid()))
+	if len(sockPath) > 80 {
+		sockPath = filepath.Join("/tmp", fmt.Sprintf("llmt-%d-%d.sock", os.Getpid(), atomic.AddUint64(&sockSeq, 1)))
 	}
 	pipePath := filepath.Join(hooksDir, "tls.bin")
 	_ = os.WriteFile(pipePath, nil, 0o666)
@@ -367,11 +370,16 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 	}
 	if preloadPath != "" {
 		if runtime.GOOS == "darwin" {
-			existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
-			if existingDyld != "" {
-				env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath+":"+existingDyld)
-			} else {
-				env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath)
+			if !isJavaBinary(binPath) {
+				existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
+				if existingDyld != "" {
+					env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath+":"+existingDyld)
+				} else {
+					env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath)
+				}
+				if prof != nil && prof.TLSStack == "dynamic-libssl" {
+					env = setEnvVar(env, "DYLD_FORCE_FLAT_NAMESPACE", "1")
+				}
 			}
 		} else if runtime.GOOS == "linux" {
 			existingPreload := os.Getenv("LD_PRELOAD")
@@ -795,6 +803,12 @@ func isShellOrRuntimeBinary(exePath string) bool {
 	default:
 		return false
 	}
+}
+
+func isJavaBinary(exePath string) bool {
+	base := strings.ToLower(filepath.Base(exePath))
+	base = strings.TrimSuffix(base, ".exe")
+	return strings.HasPrefix(base, "java")
 }
 
 func setEnvVar(env []string, key, value string) []string {

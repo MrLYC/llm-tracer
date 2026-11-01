@@ -23,7 +23,16 @@ import (
 
 func findRustcExecutable() (string, error) {
 	if p, err := exec.LookPath("rustc"); err == nil && p != "" {
-		return p, nil
+		if exec.Command(p, "--version").Run() == nil {
+			return p, nil
+		}
+	}
+	if matches, err := filepath.Glob("/home/*/.rustup/toolchains/*/bin/rustc"); err == nil {
+		for i := len(matches) - 1; i >= 0; i-- {
+			if exec.Command(matches[i], "--version").Run() == nil {
+				return matches[i], nil
+			}
+		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		name := "rustc"
@@ -31,17 +40,27 @@ func findRustcExecutable() (string, error) {
 			name = "rustc.exe"
 		}
 		cand := filepath.Join(home, ".cargo", "bin", name)
-		if _, err := os.Stat(cand); err == nil {
+		if _, err := os.Stat(cand); err == nil && exec.Command(cand, "--version").Run() == nil {
 			return cand, nil
 		}
-	}
-	if matches, err := filepath.Glob("/home/*/.cargo/bin/rustc"); err == nil && len(matches) > 0 {
-		return matches[0], nil
 	}
 	return "", exec.ErrNotFound
 }
 
 func findJavaExecutables() (string, string, error) {
+	if javaHome := os.Getenv("JAVA_HOME"); javaHome != "" {
+		ext := ""
+		if runtime.GOOS == "windows" {
+			ext = ".exe"
+		}
+		jb := filepath.Join(javaHome, "bin", "java"+ext)
+		jcb := filepath.Join(javaHome, "bin", "javac"+ext)
+		if _, err1 := os.Stat(jb); err1 == nil {
+			if _, err2 := os.Stat(jcb); err2 == nil {
+				return jb, jcb, nil
+			}
+		}
+	}
 	javaBin, err := exec.LookPath("java")
 	if err != nil {
 		return "", "", err
@@ -307,7 +326,7 @@ int main(int argc, char **argv) {
 		require.NoError(t, os.WriteFile(cppSrc, []byte(cppCode), 0o644))
 		args := []string{"-O2", "-s", cppSrc, "-o", cppBin, "-lssl", "-lcrypto"}
 		if runtime.GOOS == "darwin" {
-			args = []string{"-O2", cppSrc, "-o", cppBin, "-L/opt/homebrew/opt/openssl@3/lib", "-I/opt/homebrew/opt/openssl@3/include", "-lssl", "-lcrypto"}
+			args = []string{"-O2", "-Wl,-flat_namespace", cppSrc, "-o", cppBin, "-L/opt/homebrew/opt/openssl@3/lib", "-I/opt/homebrew/opt/openssl@3/include", "-lssl", "-lcrypto"}
 		}
 		if out, err := exec.Command(gppBin, args...).CombinedOutput(); err != nil {
 			t.Skipf("g++ openssl build skipped: %v (%s)", err, string(out))
