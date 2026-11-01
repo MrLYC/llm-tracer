@@ -1,0 +1,119 @@
+name: Cross-Platform & Kernel eBPF CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-ebpf-and-compat:
+    name: Linux (User-Space + Root Kernel eBPF 15 Scenarios)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ensure kernel debugfs/tracefs and perf_event_paranoid for eBPF uprobes
+        run: |
+          sudo mount -t debugfs none /sys/kernel/debug || true
+          sudo mount -t tracefs none /sys/kernel/tracing || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          sudo sysctl -w kernel.kptr_restrict=0 || true
+          uname -a
+
+      - name: Run full test suite (Unprivileged User-Space Mode)
+        run: go test -v -count=1 ./...
+
+      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios) & 6 Runtime Compatibility Scenarios (Root)
+        run: |
+          GO_BIN="$(which go)"
+          sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
+            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform'
+
+      - name: Build Linux amd64 & arm64 binaries
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -o dist/llm-tracer-linux-amd64 ./cmd/llm-tracer
+          GOOS=linux GOARCH=arm64 go build -o dist/llm-tracer-linux-arm64 ./cmd/llm-tracer
+
+  macos-scenarios:
+    name: macOS (Darwin Process Tree + Mach-O + Runtime & LoopbackTap Capture)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run full test suite & Cross-Platform Capture Scenarios on macOS
+        run: go test -v -count=1 ./...
+
+      - name: Build macOS arm64 & amd64 binaries
+        run: |
+          mkdir -p dist
+          GOOS=darwin GOARCH=arm64 go build -o dist/llm-tracer-darwin-arm64 ./cmd/llm-tracer
+          GOOS=darwin GOARCH=amd64 go build -o dist/llm-tracer-darwin-amd64 ./cmd/llm-tracer
+
+  windows-scenarios:
+    name: Windows (Toolhelp32 Process Tree + PE + Runtime & LoopbackTap Capture)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run full test suite & Cross-Platform Capture Scenarios on Windows
+        run: go test -v -count=1 ./...
+
+      - name: Build Windows amd64 binary
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          go build -o dist/llm-tracer-windows-amd64.exe ./cmd/llm-tracer

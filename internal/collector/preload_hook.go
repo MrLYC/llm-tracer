@@ -5,12 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 )
 
 const sslHookCSource = `#define _GNU_SOURCE
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,13 @@ const sslHookCSource = `#define _GNU_SOURCE
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
 
 typedef int (*ssl_rw_fn)(void *ssl, void *buf, int num);
 typedef int (*ssl_rw_ex_fn)(void *ssl, void *buf, size_t num, size_t *processed);
@@ -46,6 +55,9 @@ static void *resolve_ssl_sym(const char *name) {
             "/usr/lib/x86_64-linux-gnu/libssl.so.3",
             "libssl.so.1.1",
             "libssl.so",
+            "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+            "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+            "libssl.3.dylib",
             NULL
         };
         for (int i = 0; candidates[i] != NULL && !ssl_handle; i++) {
@@ -68,7 +80,13 @@ static void send_tls_chunk(void *ssl, const void *buf, size_t len, uint32_t dir)
     uint32_t hdr[6];
     hdr[0] = 0x4c4c4d54U; /* "LLMT" */
     hdr[1] = (uint32_t)getpid();
+#ifdef __APPLE__
+    uint64_t tid64 = 0;
+    pthread_threadid_np(NULL, &tid64);
+    hdr[2] = (uint32_t)tid64;
+#else
     hdr[2] = (uint32_t)syscall(SYS_gettid);
+#endif
     hdr[3] = (uint32_t)((uintptr_t)ssl & 0xffffffffU);
     hdr[4] = dir;
     hdr[5] = capped;
@@ -312,26 +330,39 @@ int close(int fd) {
 }
 `
 
-// EnsureSSLPreloadHook compiles libllmtracer_ssl.so into hooksDir if gcc is available.
+// EnsureSSLPreloadHook compiles libllmtracer_ssl.so (Linux) or libllmtracer_ssl.dylib (macOS) into hooksDir.
 func EnsureSSLPreloadHook(hooksDir string) (string, error) {
+	if runtime.GOOS == "windows" {
+		return "", fmt.Errorf("preload hook not used on windows")
+	}
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		return "", err
 	}
 	cPath := filepath.Join(hooksDir, "libllmtracer_ssl.c")
 	soPath := filepath.Join(hooksDir, "libllmtracer_ssl.so")
+	if runtime.GOOS == "darwin" {
+		soPath = filepath.Join(hooksDir, "libllmtracer_ssl.dylib")
+	}
 	if existingC, err := os.ReadFile(cPath); err == nil && string(existingC) == sslHookCSource {
 		if info, err := os.Stat(soPath); err == nil && info.Size() > 0 {
 			return soPath, nil
 		}
 	}
-	gccPath, err := exec.LookPath("gcc")
+	ccPath, err := exec.LookPath("gcc")
 	if err != nil {
-		return "", fmt.Errorf("gcc not found: %w", err)
+		ccPath, err = exec.LookPath("cc")
+		if err != nil {
+			return "", fmt.Errorf("c compiler not found: %w", err)
+		}
 	}
 	if err := os.WriteFile(cPath, []byte(sslHookCSource), 0o644); err != nil {
 		return "", err
 	}
-	cmd := exec.Command(gccPath, "-shared", "-fPIC", "-O2", "-o", soPath, cPath, "-ldl")
+	args := []string{"-shared", "-fPIC", "-O2", "-o", soPath, cPath, "-ldl"}
+	if runtime.GOOS == "darwin" {
+		args = []string{"-dynamiclib", "-fPIC", "-O2", "-o", soPath, cPath}
+	}
+	cmd := exec.Command(ccPath, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("compile ssl hook: %w (%s)", err, string(out))
 	}

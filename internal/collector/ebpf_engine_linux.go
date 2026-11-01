@@ -1,3 +1,5 @@
+//go:build linux
+
 package collector
 
 import (
@@ -1132,4 +1134,40 @@ func (e *EBPFEngine) parseAndDispatchRecord(raw []byte, selfPID int) {
 		connID = fmt.Sprintf("ebpf_fd_%x", connTag&0xffff)
 	}
 	e.onEvent(pid, tid, connID, dir, payload, mode)
+}
+
+// TryAttachKernelUprobe attempts to open a Linux uprobe perf_event for the target symbol offset.
+// If the current process lacks CAP_BPF/CAP_PERFMON/root, it returns a descriptive error without crashing.
+func TryAttachKernelUprobe(binaryPath string, offset uint64) (int, error) {
+	pmuTypeBytes, err := os.ReadFile("/sys/bus/event_source/devices/uprobe/type")
+	if err != nil {
+		return -1, fmt.Errorf("read uprobe pmu type: %w", err)
+	}
+	pmuType, err := strconv.Atoi(strings.TrimSpace(string(pmuTypeBytes)))
+	if err != nil {
+		return -1, fmt.Errorf("invalid uprobe pmu type: %w", err)
+	}
+	cPath, err := unix.BytePtrFromString(binaryPath)
+	if err != nil {
+		return -1, err
+	}
+
+	attr := unix.PerfEventAttr{
+		Type:   uint32(pmuType),
+		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+		Ext1:   uint64(uintptr(unsafe.Pointer(cPath))),
+		Ext2:   offset,
+		Sample: 1,
+		Wakeup: 1,
+	}
+	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	runtime.KeepAlive(cPath)
+	if err != nil {
+		return -1, fmt.Errorf("perf_event_open uprobe on %s: %w", filepath.Base(binaryPath), err)
+	}
+	return fd, nil
+}
+
+func closeKernelFD(fd int) {
+	_ = unix.Close(fd)
 }

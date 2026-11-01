@@ -189,3 +189,28 @@ sudo /path/to/go test -v -count=1 ./internal/collector -run 'TestEBPF|TestRealKe
 13. **`EBPF_Scenario13_ScopeFilters_Exe_Cwd_Cmd_And_HostFilter`**：验证 `--exe`、`--cwd`、`--cmd`、`--host` 四维范围过滤在内核 eBPF 采集链路下的命中与拦截。
 14. **`EBPF_Scenario14_ConcurrentMultiProcess_ParallelTLSStreams_And_Correlation`**：验证多进程高并发 TLS 流并行抓取零串流与会话独立关联。
 15. **`EBPF_Scenario15_LaunchCommand_SubprocessTree_And_SelfMonitoringAudit`**：验证 `LaunchCommand` (`-- <cmd>`) 包装脚本子进程树端到端抓取与 `selfmon` 自监控指标审计。
+
+---
+
+## 六、跨平台采集架构（Linux / macOS / Windows）与 GitHub Actions CI
+
+`llm-tracer` 的流重组器（`internal/parser`）、多协议解析器（`systemone` / OpenAI / Anthropic / Gemini / Ollama）、三级会话串联器（`internal/correlator`）、10 分钟热窗文件存储（`internal/store`）、自监控（`internal/selfmon`）与 Web/TOTP 控制台（`internal/web`）均为 100% 纯 Go 跨平台实现；采集层（`internal/collector`）按操作系统提供原生适配：
+
+| 能力维度 | Linux (`linux`) | macOS (`darwin`) | Windows (`windows`) |
+|---|---|---|---|
+| **内核态零注入采集** | `ebpf_engine_linux.go`（11 个原生 eBPF 程序、19 个 Uprobe/Uretprobe/Syscall Tracepoint，`8 MiB` `BPF_MAP_TYPE_RINGBUF`） | `ebpf_engine_other.go`（自动降级至用户态 Hook 与 `LoopbackTap`） | `ebpf_engine_other.go`（自动降级至用户态 Hook 与 `LoopbackTap`） |
+| **进程树与范围过滤** | `proctree_linux.go`（`/proc/<pid>/stat`、`task/*/children`、`cmdline`、`exe`、`cwd`） | `proctree_darwin.go`（`sysctl kern.proc.all` / `kern.proc.pid` + `ps` / `lsof`） | `proctree_windows.go`（Win32 `CreateToolhelp32Snapshot`、`Process32First/Next`、`QueryFullProcessImageName`） |
+| **多格式二进制符号解析** | `debug/elf`（`.dynsym` + `.symtab` + Go PCLNTAB 栈扩容跳过与 `RET` 扫描） | `debug/macho`（Mach-O 符号表与 `crypto/tls` 符号识别） | `debug/pe`（PE `.exe`/`.dll` 符号表与 `crypto/tls` 符号识别） |
+| **Python / Node / Bun 零配置 Hook** | `PYTHONPATH` (`sitecustomize.py`)、`NODE_OPTIONS` / `BUN_OPTIONS` (`node_hook.cjs`)、`LD_PRELOAD` (`.so`) | `PYTHONPATH`、`NODE_OPTIONS` / `BUN_OPTIONS`、`DYLD_INSERT_LIBRARIES` (`.dylib`) | `PYTHONPATH`（`os.O_BINARY` 二进制帧管道）、`NODE_OPTIONS` / `BUN_OPTIONS` |
+| **原生编译二进制 (`codex` / Go / `curl`)** | Root eBPF Uprobe/Tracepoint 或 `llm_tracer_ptrace` + `LoopbackTap` | `LoopbackTap` 本地动态 CA + `HTTPS_PROXY` / `SSL_CERT_FILE` 自动注入 | `LoopbackTap` 本地动态 CA + `HTTPS_PROXY` / `SSL_CERT_FILE` 自动注入 |
+
+### GitHub Actions 自动化验证矩阵 (`.github/workflows/ci.yml`)
+
+仓库内置三端 CI 流水线（`ubuntu-latest`、`macos-latest`、`windows-latest`）：
+
+- **`linux-ebpf-and-compat` (`ubuntu-latest`)**：
+  1. 非特权模式执行全量单元测试与跨平台场景测试（`go test -v -count=1 ./...`）；
+  2. Root 权限下实测挂载 **11 个内核 eBPF 程序（19 个探针）** 并运行 **15 大真实内核 eBPF 场景**（`TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot`）与 **6 大运行时兼容场景**（`TestCompatibilityMatrixAllRuntimeScenarios`）；
+  3. 交叉构建 `linux/amd64` 与 `linux/arm64` 二进制。
+- **`macos-scenarios` (`macos-latest`)**：验证 Darwin `sysctl` 进程树过滤、ELF/Mach-O/PE 三格式符号解析、Python `ssl.SSLSocket`、Node.js `tls.TLSSocket` 多轮对话及原生 Mach-O Go HTTPS 客户端通过 `LoopbackTap` 的端到端抓取，并构建 `darwin/arm64` 与 `darwin/amd64` 二进制。
+- **`windows-scenarios` (`windows-latest`)**：验证 Windows `Toolhelp32` 进程树过滤、ELF/Mach-O/PE 三格式符号解析、Python/Node.js TLS Hook（含 `O_BINARY` 管道帧）及原生 PE `.exe` Go HTTPS 客户端端到端抓取，并构建 `windows/amd64` 二进制。

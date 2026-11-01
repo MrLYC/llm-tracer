@@ -35,7 +35,13 @@
 # 使用 mise 管理的 Go 1.26.5 构建测试
 mise exec go@1.26.5 -- go test -v -count=1 ./...
 mise exec go@1.26.5 -- go test -v -count=1 ./internal/collector -run TestCompatibilityMatrixAllRuntimeScenarios
+mise exec go@1.26.5 -- go test -v -count=1 ./internal/collector -run TestCrossPlatform
 mise exec go@1.26.5 -- go build -o bin/llm-tracer ./cmd/llm-tracer
+
+# 交叉编译 Linux / macOS / Windows 发行二进制
+GOOS=linux GOARCH=amd64 mise exec go@1.26.5 -- go build -o dist/llm-tracer-linux-amd64 ./cmd/llm-tracer
+GOOS=darwin GOARCH=arm64 mise exec go@1.26.5 -- go build -o dist/llm-tracer-darwin-arm64 ./cmd/llm-tracer
+GOOS=windows GOARCH=amd64 mise exec go@1.26.5 -- go build -o dist/llm-tracer-windows-amd64.exe ./cmd/llm-tracer
 
 # 1. 直接拉起命令并抓取（含所有子进程）
 ./bin/llm-tracer capture --listen 127.0.0.1:8787 -- uv run jev-release ripgrep --storybook 40-full --no-interactive

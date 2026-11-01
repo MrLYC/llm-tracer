@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 )
 
 type RuntimeHookPaths struct {
@@ -65,7 +66,7 @@ def _emit_chunk(conn_tag, data, direction):
         hdr = struct.pack("=IIIIII", _MAGIC, pid, tid, conn_tag & 0xFFFFFFFF, direction, len(raw))
         frame = hdr + raw
         sock_path = os.environ.get("LLM_TRACER_SOCK", "")
-        if sock_path:
+        if sock_path and hasattr(socket, "AF_UNIX"):
             try:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(0.05)
@@ -78,7 +79,8 @@ def _emit_chunk(conn_tag, data, direction):
         pipe_path = os.environ.get("LLM_TRACER_PIPE", "")
         if pipe_path:
             try:
-                fd = os.open(pipe_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+                fd = os.open(pipe_path, flags, 0o666)
                 os.write(fd, frame)
                 os.close(fd)
             except Exception:
@@ -611,16 +613,18 @@ func EnsureRuntimeHooks(hooksDir string) (*RuntimeHookPaths, error) {
 		out.NodeHookJS = nodePath
 	}
 
-	// 3. Ptrace syscall helper for static-pie (codex) and Go binaries
-	ptraceC := filepath.Join(hooksDir, "llm_tracer_ptrace.c")
-	ptraceBin := filepath.Join(hooksDir, "llm_tracer_ptrace")
-	if err := os.WriteFile(ptraceC, []byte(ptraceHelperCSource), 0o644); err == nil {
-		if gccPath, err := exec.LookPath("gcc"); err == nil {
-			cmd := exec.Command(gccPath, "-O2", ptraceC, "-o", ptraceBin)
-			if outBytes, err := cmd.CombinedOutput(); err == nil {
-				out.PtraceBin = ptraceBin
-			} else {
-				return out, fmt.Errorf("compile ptrace helper: %w (%s)", err, string(outBytes))
+	// 3. Ptrace syscall helper for Linux static-pie (codex) and Go binaries
+	if runtime.GOOS == "linux" {
+		ptraceC := filepath.Join(hooksDir, "llm_tracer_ptrace.c")
+		ptraceBin := filepath.Join(hooksDir, "llm_tracer_ptrace")
+		if err := os.WriteFile(ptraceC, []byte(ptraceHelperCSource), 0o644); err == nil {
+			if gccPath, err := exec.LookPath("gcc"); err == nil {
+				cmd := exec.Command(gccPath, "-O2", ptraceC, "-o", ptraceBin)
+				if outBytes, err := cmd.CombinedOutput(); err == nil {
+					out.PtraceBin = ptraceBin
+				} else {
+					return out, fmt.Errorf("compile ptrace helper: %w (%s)", err, string(outBytes))
+				}
 			}
 		}
 	}
@@ -629,6 +633,9 @@ func EnsureRuntimeHooks(hooksDir string) (*RuntimeHookPaths, error) {
 
 // CanUsePtrace tests whether the current process/sandbox permits PTRACE_TRACEME on a child process.
 func CanUsePtrace() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
 	cmd := exec.Command("sh", "-c", "exit 0")
 	if cmd.SysProcAttr == nil {
 		// Quick probe via python3 or ptrace_scope

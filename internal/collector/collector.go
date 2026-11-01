@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -364,30 +365,41 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 		env = append(env, "LLM_TRACER_PIPE="+pipePath)
 	}
 	if preloadPath != "" {
-		existingPreload := os.Getenv("LD_PRELOAD")
-		if existingPreload != "" {
-			env = append(env, "LD_PRELOAD="+preloadPath+":"+existingPreload)
-		} else {
-			env = append(env, "LD_PRELOAD="+preloadPath)
+		if runtime.GOOS == "darwin" {
+			existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
+			if existingDyld != "" {
+				env = append(env, "DYLD_INSERT_LIBRARIES="+preloadPath+":"+existingDyld)
+			} else {
+				env = append(env, "DYLD_INSERT_LIBRARIES="+preloadPath)
+			}
+		} else if runtime.GOOS == "linux" {
+			existingPreload := os.Getenv("LD_PRELOAD")
+			if existingPreload != "" {
+				env = append(env, "LD_PRELOAD="+preloadPath+":"+existingPreload)
+			} else {
+				env = append(env, "LD_PRELOAD="+preloadPath)
+			}
 		}
 	}
 	if rtHooks != nil {
 		if rtHooks.PyHookDir != "" {
 			existingPyPath := os.Getenv("PYTHONPATH")
+			sep := string(os.PathListSeparator)
 			if existingPyPath != "" {
-				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir+":"+existingPyPath)
+				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir+sep+existingPyPath)
 			} else {
 				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir)
 			}
 		}
 		if rtHooks.NodeHookJS != "" {
-			reqOpt := "--require " + rtHooks.NodeHookJS
+			nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
+			reqOpt := "--require " + nodeHookSlash
 			if existingNodeOpts := os.Getenv("NODE_OPTIONS"); existingNodeOpts != "" {
 				env = append(env, "NODE_OPTIONS="+existingNodeOpts+" "+reqOpt)
 			} else {
 				env = append(env, "NODE_OPTIONS="+reqOpt)
 			}
-			preloadOpt := "--preload " + rtHooks.NodeHookJS
+			preloadOpt := "--preload " + nodeHookSlash
 			if existingBunOpts := os.Getenv("BUN_OPTIONS"); existingBunOpts != "" {
 				env = append(env, "BUN_OPTIONS="+existingBunOpts+" "+preloadOpt)
 			} else {
@@ -395,12 +407,14 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 			}
 		}
 	}
-	if prof != nil && prof.RequiresPtrace && tap != nil {
+	if tap != nil && ((prof != nil && prof.RequiresPtrace) || runtime.GOOS != "linux") {
 		if os.Getenv("HTTP_PROXY") == "" && os.Getenv("HTTPS_PROXY") == "" {
 			env = append(env,
 				"HTTPS_PROXY="+tap.ProxyURL(),
 				"https_proxy="+tap.ProxyURL(),
 				"SSL_CERT_FILE="+tap.CABundlePath(),
+				"CURL_CA_BUNDLE="+tap.CABundlePath(),
+				"REQUESTS_CA_BUNDLE="+tap.CABundlePath(),
 				"NODE_EXTRA_CA_CERTS="+tap.CABundlePath(),
 			)
 			if !CanUsePtrace() {

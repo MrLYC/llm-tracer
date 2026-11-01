@@ -5,16 +5,14 @@ import (
 	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
+	"debug/macho"
+	"debug/pe"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/liuyicong/llm-tracer/internal/selfmon"
-	"golang.org/x/sys/unix"
 )
 
 type ProbeTarget struct {
@@ -46,6 +44,10 @@ func DiscoverOpenSSLTargets(pids []int, exes ...string) []ProbeTarget {
 		"/lib/aarch64-linux-gnu/libssl.so.3",
 		"/lib64/libssl.so.3",
 		"/lib/x86_64-linux-gnu/libssl.so.1.1",
+		"/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+		"/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+		"/opt/homebrew/lib/libssl.dylib",
+		"/usr/local/lib/libssl.dylib",
 	}
 	for _, pid := range pids {
 		if exeLink, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeLink != "" {
@@ -79,7 +81,8 @@ func DiscoverOpenSSLTargets(pids []int, exes ...string) []ProbeTarget {
 		}
 		seen[realPath] = true
 		probeType := "openssl"
-		if !strings.Contains(filepath.Base(realPath), "libssl.so") {
+		base := strings.ToLower(filepath.Base(realPath))
+		if !strings.Contains(base, "libssl") && !strings.Contains(base, "ssleay") {
 			probeType = "static_openssl"
 		}
 		out = append(out, ProbeTarget{
@@ -91,15 +94,9 @@ func DiscoverOpenSSLTargets(pids []int, exes ...string) []ProbeTarget {
 	return out
 }
 
-// ResolveOpenSSLSymbols parses an ELF shared library or executable and returns file offsets for SSL_write/SSL_read
-// and Python MemoryBIO functions from both .dynsym and .symtab (including local 't' symbols in static builds).
+// ResolveOpenSSLSymbols parses an ELF, Mach-O, or PE shared library or executable and returns file offsets for SSL_write/SSL_read
+// and Python MemoryBIO functions.
 func ResolveOpenSSLSymbols(elfPath string) (map[string]uint64, error) {
-	f, err := elf.Open(elfPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
 	wanted := map[string]bool{
 		"SSL_write":            true,
 		"SSL_write_ex":         true,
@@ -109,21 +106,53 @@ func ResolveOpenSSLSymbols(elfPath string) (map[string]uint64, error) {
 		"_ssl_MemoryBIO_read":  true,
 	}
 	offsets := make(map[string]uint64)
-	collectSyms := func(syms []elf.Symbol) {
-		for _, s := range syms {
-			baseName := strings.Split(s.Name, "@")[0]
-			if wanted[baseName] && s.Value > 0 {
-				offsets[baseName] = vaddrToFileOffset(f, s.Value)
+
+	if f, err := elf.Open(elfPath); err == nil {
+		defer f.Close()
+		collectSyms := func(syms []elf.Symbol) {
+			for _, s := range syms {
+				baseName := strings.Split(s.Name, "@")[0]
+				if wanted[baseName] && s.Value > 0 {
+					offsets[baseName] = vaddrToFileOffset(f, s.Value)
+				}
 			}
 		}
+		if dynSyms, err := f.DynamicSymbols(); err == nil {
+			collectSyms(dynSyms)
+		}
+		if stdSyms, err := f.Symbols(); err == nil {
+			collectSyms(stdSyms)
+		}
+		return offsets, nil
 	}
-	if dynSyms, err := f.DynamicSymbols(); err == nil {
-		collectSyms(dynSyms)
+
+	if mf, err := macho.Open(elfPath); err == nil {
+		defer mf.Close()
+		if mf.Symtab != nil {
+			for _, s := range mf.Symtab.Syms {
+				name := strings.TrimPrefix(s.Name, "_")
+				if wanted[name] && s.Value > 0 {
+					offsets[name] = s.Value
+				} else if wanted[s.Name] && s.Value > 0 {
+					offsets[s.Name] = s.Value
+				}
+			}
+		}
+		return offsets, nil
 	}
-	if stdSyms, err := f.Symbols(); err == nil {
-		collectSyms(stdSyms)
+
+	if pf, err := pe.Open(elfPath); err == nil {
+		defer pf.Close()
+		for _, s := range pf.Symbols {
+			name := strings.TrimPrefix(s.Name, "_")
+			if wanted[name] && s.Value > 0 {
+				offsets[name] = uint64(s.Value)
+			}
+		}
+		return offsets, nil
 	}
-	return offsets, nil
+
+	return nil, fmt.Errorf("unsupported binary format: %s", elfPath)
 }
 
 // InspectBinaryProfile analyzes an executable (or wrapper script) to classify its linkage and TLS stack.
@@ -133,6 +162,71 @@ func InspectBinaryProfile(binaryPath string) (*BinaryProfile, error) {
 	if err != nil {
 		realPath = targetPath
 	}
+
+	if gt, err := InspectGoTLSTarget(realPath); err == nil && gt != nil {
+		return &BinaryProfile{
+			RequestedPath:  binaryPath,
+			ResolvedELF:    realPath,
+			LinkMode:       "dynamic",
+			TLSStack:       "gotls",
+			GoVersion:      gt.GoVersion,
+			RequiresPtrace: true,
+			Symbols:        gt.Symbols,
+		}, nil
+	}
+
+	if mf, err := macho.Open(realPath); err == nil {
+		defer mf.Close()
+		libs, _ := mf.ImportedLibraries()
+		for _, lib := range libs {
+			if strings.Contains(strings.ToLower(filepath.Base(lib)), "libssl") {
+				syms, _ := ResolveOpenSSLSymbols(realPath)
+				return &BinaryProfile{
+					RequestedPath:  binaryPath,
+					ResolvedELF:    realPath,
+					LinkMode:       "dynamic",
+					TLSStack:       "dynamic-libssl",
+					RequiresPtrace: false,
+					Symbols:        syms,
+				}, nil
+			}
+		}
+		if syms, err := ResolveOpenSSLSymbols(realPath); err == nil && len(syms) > 0 {
+			return &BinaryProfile{
+				RequestedPath:  binaryPath,
+				ResolvedELF:    realPath,
+				LinkMode:       "dynamic",
+				TLSStack:       "static-openssl",
+				RequiresPtrace: false,
+				Symbols:        syms,
+			}, nil
+		}
+		return &BinaryProfile{
+			RequestedPath:  binaryPath,
+			ResolvedELF:    realPath,
+			LinkMode:       "dynamic",
+			TLSStack:       "stripped-embedded-tls",
+			RequiresPtrace: false,
+		}, nil
+	}
+
+	if pf, err := pe.Open(realPath); err == nil {
+		defer pf.Close()
+		syms, _ := ResolveOpenSSLSymbols(realPath)
+		tlsStack := "stripped-embedded-tls"
+		if len(syms) > 0 {
+			tlsStack = "static-openssl"
+		}
+		return &BinaryProfile{
+			RequestedPath:  binaryPath,
+			ResolvedELF:    realPath,
+			LinkMode:       "dynamic",
+			TLSStack:       tlsStack,
+			RequiresPtrace: false,
+			Symbols:        syms,
+		}, nil
+	}
+
 	f, err := elf.Open(realPath)
 	if err != nil {
 		return nil, err
@@ -145,22 +239,6 @@ func InspectBinaryProfile(binaryPath string) (*BinaryProfile, error) {
 			hasInterp = true
 			break
 		}
-	}
-	linkMode := "dynamic"
-	if !hasInterp {
-		linkMode = "static-pie"
-	}
-
-	if gt, err := InspectGoTLSTarget(realPath); err == nil && gt != nil {
-		return &BinaryProfile{
-			RequestedPath:  binaryPath,
-			ResolvedELF:    realPath,
-			LinkMode:       linkMode,
-			TLSStack:       "gotls",
-			GoVersion:      gt.GoVersion,
-			RequiresPtrace: true,
-			Symbols:        gt.Symbols,
-		}, nil
 	}
 
 	if !hasInterp {
@@ -257,43 +335,64 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	}
 	defer rawFile.Close()
 
-	f, err := elf.Open(realPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
 	syms := make(map[string]uint64)
 	var readRetOffsets []uint64
-	if elfSyms, err := f.Symbols(); err == nil {
-		for _, s := range elfSyms {
+	if f, err := elf.Open(realPath); err == nil {
+		defer f.Close()
+		if elfSyms, err := f.Symbols(); err == nil {
+			for _, s := range elfSyms {
+				switch s.Name {
+				case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
+					if s.Value > 0 {
+						baseOff := vaddrToFileOffset(f, s.Value)
+						entryOff := baseOff
+						if f.Machine == elf.EM_X86_64 && s.Size > 16 {
+							code := make([]byte, s.Size)
+							if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
+								// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
+								// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
+								prologueWindow := code
+								if len(prologueWindow) > 32 {
+									prologueWindow = prologueWindow[:32]
+								}
+								if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
+									entryOff = baseOff + uint64(idx)
+								}
+								if s.Name == "crypto/tls.(*Conn).Read" {
+									readRetOffsets = findGoX8664RetOffsets(baseOff, code)
+								}
+							}
+						}
+						syms[s.Name] = entryOff
+					}
+				}
+			}
+		}
+	} else if mf, err := macho.Open(realPath); err == nil {
+		defer mf.Close()
+		if mf.Symtab != nil {
+			for _, s := range mf.Symtab.Syms {
+				name := strings.TrimPrefix(s.Name, "_")
+				switch name {
+				case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
+					if s.Value > 0 {
+						syms[name] = s.Value
+					}
+				}
+			}
+		}
+	} else if pf, err := pe.Open(realPath); err == nil {
+		defer pf.Close()
+		for _, s := range pf.Symbols {
 			switch s.Name {
 			case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
 				if s.Value > 0 {
-					baseOff := vaddrToFileOffset(f, s.Value)
-					entryOff := baseOff
-					if f.Machine == elf.EM_X86_64 && s.Size > 16 {
-						code := make([]byte, s.Size)
-						if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
-							// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
-							// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
-							prologueWindow := code
-							if len(prologueWindow) > 32 {
-								prologueWindow = prologueWindow[:32]
-							}
-							if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
-								entryOff = baseOff + uint64(idx)
-							}
-							if s.Name == "crypto/tls.(*Conn).Read" {
-								readRetOffsets = findGoX8664RetOffsets(baseOff, code)
-							}
-						}
-					}
-					syms[s.Name] = entryOff
+					syms[s.Name] = uint64(s.Value)
 				}
 			}
 		}
 	}
+
 	return &ProbeTarget{
 		BinaryPath:          realPath,
 		Type:                "gotls",
@@ -321,38 +420,6 @@ func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
 	return out
 }
 
-// TryAttachKernelUprobe attempts to open a Linux uprobe perf_event for the target symbol offset.
-// If the current process lacks CAP_BPF/CAP_PERFMON/root, it returns a descriptive error without crashing.
-func TryAttachKernelUprobe(binaryPath string, offset uint64) (int, error) {
-	pmuTypeBytes, err := os.ReadFile("/sys/bus/event_source/devices/uprobe/type")
-	if err != nil {
-		return -1, fmt.Errorf("read uprobe pmu type: %w", err)
-	}
-	pmuType, err := strconv.Atoi(strings.TrimSpace(string(pmuTypeBytes)))
-	if err != nil {
-		return -1, fmt.Errorf("invalid uprobe pmu type: %w", err)
-	}
-	cPath, err := unix.BytePtrFromString(binaryPath)
-	if err != nil {
-		return -1, err
-	}
-
-	attr := unix.PerfEventAttr{
-		Type:   uint32(pmuType),
-		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Ext1:   uint64(uintptr(unsafe.Pointer(cPath))),
-		Ext2:   offset,
-		Sample: 1,
-		Wakeup: 1,
-	}
-	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
-	runtime.KeepAlive(cPath)
-	if err != nil {
-		return -1, fmt.Errorf("perf_event_open uprobe on %s: %w", filepath.Base(binaryPath), err)
-	}
-	return fd, nil
-}
-
 func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []ProbeTarget {
 	var results []ProbeTarget
 	sslTargets := DiscoverOpenSSLTargets(pids, exes...)
@@ -364,7 +431,7 @@ func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []Pr
 		}
 		fd, err := TryAttachKernelUprobe(t.BinaryPath, firstOff)
 		if err == nil && fd >= 0 {
-			_ = unix.Close(fd)
+			closeKernelFD(fd)
 			t.Attached = true
 			t.Note = "eBPF uprobe attached"
 			if mon != nil {

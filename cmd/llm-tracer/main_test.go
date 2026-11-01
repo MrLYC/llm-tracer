@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -16,9 +17,12 @@ func TestParseDurationWithDaysAndCLI(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 10*time.Minute, d2)
 
+	selfExe, err := os.Executable()
+	require.NoError(t, err)
+
 	dir := t.TempDir()
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"capture", "-d", dir, "-l", "off", "--exit-with-child", "--", "sh", "-c", "exit 0"})
+	cmd.SetArgs([]string{"capture", "-d", dir, "-l", "off", "--exit-with-child", "--", selfExe, "-test.run=^$"})
 	require.NoError(t, cmd.Execute())
 
 	statusCmd := newRootCmd()

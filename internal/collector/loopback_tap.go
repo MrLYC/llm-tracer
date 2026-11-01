@@ -66,9 +66,16 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
 	// Append system CA bundle if present so upstream verification inside target process still trusts public CAs
 	var combinedPEM bytes.Buffer
-	if sysCA, err := os.ReadFile("/etc/ssl/certs/ca-certificates.crt"); err == nil {
-		combinedPEM.Write(sysCA)
-		combinedPEM.WriteByte('\n')
+	for _, sysCAPath := range []string{
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/ssl/cert.pem",
+	} {
+		if sysCA, err := os.ReadFile(sysCAPath); err == nil && len(sysCA) > 0 {
+			combinedPEM.Write(sysCA)
+			combinedPEM.WriteByte('\n')
+			break
+		}
 	}
 	combinedPEM.Write(caPEM)
 	caPath := filepath.Join(hooksDir, "llm_tracer_ca_bundle.pem")
