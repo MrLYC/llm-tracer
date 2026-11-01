@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"debug/buildinfo"
 	"debug/elf"
+	"debug/gosym"
 	"debug/macho"
 	"debug/pe"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -346,40 +348,72 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	}
 	defer rawFile.Close()
 
-	syms := make(map[string]uint64)
-	var readRetOffsets []uint64
-	if f, err := elf.Open(realPath); err == nil {
-		defer f.Close()
-		if elfSyms, err := f.Symbols(); err == nil {
-			for _, s := range elfSyms {
-				switch s.Name {
+		syms := make(map[string]uint64)
+		var readRetOffsets []uint64
+		if f, err := elf.Open(realPath); err == nil {
+			defer f.Close()
+			processGoFunc := func(name string, vaddr, fnSize uint64) {
+				switch name {
 				case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
-					if s.Value > 0 {
-						baseOff := vaddrToFileOffset(f, s.Value)
-						entryOff := baseOff
-						if f.Machine == elf.EM_X86_64 && s.Size > 16 {
-							code := make([]byte, s.Size)
-							if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
-								// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
-								// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
-								prologueWindow := code
-								if len(prologueWindow) > 32 {
-									prologueWindow = prologueWindow[:32]
-								}
-								if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
-									entryOff = baseOff + uint64(idx)
-								}
-								if s.Name == "crypto/tls.(*Conn).Read" {
-									readRetOffsets = findGoX8664RetOffsets(baseOff, code)
-								}
+					if vaddr == 0 {
+						return
+					}
+					baseOff := vaddrToFileOffset(f, vaddr)
+					entryOff := baseOff
+					if f.Machine == elf.EM_X86_64 && fnSize > 16 {
+						code := make([]byte, fnSize)
+						if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
+							// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
+							// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
+							prologueWindow := code
+							if len(prologueWindow) > 32 {
+								prologueWindow = prologueWindow[:32]
+							}
+							if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
+								entryOff = baseOff + uint64(idx)
+							}
+							if name == "crypto/tls.(*Conn).Read" && len(readRetOffsets) == 0 {
+								readRetOffsets = findGoX8664RetOffsets(baseOff, code)
 							}
 						}
-						syms[s.Name] = entryOff
+					}
+					syms[name] = entryOff
+				}
+			}
+			if elfSyms, err := f.Symbols(); err == nil {
+				for _, s := range elfSyms {
+					processGoFunc(s.Name, s.Value, s.Size)
+				}
+			}
+			// Fallback for stripped Go binaries (`go build -ldflags="-s -w"`): recover symbols from .gopclntab
+			if len(syms) == 0 {
+				var pclnSec *elf.Section
+				for _, secName := range []string{".gopclntab", ".data.rel.ro.gopclntab"} {
+					if s := f.Section(secName); s != nil {
+						pclnSec = s
+						break
+					}
+				}
+				if pclnSec != nil {
+					if pclnData, err := pclnSec.Data(); err == nil && len(pclnData) > 16 {
+						var textStart uint64
+						if txtSec := f.Section(".text"); txtSec != nil {
+							textStart = txtSec.Addr
+						}
+						lt := gosym.NewLineTable(pclnData, textStart)
+						if tab, err := gosym.NewTable(nil, lt); err == nil && tab != nil {
+							for _, fn := range tab.Funcs {
+								var sz uint64
+								if fn.End > fn.Entry {
+									sz = fn.End - fn.Entry
+								}
+								processGoFunc(fn.Name, fn.Entry, sz)
+							}
+						}
 					}
 				}
 			}
-		}
-	} else if mf, err := macho.Open(realPath); err == nil {
+		} else if mf, err := macho.Open(realPath); err == nil {
 		defer mf.Close()
 		if mf.Symtab != nil {
 			for _, s := range mf.Symtab.Syms {
@@ -433,7 +467,19 @@ func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
 
 func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []ProbeTarget {
 	var results []ProbeTarget
-	sslTargets := DiscoverOpenSSLTargets(pids, exes...)
+	resolvedExes := make([]string, 0, len(exes))
+	for _, e := range exes {
+		if e == "" {
+			continue
+		}
+		if _, err := os.Stat(e); err != nil {
+			if lp, lerr := exec.LookPath(e); lerr == nil {
+				e = lp
+			}
+		}
+		resolvedExes = append(resolvedExes, e)
+	}
+	sslTargets := DiscoverOpenSSLTargets(pids, resolvedExes...)
 	for _, t := range sslTargets {
 		var firstOff uint64
 		for _, off := range t.Symbols {
@@ -462,13 +508,38 @@ func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []Pr
 				})
 			}
 		}
-		results = append(results, t)
-	}
+			results = append(results, t)
+		}
 
-	for _, exePath := range exes {
-		if gt, err := InspectGoTLSTarget(exePath); err == nil && gt != nil {
-			if len(gt.Symbols) > 0 {
-				gt.Note = fmt.Sprintf("GoTLS (%s) symbols resolved", gt.GoVersion)
+		allExes := append([]string(nil), resolvedExes...)
+		for _, pid := range pids {
+			if exeLink, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeLink != "" {
+				allExes = append(allExes, exeLink)
+			}
+		}
+		seenExe := make(map[string]bool)
+		for _, exePath := range allExes {
+			if exePath == "" {
+				continue
+			}
+			realExe, err := filepath.EvalSymlinks(exePath)
+			if err != nil {
+				realExe = exePath
+			}
+			if seenExe[realExe] {
+				continue
+			}
+			seenExe[realExe] = true
+			if gt, err := InspectGoTLSTarget(exePath); err == nil && gt != nil {
+				if len(gt.Symbols) > 0 {
+					for _, off := range gt.Symbols {
+						if fd, err := TryAttachKernelUprobe(gt.BinaryPath, off); err == nil && fd >= 0 {
+							closeKernelFD(fd)
+							gt.Attached = true
+						}
+						break
+					}
+					gt.Note = fmt.Sprintf("GoTLS (%s) symbols resolved", gt.GoVersion)
 				if mon != nil {
 					mon.RecordOK(selfmon.StageProbe, "resolve_gotls_symbols", map[string]any{
 						"binary":     gt.BinaryPath,

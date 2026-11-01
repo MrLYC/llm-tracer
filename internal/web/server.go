@@ -61,6 +61,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/sessions/{id}/events", s.withAuth(s.handleGetSessionEvents))
 	s.mux.HandleFunc("GET /api/scope", s.withAuth(s.handleGetScope))
 	s.mux.HandleFunc("PUT /api/scope", s.withAuth(s.handleUpdateScope))
+	s.mux.HandleFunc("POST /api/pid/inject", s.withAuth(s.handleInjectPID))
 	s.mux.HandleFunc("GET /api/selfmon/stats", s.withAuth(s.handleSelfmonStats))
 	s.mux.HandleFunc("GET /api/selfmon/events", s.withAuth(s.handleSelfmonEvents))
 	s.mux.HandleFunc("POST /api/cache/clean", s.withAuth(s.handleCacheClean))
@@ -240,13 +241,19 @@ func (s *Server) handleGetSessionEvents(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleGetScope(w http.ResponseWriter, r *http.Request) {
 	var scope model.ScopeFilter
 	var probes []collector.ProbeTarget
+	var pidPlans []collector.PIDAttachPlan
+	var launchPlan *collector.LaunchAttachPlan
 	if s.collector != nil {
 		scope = s.collector.Scope()
 		probes = s.collector.Probes()
+		pidPlans = s.collector.PIDPlans()
+		launchPlan = s.collector.LastLaunchPlan()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scope":  scope,
-		"probes": probes,
+		"scope":       scope,
+		"probes":      probes,
+		"pid_plans":   pidPlans,
+		"launch_plan": launchPlan,
 	})
 }
 
@@ -262,8 +269,45 @@ func (s *Server) handleUpdateScope(w http.ResponseWriter, r *http.Request) {
 	}
 	s.collector.UpdateScope(scope)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scope":  s.collector.Scope(),
-		"probes": s.collector.Probes(),
+		"scope":     s.collector.Scope(),
+		"probes":    s.collector.Probes(),
+		"pid_plans": s.collector.PIDPlans(),
+	})
+}
+
+func (s *Server) handleInjectPID(w http.ResponseWriter, r *http.Request) {
+	if s.collector == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "offline view mode"})
+		return
+	}
+	var req struct {
+		PID int  `json:"pid"`
+		All bool `json:"all"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+	if req.All || req.PID == 0 {
+		plans := s.collector.AutoInjectMatchingPIDs()
+		writeJSON(w, http.StatusOK, map[string]any{"pid_plans": plans})
+		return
+	}
+	if req.PID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid pid"})
+		return
+	}
+	plan, err := s.collector.InjectRunningPID(req.PID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": err.Error(),
+			"plan":  plan,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"plan":      plan,
+		"pid_plans": s.collector.PIDPlans(),
 	})
 }
 

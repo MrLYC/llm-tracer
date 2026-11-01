@@ -1,7 +1,9 @@
 package collector
 
 import (
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -155,6 +157,32 @@ func (pt *ProcessTracker) MatchAndEnrich(pid int, hint model.ProcessInfo) (model
 		}
 	}
 
+	if matchesAttributes(info, scope) {
+		return info, true
+	}
+
+	// When PIDOnly is false (default subtree mode), also allow descendant child processes
+	// whose ancestor process matches --exe / --cwd / --cmd (stopping before llm-tracer's own PID).
+	if !scope.PIDOnly && pid > 0 {
+		selfPID := os.Getpid()
+		curr := readPPID(pid)
+		for depth := 0; depth < 8 && curr > 1 && curr != selfPID; depth++ {
+			ancInfo := pt.ResolveProcess(curr, model.ProcessInfo{PID: curr})
+			if matchesAttributes(ancInfo, scope) {
+				return info, true
+			}
+			next := readPPID(curr)
+			if next <= 1 || next == curr {
+				break
+			}
+			curr = next
+		}
+	}
+
+	return info, false
+}
+
+func matchesAttributes(info model.ProcessInfo, scope model.ScopeFilter) bool {
 	// Check Exe filter (--exe / --binary)
 	if len(scope.Exes) > 0 {
 		matchedExe := false
@@ -168,13 +196,13 @@ func (pt *ProcessTracker) MatchAndEnrich(pid int, hint model.ProcessInfo) (model
 			if t == "" {
 				continue
 			}
-			if procExe == t || procBase == filepath.Base(t) || strings.Contains(procExe, t) {
+			if procExe != "" && (procExe == t || procBase == filepath.Base(t) || strings.Contains(procExe, t)) {
 				matchedExe = true
 				break
 			}
 		}
 		if !matchedExe {
-			return info, false
+			return false
 		}
 	}
 
@@ -187,13 +215,13 @@ func (pt *ProcessTracker) MatchAndEnrich(pid int, hint model.ProcessInfo) (model
 			if tc == "" {
 				continue
 			}
-			if procCwd == tc || strings.HasPrefix(procCwd, tc+string(filepath.Separator)) {
+			if info.Cwd != "" && (procCwd == tc || strings.HasPrefix(procCwd, tc+string(filepath.Separator))) {
 				matchedCwd = true
 				break
 			}
 		}
 		if !matchedCwd {
-			return info, false
+			return false
 		}
 	}
 
@@ -209,11 +237,95 @@ func (pt *ProcessTracker) MatchAndEnrich(pid int, hint model.ProcessInfo) (model
 			}
 		}
 		if !matchedCmd {
-			return info, false
+			return false
 		}
 	}
 
-	return info, true
+	return true
+}
+
+// DiscoverMatchingPIDs returns all currently running PIDs on the host that match the active ScopeFilter
+// (--pid with optional subtree, --exe/--binary, --cwd, --cmd), excluding llm-tracer's own process.
+func (pt *ProcessTracker) DiscoverMatchingPIDs() []int {
+	scope := pt.GetScope()
+	hasPID := len(scope.PIDs) > 0
+	hasAttr := len(scope.Exes) > 0 || len(scope.Cwds) > 0 || len(scope.Cmds) > 0
+	if !hasPID && !hasAttr {
+		return nil
+	}
+	selfPID := os.Getpid()
+
+	if hasPID {
+		var candidates []int
+		if scope.PIDOnly {
+			candidates = append(candidates, scope.PIDs...)
+		} else {
+			candidates = pt.RefreshSubtree()
+		}
+		seen := make(map[int]bool, len(candidates))
+		var out []int
+		for _, pid := range candidates {
+			if pid <= 0 || seen[pid] {
+				continue
+			}
+			info := InspectProcess(pid)
+			if info.Comm == "llm_tracer_ptra" || strings.Contains(info.Exe, "llm_tracer_ptrace") {
+				continue
+			}
+			if _, ok := pt.MatchAndEnrich(pid, model.ProcessInfo{PID: pid}); ok {
+				seen[pid] = true
+				out = append(out, pid)
+			}
+		}
+		return out
+	}
+
+	// Attribute-based process selectors (--exe / --binary, --cwd, --cmd) without explicit --pid
+	ppidMap := scanAllPPIDs()
+	childrenByPPID := make(map[int][]int)
+	for pid, ppid := range ppidMap {
+		if ppid == selfPID {
+			// Still allow direct test subprocesses matched by attributes, but don't expand selfPID
+		}
+		childrenByPPID[ppid] = append(childrenByPPID[ppid], pid)
+	}
+
+	var matchedRoots []int
+	seen := make(map[int]bool)
+	for pid := range ppidMap {
+		if pid <= 1 || pid == selfPID {
+			continue
+		}
+		info := InspectProcess(pid)
+		if info.Comm == "llm_tracer_ptra" || strings.Contains(info.Exe, "llm_tracer_ptrace") {
+			continue
+		}
+		if matchesAttributes(info, scope) {
+			pt.mu.Lock()
+			pt.procCache[pid] = info
+			pt.mu.Unlock()
+			seen[pid] = true
+			matchedRoots = append(matchedRoots, pid)
+		}
+	}
+
+	out := append([]int(nil), matchedRoots...)
+	if !scope.PIDOnly && len(matchedRoots) > 0 {
+		queue := append([]int(nil), matchedRoots...)
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			for _, ch := range childrenByPPID[curr] {
+				if ch > 1 && ch != selfPID && !seen[ch] {
+					seen[ch] = true
+					out = append(out, ch)
+					queue = append(queue, ch)
+				}
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 func (pt *ProcessTracker) ResolveProcess(pid int, hint model.ProcessInfo) model.ProcessInfo {

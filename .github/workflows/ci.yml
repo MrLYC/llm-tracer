@@ -36,16 +36,24 @@ jobs:
           sudo mount -t tracefs none /sys/kernel/tracing || true
           sudo sysctl -w kernel.perf_event_paranoid=-1 || true
           sudo sysctl -w kernel.kptr_restrict=0 || true
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
           uname -a
 
       - name: Run full test suite (Unprivileged User-Space Mode)
         run: go test -v -count=1 ./...
 
-      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios) & 6 Runtime Compatibility Scenarios (Root)
+      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios), Live Attach & All Runtime Compatibility Scenarios (Root)
         run: |
           GO_BIN="$(which go)"
           sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
-            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios'
+            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios|TestLivePIDAttachWithoutRestart'
+
+      - name: Verify GoReleaser configuration
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check
 
       - name: Build Linux amd64 & arm64 binaries
         run: |

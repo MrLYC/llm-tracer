@@ -37,6 +37,10 @@ type Collector struct {
 	loopbackTap  *LoopbackTap
 	ebpfEngine   *EBPFEngine
 	userHookPIDs map[int]bool
+	liveInjectedPIDs map[int]string
+	autoIntrusive    bool
+	autoInjectLive   bool
+	lastLaunchPlan   *LaunchAttachPlan
 	activeTapPID int
 	listener     net.Listener
 	tracker      *ProcessTracker
@@ -45,6 +49,7 @@ type Collector struct {
 	store        *store.Store
 	mon          *selfmon.Monitor
 	probes       []ProbeTarget
+	pidPlans     []PIDAttachPlan
 	stopCh       chan struct{}
 	stopOnce     sync.Once
 }
@@ -81,9 +86,11 @@ func NewCollector(
 ) (*Collector, error) {
 	tracker := NewProcessTracker(scope, mon)
 	c := &Collector{
-		cacheDir:     cacheDir,
-		userHookPIDs: make(map[int]bool),
-		tracker:      tracker,
+		cacheDir:         cacheDir,
+		userHookPIDs:     make(map[int]bool),
+		liveInjectedPIDs: make(map[int]string),
+		autoIntrusive:    true,
+		tracker:          tracker,
 		correlator:   corr,
 		store:        st,
 		mon:          mon,
@@ -199,6 +206,7 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.mu.Lock()
 	c.probes = probes
 	c.mu.Unlock()
+	c.AnalyzePIDPlans()
 
 	go c.tailPipeLoop(ctx, pipePath)
 	go c.periodicSubtreeRefresh(ctx)
@@ -254,6 +262,11 @@ func (c *Collector) UpdateScope(scope model.ScopeFilter) {
 	c.mu.Lock()
 	c.probes = probes
 	c.mu.Unlock()
+	if c.AutoInjectLive() {
+		c.AutoInjectMatchingPIDs()
+	} else {
+		c.AnalyzePIDPlans()
+	}
 	if c.mon != nil {
 		c.mon.RecordOK(selfmon.StageTracker, "update_scope", map[string]any{
 			"pids":           scope.PIDs,
@@ -287,12 +300,13 @@ func (c *Collector) AttachBinaryTargets(exes ...string) []ProbeTarget {
 }
 
 // LaunchCommand starts a child command (`-- <cmd> [args...]`), immediately registers its PID in the ProcessTracker
-// before traffic starts, injects SSL hook env vars for zero-root OpenSSL capture, and waits for completion.
+// before traffic starts, automatically completes intrusive CLI/env parameters when non-intrusive eBPF cannot be used,
+// and waits for completion.
 func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, error) {
 	if len(cmdArgs) == 0 {
 		return 1, fmt.Errorf("empty command")
 	}
-	binPath, err := exec.LookPath(cmdArgs[0])
+	plan, env, err := c.PlanLaunchCommand(cmdArgs)
 	if err != nil {
 		if c.mon != nil {
 			c.mon.RecordError(selfmon.StageTracker, "launch_command", err, map[string]any{"cmd": cmdArgs})
@@ -300,164 +314,10 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 		return 127, err
 	}
 
-	prof, _ := InspectBinaryProfile(binPath)
-	if prof != nil {
-		extraProbes := ProbeAndRecordTargets(nil, []string{prof.ResolvedELF}, c.mon)
-		if len(extraProbes) > 0 {
-			c.mu.RLock()
-			ebpf := c.ebpfEngine
-			c.mu.RUnlock()
-			if ebpf != nil {
-				ebpf.AttachTargets(extraProbes)
-			}
-			c.mu.Lock()
-			c.probes = append(c.probes, extraProbes...)
-			c.mu.Unlock()
-		}
-	}
-
-	// Inspect if target binary is a Go binary for GoTLS uprobe resolution
-	if gt, err := InspectGoTLSTarget(binPath); err == nil && gt != nil {
-		c.mu.RLock()
-		ebpf := c.ebpfEngine
-		c.mu.RUnlock()
-		if ebpf != nil {
-			ebpf.AttachTargets([]ProbeTarget{*gt})
-		}
-		c.mu.Lock()
-		c.probes = append(c.probes, *gt)
-		c.mu.Unlock()
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "inspect_launched_go_binary", map[string]any{
-				"binary": binPath, "go_version": gt.GoVersion, "symbols": gt.Symbols,
-			})
-		}
-	}
-
-	c.mu.RLock()
-	sockPath := c.sockPath
-	pipePath := c.pipePath
-	preloadPath := c.preloadPath
-	rtHooks := c.runtimeHooks
-	tap := c.loopbackTap
-	c.mu.RUnlock()
-
-	execBin := binPath
-	execArgs := cmdArgs[1:]
-	if prof != nil && prof.RequiresPtrace && rtHooks != nil && rtHooks.PtraceBin != "" {
-		execBin = rtHooks.PtraceBin
-		execArgs = append([]string{binPath}, cmdArgs[1:]...)
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "enable_ptrace_syscall_hook", map[string]any{
-				"target":    prof.ResolvedELF,
-				"link_mode": prof.LinkMode,
-				"tls_stack": prof.TLSStack,
-			})
-		}
-	}
-
-	cmd := exec.CommandContext(ctx, execBin, execArgs...)
+	cmd := exec.CommandContext(ctx, plan.ExecBin, plan.ExecArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	env := os.Environ()
-	if sockPath != "" {
-		env = setEnvVar(env, "LLM_TRACER_SOCK", sockPath)
-	}
-	if pipePath != "" {
-		env = setEnvVar(env, "LLM_TRACER_PIPE", pipePath)
-	}
-	if preloadPath != "" {
-		if runtime.GOOS == "darwin" {
-			if !isJavaBinary(binPath) {
-				existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
-				if existingDyld != "" {
-					env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath+":"+existingDyld)
-				} else {
-					env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath)
-				}
-				if prof != nil && prof.TLSStack == "dynamic-libssl" {
-					env = setEnvVar(env, "DYLD_FORCE_FLAT_NAMESPACE", "1")
-				}
-			}
-		} else if runtime.GOOS == "linux" {
-			existingPreload := os.Getenv("LD_PRELOAD")
-			if existingPreload != "" {
-				env = setEnvVar(env, "LD_PRELOAD", preloadPath+":"+existingPreload)
-			} else {
-				env = setEnvVar(env, "LD_PRELOAD", preloadPath)
-			}
-		}
-	}
-	if rtHooks != nil {
-		if rtHooks.PyHookDir != "" {
-			existingPyPath := os.Getenv("PYTHONPATH")
-			sep := string(os.PathListSeparator)
-			if existingPyPath != "" {
-				env = setEnvVar(env, "PYTHONPATH", rtHooks.PyHookDir+sep+existingPyPath)
-			} else {
-				env = setEnvVar(env, "PYTHONPATH", rtHooks.PyHookDir)
-			}
-		}
-		if rtHooks.NodeHookJS != "" {
-			nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
-			reqOpt := "--require " + nodeHookSlash
-			if existingNodeOpts := os.Getenv("NODE_OPTIONS"); existingNodeOpts != "" {
-				env = setEnvVar(env, "NODE_OPTIONS", existingNodeOpts+" "+reqOpt)
-			} else {
-				env = setEnvVar(env, "NODE_OPTIONS", reqOpt)
-			}
-			preloadOpt := "--preload " + nodeHookSlash
-			if existingBunOpts := os.Getenv("BUN_OPTIONS"); existingBunOpts != "" {
-				env = setEnvVar(env, "BUN_OPTIONS", existingBunOpts+" "+preloadOpt)
-			} else {
-				env = setEnvVar(env, "BUN_OPTIONS", preloadOpt)
-			}
-		}
-		if rtHooks.JavaAgentJar != "" {
-			javaOpt := "-javaagent:" + rtHooks.JavaAgentJar
-			if existingJavaOpts := os.Getenv("JAVA_TOOL_OPTIONS"); existingJavaOpts != "" {
-				env = setEnvVar(env, "JAVA_TOOL_OPTIONS", existingJavaOpts+" "+javaOpt)
-			} else {
-				env = setEnvVar(env, "JAVA_TOOL_OPTIONS", javaOpt)
-			}
-		}
-	}
-	if tap != nil {
-		pHost, pPort := tap.HostPort()
-		env = setEnvVar(env, "LLM_TRACER_PROXY_HOST", pHost)
-		env = setEnvVar(env, "LLM_TRACER_PROXY_PORT", pPort)
-		env = setEnvVar(env, "SSL_CERT_FILE", tap.CABundlePath())
-		env = setEnvVar(env, "CURL_CA_BUNDLE", tap.CABundlePath())
-		env = setEnvVar(env, "REQUESTS_CA_BUNDLE", tap.CABundlePath())
-		env = setEnvVar(env, "NODE_EXTRA_CA_CERTS", tap.CABundlePath())
-		env = setEnvVar(env, "CARGO_HTTP_CAINFO", tap.CABundlePath())
-		targetResolved := binPath
-		if prof != nil && prof.ResolvedELF != "" {
-			targetResolved = prof.ResolvedELF
-		}
-		isRuntime := isShellOrRuntimeBinary(binPath) || isShellOrRuntimeBinary(targetResolved)
-		needsProxyEnv := !isRuntime &&
-			(runtime.GOOS != "linux" || (prof != nil && (prof.RequiresPtrace || prof.TLSStack == "stripped-embedded-tls")))
-		env = unsetEnvVar(env, "ALL_PROXY")
-		env = unsetEnvVar(env, "all_proxy")
-		env = unsetEnvVar(env, "NO_PROXY")
-		env = unsetEnvVar(env, "no_proxy")
-		if needsProxyEnv {
-			env = setEnvVar(env, "HTTPS_PROXY", tap.ProxyURL())
-			env = setEnvVar(env, "https_proxy", tap.ProxyURL())
-			if !CanUsePtrace() || (prof != nil && prof.TLSStack == "stripped-embedded-tls") {
-				env = setEnvVar(env, "HTTP_PROXY", tap.ProxyURL())
-				env = setEnvVar(env, "http_proxy", tap.ProxyURL())
-			}
-		} else {
-			env = unsetEnvVar(env, "HTTPS_PROXY")
-			env = unsetEnvVar(env, "https_proxy")
-			env = unsetEnvVar(env, "HTTP_PROXY")
-			env = unsetEnvVar(env, "http_proxy")
-		}
-	}
 	cmd.Env = env
 
 	if err := cmd.Start(); err != nil {
@@ -479,7 +339,15 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 			Action: "launch_command_started",
 			PID:    childPID,
 			Comm:   info.Comm,
-			Detail: map[string]any{"args": cmdArgs, "exe": binPath},
+			Detail: map[string]any{
+				"args":                    cmdArgs,
+				"exe":                     plan.BinaryPath,
+				"detected_stack":          plan.DetectedStack,
+				"non_intrusive_ok":        plan.NonIntrusiveOK,
+				"auto_intrusive_triggered": plan.AutoIntrusiveTriggered,
+				"injected_args":           plan.InjectedArgs,
+				"intrusive_methods":       plan.IntrusiveMethods,
+			},
 		})
 	}
 
@@ -773,6 +641,11 @@ func (c *Collector) periodicSubtreeRefresh(ctx context.Context) {
 			return
 		case <-ticker.C:
 			c.tracker.RefreshSubtree()
+			if c.AutoInjectLive() {
+				c.AutoInjectMatchingPIDs()
+			} else {
+				c.AnalyzePIDPlans()
+			}
 		}
 	}
 }

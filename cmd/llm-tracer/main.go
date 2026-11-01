@@ -36,6 +36,9 @@ type captureFlags struct {
 	recordHeaders bool
 	totpSecret    string
 	exitWithChild bool
+	injectLive    bool
+	autoIntrusive bool
+	yes           bool
 }
 
 func main() {
@@ -145,6 +148,9 @@ func bindCaptureFlags(cmd *cobra.Command, f *captureFlags) {
 	cmd.Flags().BoolVar(&f.recordHeaders, "record-headers", false, "记录 HTTP 请求与响应头 (默认 false 以避免凭据泄露)")
 	cmd.Flags().StringVar(&f.totpSecret, "totp-secret", os.Getenv("LLM_TRACER_TOTP_SECRET"), "可选 TOTP Base32 密钥，开启 Web 登录保护")
 	cmd.Flags().BoolVar(&f.exitWithChild, "exit-with-child", false, "使用 -- <cmd> 拉起子进程时，子进程结束后自动退出")
+	cmd.Flags().BoolVar(&f.injectLive, "inject-live", false, "按 --pid/--exe/--cwd/--cmd 匹配运行中进程时，若 eBPF 无法直接覆盖 TLS，自动执行免重启侵入式热注入")
+	cmd.Flags().BoolVar(&f.autoIntrusive, "auto-intrusive", true, "使用 -- <cmd> 直接拉起子程序时，若无法使用非侵入式方式，自动通过参数完成侵入式方案")
+	cmd.Flags().BoolVarP(&f.yes, "yes", "y", false, "跳过侵入式热注入二次确认提示")
 }
 
 func runCapture(flags captureFlags, launchArgs []string) error {
@@ -178,6 +184,8 @@ func runCapture(flags captureFlags, launchArgs []string) error {
 	if err != nil {
 		return err
 	}
+	col.SetAutoIntrusive(flags.autoIntrusive)
+	col.SetAutoInjectLive(flags.injectLive || flags.yes)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -209,12 +217,27 @@ func runCapture(flags captureFlags, launchArgs []string) error {
 
 		fmt.Printf("LLM-Tracer Web UI : http://%s\n", flags.listen)
 		fmt.Printf("Cache Directory   : %s (默认加载窗口: %s)\n", flags.cacheDir, winDur)
-		fmt.Printf("Record Headers    : %v (默认关闭防凭据泄露)\n", flags.recordHeaders)
-		fmt.Printf("TOTP Auth Enabled : %v\n", guard.Enabled())
+	fmt.Printf("Record Headers    : %v (默认关闭防凭据泄露)\n", flags.recordHeaders)
+	fmt.Printf("TOTP Auth Enabled : %v\n", guard.Enabled())
 
-		if len(launchArgs) > 0 {
-			fmt.Printf("Launching Process : %s\n", strings.Join(launchArgs, " "))
-			exitCode, launchErr := col.LaunchCommand(ctx, launchArgs)
+	if len(flags.pids) > 0 || len(flags.exes) > 0 || len(flags.cwds) > 0 || len(flags.cmds) > 0 {
+		handleLivePIDAttachPlans(col, flags.injectLive || flags.yes)
+	}
+
+	if len(launchArgs) > 0 {
+		fmt.Printf("Launching Process : %s\n", strings.Join(launchArgs, " "))
+		if plan, _, planErr := col.PlanLaunchCommand(launchArgs); planErr == nil && plan != nil {
+			if plan.NonIntrusiveOK {
+				fmt.Printf("[Launch %s] 自动识别: %s | 非侵入式 eBPF Uprobe 可直接覆盖 (%s)\n",
+					launchArgs[0], plan.DetectedStack, plan.NonIntrusiveReason)
+			} else if plan.AutoIntrusiveTriggered {
+				fmt.Printf("[Launch %s] 自动识别: %s | 诊断: %s\n",
+					launchArgs[0], plan.DetectedStack, plan.NonIntrusiveReason)
+				fmt.Printf("  └─ 已通过参数自动完成侵入式方案: methods=%v injected_args=%v ptrace=%v\n",
+					plan.IntrusiveMethods, plan.InjectedArgs, plan.PtraceWrapped)
+			}
+		}
+		exitCode, launchErr := col.LaunchCommand(ctx, launchArgs)
 			if flags.exitWithChild {
 				col.Flush()
 				time.Sleep(150 * time.Millisecond)
@@ -234,8 +257,49 @@ func runCapture(flags captureFlags, launchArgs []string) error {
 		if httpServer == nil {
 			return nil
 		}
-		return httpServer.Shutdown(shutdownCtx)
+	return httpServer.Shutdown(shutdownCtx)
+}
+
+func handleLivePIDAttachPlans(col *collector.Collector, autoInject bool) {
+	plans := col.AnalyzePIDPlans()
+	for _, p := range plans {
+		if !p.IntrusiveNeeded && p.EBPFStatus == "attached" {
+			fmt.Printf("[PID %d (%s)] 自动识别: %s | 挂载模式: %s (免重启零侵入)\n  └─ %s\n",
+				p.PID, p.Comm, p.DetectedStack, p.ActiveMode, p.EBPFReason)
+			continue
+		}
+		fmt.Printf("[!] [PID %d (%s)] 自动识别: %s | eBPF 状态: %s\n", p.PID, p.Comm, p.DetectedStack, p.EBPFStatus)
+		fmt.Printf("  ├─ 诊断原因: %s\n", p.EBPFReason)
+		fmt.Printf("  └─ 候选侵入式方案: [%s] %s\n", p.RecommendedIntrusive, p.IntrusiveDescription)
+		shouldInject := autoInject
+		if !shouldInject && isInteractiveStdin() {
+			fmt.Printf("  ? 是否立即对运行中 PID %d (%s) 执行 [%s] 免重启侵入式热注入？[y/N]: ",
+				p.PID, p.Comm, p.RecommendedIntrusive)
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			ans := strings.TrimSpace(strings.ToLower(line))
+			shouldInject = ans == "y" || ans == "yes"
+		}
+		if shouldInject {
+			updated, err := col.InjectRunningPID(p.PID)
+			if err != nil {
+				fmt.Printf("  [x] PID %d 侵入式热注入失败: %v\n", p.PID, err)
+			} else {
+				fmt.Printf("  [+] PID %d 已完成免重启热注入 (模式: %s)\n", p.PID, updated.ActiveMode)
+			}
+		} else {
+			fmt.Printf("  -> 未执行侵入式注入（如需启用，可加 --inject-live 参数或调用 POST /api/pid/inject）\n")
+		}
 	}
+}
+
+func isInteractiveStdin() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
 
 func runView(cacheDir, listen, windowStr, totpSecret string) error {
 	winDur, err := parseDurationWithDays(windowStr)
