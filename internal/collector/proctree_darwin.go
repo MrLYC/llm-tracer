@@ -18,9 +18,14 @@ func InspectProcess(pid int) model.ProcessInfo {
 	if pid <= 0 {
 		return info
 	}
-	if kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid); err == nil && kp != nil {
-		info.PPID = int(kp.Eproc.Ppid)
-		info.Comm = unix.ByteSliceToString(kp.Proc.P_comm[:])
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || kp == nil {
+		return info
+	}
+	info.PPID = int(kp.Eproc.Ppid)
+	info.Comm = unix.ByteSliceToString(kp.Proc.P_comm[:])
+	if os.Geteuid() != 0 && kp.Eproc.Ucred.Uid != uint32(os.Geteuid()) {
+		return info
 	}
 	if out, err := exec.Command("ps", "-o", "ppid=,comm=,args=", "-p", strconv.Itoa(pid)).Output(); err == nil {
 		line := strings.TrimSpace(string(out))
@@ -42,7 +47,7 @@ func InspectProcess(pid int) model.ProcessInfo {
 			}
 		}
 	}
-	if out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd,txt", "-Fn").Output(); err == nil {
+	if out, err := exec.Command("lsof", "-n", "-P", "-a", "-p", strconv.Itoa(pid), "-d", "cwd,txt", "-Fn").Output(); err == nil {
 		var curFD string
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.HasPrefix(line, "f") {
@@ -95,7 +100,11 @@ func scanAllPPIDs() map[int]int {
 	if err != nil {
 		return out
 	}
+	euid := uint32(os.Geteuid())
 	for i := range kprocs {
+		if euid != 0 && kprocs[i].Eproc.Ucred.Uid != euid {
+			continue
+		}
 		pid := int(kprocs[i].Proc.P_pid)
 		ppid := int(kprocs[i].Eproc.Ppid)
 		if pid > 0 && ppid > 0 {

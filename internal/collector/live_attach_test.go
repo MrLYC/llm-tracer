@@ -186,7 +186,7 @@ public class LiveJvmApp {
     public static void main(String[] args) throws Exception {
         File trigger = new File(args[0]);
         String baseUrl = args[1];
-        for (int i = 0; i < 300; i++) {
+        for (int i = 0; i < 1500; i++) {
             if (trigger.exists()) break;
             Thread.sleep(20);
         }

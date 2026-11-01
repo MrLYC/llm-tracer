@@ -210,8 +210,14 @@ func matchesAttributes(info model.ProcessInfo, scope model.ScopeFilter) bool {
 	if len(scope.Cwds) > 0 {
 		matchedCwd := false
 		procCwd := filepath.Clean(info.Cwd)
+		if resolvedProcCwd, err := filepath.EvalSymlinks(procCwd); err == nil {
+			procCwd = filepath.Clean(resolvedProcCwd)
+		}
 		for _, targetCwd := range scope.Cwds {
 			tc := filepath.Clean(strings.TrimSpace(targetCwd))
+			if resolvedTargetCwd, err := filepath.EvalSymlinks(tc); err == nil {
+				tc = filepath.Clean(resolvedTargetCwd)
+			}
 			if tc == "" {
 				continue
 			}
