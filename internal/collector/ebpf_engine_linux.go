@@ -933,9 +933,9 @@ func (e *EBPFEngine) AttachTargets(targets []ProbeTarget) int {
 		if e.attachedKeys[key] {
 			return
 		}
-		if pfd, err := openAndAttachUprobe(binPath, off, isRet, progFD); err == nil {
+		if pfds, err := openAndAttachUprobe(binPath, off, isRet, progFD); err == nil && len(pfds) > 0 {
 			e.attachedKeys[key] = true
-			e.perfFDs = append(e.perfFDs, pfd)
+			e.perfFDs = append(e.perfFDs, pfds...)
 			e.uprobeCount++
 			e.attachedCount++
 			added++
@@ -1017,8 +1017,8 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 		if tp.progFD < 0 {
 			continue
 		}
-		if pfd, err := openAndAttachTracepoint(tp.name, tp.progFD); err == nil {
-			e.perfFDs = append(e.perfFDs, pfd)
+		if pfds, err := openAndAttachTracepoint(tp.name, tp.progFD); err == nil && len(pfds) > 0 {
+			e.perfFDs = append(e.perfFDs, pfds...)
 			e.tracepointCount++
 			e.attachedCount++
 		}
@@ -1026,47 +1026,96 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 	return nil
 }
 
-func openAndAttachUprobe(binaryPath string, offset uint64, isRetprobe bool, progFD int) (int, error) {
+func onlineCPUs() []int {
+	if raw, err := os.ReadFile("/sys/devices/system/cpu/online"); err == nil {
+		var cpus []int
+		for _, part := range strings.Split(strings.TrimSpace(string(raw)), ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if dash := strings.IndexByte(part, '-'); dash > 0 {
+				lo, err1 := strconv.Atoi(part[:dash])
+				hi, err2 := strconv.Atoi(part[dash+1:])
+				if err1 == nil && err2 == nil && hi >= lo {
+					for c := lo; c <= hi; c++ {
+						cpus = append(cpus, c)
+					}
+				}
+			} else if c, err := strconv.Atoi(part); err == nil {
+				cpus = append(cpus, c)
+			}
+		}
+		if len(cpus) > 0 {
+			return cpus
+		}
+	}
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	cpus := make([]int, n)
+	for i := 0; i < n; i++ {
+		cpus[i] = i
+	}
+	return cpus
+}
+
+func openAndAttachUprobe(binaryPath string, offset uint64, isRetprobe bool, progFD int) ([]int, error) {
 	pmuBytes, err := os.ReadFile("/sys/bus/event_source/devices/uprobe/type")
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 	pmuType, err := strconv.Atoi(strings.TrimSpace(string(pmuBytes)))
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 	cPath, err := unix.BytePtrFromString(binaryPath)
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
-	attr := unix.PerfEventAttr{
-		Type:   uint32(pmuType),
-		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Ext1:   uint64(uintptr(unsafe.Pointer(cPath))),
-		Ext2:   offset,
-		Sample: 1,
-		Wakeup: 1,
+	var fds []int
+	var lastErr error
+	for _, cpu := range onlineCPUs() {
+		attr := unix.PerfEventAttr{
+			Type:   uint32(pmuType),
+			Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+			Ext1:   uint64(uintptr(unsafe.Pointer(cPath))),
+			Ext2:   offset,
+			Sample: 1,
+			Wakeup: 1,
+		}
+		if isRetprobe {
+			attr.Config = 1 // format/retprobe = config:0
+		}
+		fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
+			_ = unix.Close(fd)
+			lastErr = err
+			continue
+		}
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
+			_ = unix.Close(fd)
+			lastErr = err
+			continue
+		}
+		fds = append(fds, fd)
 	}
-	if isRetprobe {
-		attr.Config = 1 // format/retprobe = config:0
-	}
-	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	runtime.KeepAlive(cPath)
-	if err != nil {
-		return -1, err
+	if len(fds) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("failed to attach uprobe %s on any CPU", binaryPath)
 	}
-	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	return fd, nil
+	return fds, nil
 }
 
-func openAndAttachTracepoint(tpSubpath string, progFD int) (int, error) {
+func openAndAttachTracepoint(tpSubpath string, progFD int) ([]int, error) {
 	var idBytes []byte
 	var err error
 	for _, base := range []string{"/sys/kernel/tracing/events", "/sys/kernel/debug/tracing/events"} {
@@ -1076,32 +1125,46 @@ func openAndAttachTracepoint(tpSubpath string, progFD int) (int, error) {
 		}
 	}
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 	tpID, err := strconv.ParseUint(strings.TrimSpace(string(idBytes)), 10, 64)
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
-	attr := unix.PerfEventAttr{
-		Type:   unix.PERF_TYPE_TRACEPOINT,
-		Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
-		Config: tpID,
-		Sample: 1,
-		Wakeup: 1,
+	var fds []int
+	var lastErr error
+	for _, cpu := range onlineCPUs() {
+		attr := unix.PerfEventAttr{
+			Type:   unix.PERF_TYPE_TRACEPOINT,
+			Size:   uint32(unsafe.Sizeof(unix.PerfEventAttr{})),
+			Config: tpID,
+			Sample: 1,
+			Wakeup: 1,
+		}
+		fd, err := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
+			_ = unix.Close(fd)
+			lastErr = err
+			continue
+		}
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
+			_ = unix.Close(fd)
+			lastErr = err
+			continue
+		}
+		fds = append(fds, fd)
 	}
-	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
-	if err != nil {
-		return -1, err
+	if len(fds) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("failed to attach tracepoint %s on any CPU", tpSubpath)
 	}
-	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	return fd, nil
+	return fds, nil
 }
 
 // Flush synchronously drains all ready records from the mmap'd kernel BPF RingBuf.
