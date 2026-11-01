@@ -22,22 +22,25 @@ import (
 )
 
 type Collector struct {
-	mu          sync.RWMutex
-	cacheDir    string
-	sockPath    string
-	pipePath    string
-	pipeMu      sync.Mutex
-	pipeOffset  int64
-	preloadPath string
-	listener    net.Listener
-	tracker     *ProcessTracker
-	reassembler *parser.StreamReassembler
-	correlator  *correlator.Correlator
-	store       *store.Store
-	mon         *selfmon.Monitor
-	probes      []ProbeTarget
-	stopCh      chan struct{}
-	stopOnce    sync.Once
+	mu           sync.RWMutex
+	cacheDir     string
+	sockPath     string
+	pipePath     string
+	pipeMu       sync.Mutex
+	pipeOffset   int64
+	preloadPath  string
+	runtimeHooks *RuntimeHookPaths
+	loopbackTap  *LoopbackTap
+	activeTapPID int
+	listener     net.Listener
+	tracker      *ProcessTracker
+	reassembler  *parser.StreamReassembler
+	correlator   *correlator.Correlator
+	store        *store.Store
+	mon          *selfmon.Monitor
+	probes       []ProbeTarget
+	stopCh       chan struct{}
+	stopOnce     sync.Once
 }
 
 type DirectExchangeInput struct {
@@ -124,6 +127,41 @@ func (c *Collector) Start(ctx context.Context) error {
 		c.mon.RecordWarn(selfmon.StageProbe, "build_ssl_hook", err.Error(), nil)
 	}
 
+	if rtHooks, err := EnsureRuntimeHooks(hooksDir); err == nil && rtHooks != nil {
+		c.mu.Lock()
+		c.runtimeHooks = rtHooks
+		c.mu.Unlock()
+		if c.mon != nil {
+			c.mon.RecordOK(selfmon.StageProbe, "build_runtime_hooks", map[string]any{
+				"py_hook":   rtHooks.PyHookDir,
+				"node_hook": rtHooks.NodeHookJS,
+				"ptrace":    rtHooks.PtraceBin,
+			})
+		}
+	} else if err != nil && c.mon != nil {
+		c.mon.RecordWarn(selfmon.StageProbe, "build_runtime_hooks", err.Error(), nil)
+	}
+
+	if tap, err := NewLoopbackTap(hooksDir, func(connID string, dir parser.Direction, data []byte) {
+		c.mu.RLock()
+		pid := c.activeTapPID
+		c.mu.RUnlock()
+		if pid <= 0 {
+			pid = os.Getpid()
+		}
+		c.IngestRawChunk(pid, pid, connID, dir, data, "loopback_tap")
+	}); err == nil {
+		c.mu.Lock()
+		c.loopbackTap = tap
+		c.mu.Unlock()
+		if c.mon != nil {
+			c.mon.RecordOK(selfmon.StageProbe, "start_loopback_tap", map[string]any{
+				"proxy_url": tap.ProxyURL(),
+				"ca_bundle": tap.CABundlePath(),
+			})
+		}
+	}
+
 	scope := c.tracker.GetScope()
 	probes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
 	c.mu.Lock()
@@ -141,9 +179,13 @@ func (c *Collector) Stop() {
 		c.mu.RLock()
 		ln := c.listener
 		sock := c.sockPath
+		tap := c.loopbackTap
 		c.mu.RUnlock()
 		if ln != nil {
 			_ = ln.Close()
+		}
+		if tap != nil {
+			tap.Close()
 		}
 		if sock != "" {
 			_ = os.Remove(sock)
@@ -197,6 +239,16 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 		return 127, err
 	}
 
+	prof, _ := InspectBinaryProfile(binPath)
+	if prof != nil {
+		extraProbes := ProbeAndRecordTargets(nil, []string{prof.ResolvedELF}, c.mon)
+		if len(extraProbes) > 0 {
+			c.mu.Lock()
+			c.probes = append(c.probes, extraProbes...)
+			c.mu.Unlock()
+		}
+	}
+
 	// Inspect if target binary is a Go binary for GoTLS uprobe resolution
 	if gt, err := InspectGoTLSTarget(binPath); err == nil && gt != nil {
 		c.mu.Lock()
@@ -209,17 +261,34 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, binPath, cmdArgs[1:]...)
+	c.mu.RLock()
+	sockPath := c.sockPath
+	pipePath := c.pipePath
+	preloadPath := c.preloadPath
+	rtHooks := c.runtimeHooks
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+
+	execBin := binPath
+	execArgs := cmdArgs[1:]
+	if prof != nil && prof.RequiresPtrace && rtHooks != nil && rtHooks.PtraceBin != "" {
+		execBin = rtHooks.PtraceBin
+		execArgs = append([]string{binPath}, cmdArgs[1:]...)
+		if c.mon != nil {
+			c.mon.RecordOK(selfmon.StageProbe, "enable_ptrace_syscall_hook", map[string]any{
+				"target":    prof.ResolvedELF,
+				"link_mode": prof.LinkMode,
+				"tls_stack": prof.TLSStack,
+			})
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, execBin, execArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	env := os.Environ()
-	c.mu.RLock()
-	sockPath := c.sockPath
-	pipePath := c.pipePath
-	preloadPath := c.preloadPath
-	c.mu.RUnlock()
 	if sockPath != "" {
 		env = append(env, "LLM_TRACER_SOCK="+sockPath)
 	}
@@ -234,6 +303,46 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 			env = append(env, "LD_PRELOAD="+preloadPath)
 		}
 	}
+	if rtHooks != nil {
+		if rtHooks.PyHookDir != "" {
+			existingPyPath := os.Getenv("PYTHONPATH")
+			if existingPyPath != "" {
+				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir+":"+existingPyPath)
+			} else {
+				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir)
+			}
+		}
+		if rtHooks.NodeHookJS != "" {
+			reqOpt := "--require " + rtHooks.NodeHookJS
+			if existingNodeOpts := os.Getenv("NODE_OPTIONS"); existingNodeOpts != "" {
+				env = append(env, "NODE_OPTIONS="+existingNodeOpts+" "+reqOpt)
+			} else {
+				env = append(env, "NODE_OPTIONS="+reqOpt)
+			}
+			preloadOpt := "--preload " + rtHooks.NodeHookJS
+			if existingBunOpts := os.Getenv("BUN_OPTIONS"); existingBunOpts != "" {
+				env = append(env, "BUN_OPTIONS="+existingBunOpts+" "+preloadOpt)
+			} else {
+				env = append(env, "BUN_OPTIONS="+preloadOpt)
+			}
+		}
+	}
+	if prof != nil && prof.RequiresPtrace && tap != nil {
+		if os.Getenv("HTTP_PROXY") == "" && os.Getenv("HTTPS_PROXY") == "" {
+			env = append(env,
+				"HTTPS_PROXY="+tap.ProxyURL(),
+				"https_proxy="+tap.ProxyURL(),
+				"SSL_CERT_FILE="+tap.CABundlePath(),
+				"NODE_EXTRA_CA_CERTS="+tap.CABundlePath(),
+			)
+			if !CanUsePtrace() {
+				env = append(env,
+					"HTTP_PROXY="+tap.ProxyURL(),
+					"http_proxy="+tap.ProxyURL(),
+				)
+			}
+		}
+	}
 	cmd.Env = env
 
 	if err := cmd.Start(); err != nil {
@@ -244,6 +353,9 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 	}
 
 	childPID := cmd.Process.Pid
+	c.mu.Lock()
+	c.activeTapPID = childPID
+	c.mu.Unlock()
 	info := c.tracker.RegisterRootPID(childPID)
 	if c.mon != nil {
 		c.mon.Record(selfmon.Event{

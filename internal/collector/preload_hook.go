@@ -15,7 +15,9 @@ const sslHookCSource = `#define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -23,6 +25,12 @@ typedef int (*ssl_rw_fn)(void *ssl, void *buf, int num);
 typedef int (*ssl_rw_ex_fn)(void *ssl, void *buf, size_t num, size_t *processed);
 typedef ssize_t (*send_fn)(int fd, const void *buf, size_t len, int flags);
 typedef ssize_t (*recv_fn)(int fd, void *buf, size_t len, int flags);
+typedef ssize_t (*sendto_fn)(int fd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
+typedef ssize_t (*recvfrom_fn)(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
+typedef ssize_t (*write_fn)(int fd, const void *buf, size_t len);
+typedef ssize_t (*read_fn)(int fd, void *buf, size_t len);
+typedef ssize_t (*writev_fn)(int fd, const struct iovec *iov, int iovcnt);
+typedef int (*close_fn)(int fd);
 
 static __thread int in_ssl_hook = 0;
 static uint16_t tracked_http_gen[65536];
@@ -95,11 +103,16 @@ static void send_tls_chunk(void *ssl, const void *buf, size_t len, uint32_t dir)
     errno = saved_errno;
 }
 
+static int runtime_tls_hook_active(void) {
+    const char *v = getenv("LLM_TRACER_PY_TLS_ACTIVE");
+    return (v && v[0] == '1');
+}
+
 int SSL_write(void *ssl, const void *buf, int num) {
     static ssl_rw_fn real_fn = NULL;
     if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_write");
     if (!real_fn) return -1;
-    if (in_ssl_hook) return real_fn(ssl, (void *)buf, num);
+    if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, (void *)buf, num);
     in_ssl_hook = 1;
     int ret = real_fn(ssl, (void *)buf, num);
     if (ret > 0) {
@@ -113,7 +126,7 @@ int SSL_write_ex(void *ssl, const void *buf, size_t num, size_t *written) {
     static ssl_rw_ex_fn real_fn = NULL;
     if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_write_ex");
     if (!real_fn) return 0;
-    if (in_ssl_hook) return real_fn(ssl, (void *)buf, num, written);
+    if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, (void *)buf, num, written);
     in_ssl_hook = 1;
     int ret = real_fn(ssl, (void *)buf, num, written);
     if (ret == 1 && written && *written > 0) {
@@ -127,7 +140,7 @@ int SSL_read(void *ssl, void *buf, int num) {
     static ssl_rw_fn real_fn = NULL;
     if (!real_fn) real_fn = (ssl_rw_fn)resolve_ssl_sym("SSL_read");
     if (!real_fn) return -1;
-    if (in_ssl_hook) return real_fn(ssl, buf, num);
+    if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, buf, num);
     in_ssl_hook = 1;
     int ret = real_fn(ssl, buf, num);
     if (ret > 0) {
@@ -141,7 +154,7 @@ int SSL_read_ex(void *ssl, void *buf, size_t num, size_t *readbytes) {
     static ssl_rw_ex_fn real_fn = NULL;
     if (!real_fn) real_fn = (ssl_rw_ex_fn)resolve_ssl_sym("SSL_read_ex");
     if (!real_fn) return 0;
-    if (in_ssl_hook) return real_fn(ssl, buf, num, readbytes);
+    if (in_ssl_hook || runtime_tls_hook_active()) return real_fn(ssl, buf, num, readbytes);
     in_ssl_hook = 1;
     int ret = real_fn(ssl, buf, num, readbytes);
     if (ret == 1 && readbytes && *readbytes > 0) {
@@ -161,6 +174,29 @@ static int is_http_request_prefix(const void *buf, size_t len) {
             memcmp(s, "DELETE ", 7) == 0);
 }
 
+static void record_http_tx(int fd, const void *buf, size_t len) {
+    if (fd <= 2 || fd >= 65536 || !buf || len == 0) return;
+    if (is_http_request_prefix(buf, len)) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            tracked_http_gen[fd]++;
+            if (tracked_http_gen[fd] == 0) tracked_http_gen[fd] = 1;
+        }
+    }
+    if (tracked_http_gen[fd] > 0) {
+        uint32_t tag = 0x80000000U | (((uint32_t)(tracked_http_gen[fd] & 0x7fffU)) << 16) | ((uint32_t)fd & 0xffffU);
+        send_tls_chunk((void *)(uintptr_t)tag, buf, len, 0);
+    }
+}
+
+static void record_http_rx(int fd, const void *buf, size_t len) {
+    if (fd <= 2 || fd >= 65536 || !buf || len == 0) return;
+    if (tracked_http_gen[fd] > 0) {
+        uint32_t tag = 0x80000000U | (((uint32_t)(tracked_http_gen[fd] & 0x7fffU)) << 16) | ((uint32_t)fd & 0xffffU);
+        send_tls_chunk((void *)(uintptr_t)tag, buf, len, 1);
+    }
+}
+
 ssize_t send(int fd, const void *buf, size_t len, int flags) {
     static send_fn real_fn = NULL;
     if (!real_fn) real_fn = (send_fn)dlsym(RTLD_NEXT, "send");
@@ -168,15 +204,8 @@ ssize_t send(int fd, const void *buf, size_t len, int flags) {
     if (in_ssl_hook) return real_fn(fd, buf, len, flags);
     in_ssl_hook = 1;
     ssize_t ret = real_fn(fd, buf, len, flags);
-    if (ret > 0 && fd >= 0 && fd < 65536) {
-        if (is_http_request_prefix(buf, (size_t)ret)) {
-            tracked_http_gen[fd]++;
-            if (tracked_http_gen[fd] == 0) tracked_http_gen[fd] = 1;
-        }
-        if (tracked_http_gen[fd] > 0) {
-            uint32_t tag = 0x80000000U | (((uint32_t)(tracked_http_gen[fd] & 0x7fffU)) << 16) | ((uint32_t)fd & 0xffffU);
-            send_tls_chunk((void *)(uintptr_t)tag, buf, (size_t)ret, 0);
-        }
+    if (ret > 0) {
+        record_http_tx(fd, buf, (size_t)ret);
     }
     in_ssl_hook = 0;
     return ret;
@@ -189,12 +218,97 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
     if (in_ssl_hook) return real_fn(fd, buf, len, flags);
     in_ssl_hook = 1;
     ssize_t ret = real_fn(fd, buf, len, flags);
-    if (ret > 0 && fd >= 0 && fd < 65536 && tracked_http_gen[fd] > 0) {
-        uint32_t tag = 0x80000000U | (((uint32_t)(tracked_http_gen[fd] & 0x7fffU)) << 16) | ((uint32_t)fd & 0xffffU);
-        send_tls_chunk((void *)(uintptr_t)tag, buf, (size_t)ret, 1);
+    if (ret > 0) {
+        record_http_rx(fd, buf, (size_t)ret);
     }
     in_ssl_hook = 0;
     return ret;
+}
+
+ssize_t sendto(int fd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    static sendto_fn real_fn = NULL;
+    if (!real_fn) real_fn = (sendto_fn)dlsym(RTLD_NEXT, "sendto");
+    if (!real_fn) return -1;
+    if (in_ssl_hook) return real_fn(fd, buf, len, flags, dest_addr, addrlen);
+    in_ssl_hook = 1;
+    ssize_t ret = real_fn(fd, buf, len, flags, dest_addr, addrlen);
+    if (ret > 0) {
+        record_http_tx(fd, buf, (size_t)ret);
+    }
+    in_ssl_hook = 0;
+    return ret;
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+    static recvfrom_fn real_fn = NULL;
+    if (!real_fn) real_fn = (recvfrom_fn)dlsym(RTLD_NEXT, "recvfrom");
+    if (!real_fn) return -1;
+    if (in_ssl_hook) return real_fn(fd, buf, len, flags, src_addr, addrlen);
+    in_ssl_hook = 1;
+    ssize_t ret = real_fn(fd, buf, len, flags, src_addr, addrlen);
+    if (ret > 0) {
+        record_http_rx(fd, buf, (size_t)ret);
+    }
+    in_ssl_hook = 0;
+    return ret;
+}
+
+ssize_t write(int fd, const void *buf, size_t len) {
+    static write_fn real_fn = NULL;
+    if (!real_fn) real_fn = (write_fn)dlsym(RTLD_NEXT, "write");
+    if (!real_fn) return -1;
+    if (in_ssl_hook) return real_fn(fd, buf, len);
+    in_ssl_hook = 1;
+    ssize_t ret = real_fn(fd, buf, len);
+    if (ret > 0) {
+        record_http_tx(fd, buf, (size_t)ret);
+    }
+    in_ssl_hook = 0;
+    return ret;
+}
+
+ssize_t read(int fd, void *buf, size_t len) {
+    static read_fn real_fn = NULL;
+    if (!real_fn) real_fn = (read_fn)dlsym(RTLD_NEXT, "read");
+    if (!real_fn) return -1;
+    if (in_ssl_hook) return real_fn(fd, buf, len);
+    in_ssl_hook = 1;
+    ssize_t ret = real_fn(fd, buf, len);
+    if (ret > 0) {
+        record_http_rx(fd, buf, (size_t)ret);
+    }
+    in_ssl_hook = 0;
+    return ret;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
+    static writev_fn real_fn = NULL;
+    if (!real_fn) real_fn = (writev_fn)dlsym(RTLD_NEXT, "writev");
+    if (!real_fn) return -1;
+    if (in_ssl_hook) return real_fn(fd, iov, iovcnt);
+    in_ssl_hook = 1;
+    ssize_t ret = real_fn(fd, iov, iovcnt);
+    if (ret > 0 && iov && iovcnt > 0 && fd > 2 && fd < 65536) {
+        size_t rem = (size_t)ret;
+        for (int i = 0; i < iovcnt && rem > 0; i++) {
+            if (!iov[i].iov_base || iov[i].iov_len == 0) continue;
+            size_t chunk = iov[i].iov_len < rem ? iov[i].iov_len : rem;
+            record_http_tx(fd, iov[i].iov_base, chunk);
+            rem -= chunk;
+        }
+    }
+    in_ssl_hook = 0;
+    return ret;
+}
+
+int close(int fd) {
+    static close_fn real_fn = NULL;
+    if (!real_fn) real_fn = (close_fn)dlsym(RTLD_NEXT, "close");
+    if (!real_fn) return -1;
+    if (!in_ssl_hook && fd >= 0 && fd < 65536) {
+        tracked_http_gen[fd] = 0;
+    }
+    return real_fn(fd);
 }
 `
 
