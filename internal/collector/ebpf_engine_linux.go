@@ -4,6 +4,7 @@ package collector
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -973,51 +974,31 @@ func (e *EBPFEngine) AttachTargets(targets []ProbeTarget) int {
 }
 
 func (e *EBPFEngine) attachSyscallTracepoints() error {
-	tpWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_TRACEPOINT, "llmt_tp_write",
-		BuildWriteProbeProgram(e.ringMapFD, 16, 24, 32, true))
-	if err != nil {
-		return err
-	}
-	e.progFDs = append(e.progFDs, tpWriteProg)
-
-	tpWritevProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_TRACEPOINT, "llmt_tp_writev",
-		BuildWritevProbeProgram(e.ringMapFD))
-	if err == nil {
-		e.progFDs = append(e.progFDs, tpWritevProg)
-	} else {
-		tpWritevProg = -1
-	}
-
-	tpReadEnterProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_TRACEPOINT, "llmt_tp_r_ent",
-		BuildReadEnterProgram(e.activeSysReadFD, 16, 24, 0, true))
-	if err != nil {
-		return err
-	}
-	e.progFDs = append(e.progFDs, tpReadEnterProg)
-
-	tpReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_TRACEPOINT, "llmt_tp_r_ext",
-		BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, 16, true))
-	if err != nil {
-		return err
-	}
-	e.progFDs = append(e.progFDs, tpReadExitProg)
-
-	for _, tp := range []struct {
-		name   string
-		progFD int
+	specs := []struct {
+		tpName   string
+		progName string
+		insns    []BPFInsn
+		required bool
 	}{
-		{"syscalls/sys_enter_write", tpWriteProg},
-		{"syscalls/sys_enter_sendto", tpWriteProg},
-		{"syscalls/sys_enter_writev", tpWritevProg},
-		{"syscalls/sys_enter_read", tpReadEnterProg},
-		{"syscalls/sys_enter_recvfrom", tpReadEnterProg},
-		{"syscalls/sys_exit_read", tpReadExitProg},
-		{"syscalls/sys_exit_recvfrom", tpReadExitProg},
-	} {
-		if tp.progFD < 0 {
+		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, 16, 24, 32, true), true},
+		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, 16, 24, 32, true), false},
+		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD), false},
+		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, 16, 24, 0, true), true},
+		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, 16, 24, 0, true), false},
+		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, 16, true), true},
+		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, 16, true), false},
+	}
+
+	for _, sp := range specs {
+		progFD, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_TRACEPOINT, sp.progName, sp.insns)
+		if err != nil {
+			if sp.required {
+				return err
+			}
 			continue
 		}
-		if pfds, err := openAndAttachTracepoint(tp.name, tp.progFD); err == nil && len(pfds) > 0 {
+		e.progFDs = append(e.progFDs, progFD)
+		if pfds, err := openAndAttachTracepoint(sp.tpName, progFD); err == nil && len(pfds) > 0 {
 			e.perfFDs = append(e.perfFDs, pfds...)
 			e.tracepointCount++
 			e.attachedCount++
@@ -1093,7 +1074,9 @@ func openAndAttachUprobe(binaryPath string, offset uint64, isRetprobe bool, prog
 			lastErr = err
 			continue
 		}
-		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
+		// Note: event->tp_event->prog_array is shared across CPUs for the same trace_event_call.
+		// CPU 0 adds progFD to prog_array; subsequent CPUs return EEXIST, which must keep fd open & enabled.
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil && !errors.Is(err, unix.EEXIST) {
 			_ = unix.Close(fd)
 			lastErr = err
 			continue
@@ -1146,7 +1129,9 @@ func openAndAttachTracepoint(tpSubpath string, progFD int) ([]int, error) {
 			lastErr = err
 			continue
 		}
-		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil {
+		// Keep per-CPU perf_event open and enabled even when prog_array already contains progFD (EEXIST),
+		// ensuring per_cpu(swevent_htable, cpu).swevent_hlist remains allocated on every online CPU.
+		if err := unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, progFD); err != nil && !errors.Is(err, unix.EEXIST) {
 			_ = unix.Close(fd)
 			lastErr = err
 			continue
