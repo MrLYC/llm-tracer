@@ -301,6 +301,14 @@ func unwrapScriptTarget(binPath string) string {
 	if n >= 4 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F' {
 		return realPath
 	}
+	if n >= 2 && hdr[0] == 'M' && hdr[1] == 'Z' {
+		return realPath
+	}
+	if n >= 4 && ((hdr[0] == 0xcf && hdr[1] == 0xfa && hdr[2] == 0xed && hdr[3] == 0xfe) ||
+		(hdr[0] == 0xfe && hdr[1] == 0xed && hdr[2] == 0xfa && hdr[3] == 0xcf) ||
+		(hdr[0] == 0xca && hdr[1] == 0xfe && hdr[2] == 0xba && hdr[3] == 0xbe)) {
+		return realPath
+	}
 	content := string(hdr[:n])
 	// Check for @openai/codex wrapper layout
 	if strings.Contains(content, "codex") {
@@ -309,6 +317,9 @@ func unwrapScriptTarget(binPath string) string {
 			filepath.Join(dir, "..", "node_modules", "@openai", "codex-linux-x64", "vendor", "x86_64-unknown-linux-musl", "bin", "codex"),
 			filepath.Join(dir, "..", "vendor", "x86_64-unknown-linux-musl", "bin", "codex"),
 			filepath.Join(dir, "..", "node_modules", "@openai", "codex-linux-arm64", "vendor", "aarch64-unknown-linux-musl", "bin", "codex"),
+			filepath.Join(dir, "..", "node_modules", "@openai", "codex-darwin-arm64", "vendor", "aarch64-apple-darwin", "bin", "codex"),
+			filepath.Join(dir, "..", "node_modules", "@openai", "codex-darwin-x64", "vendor", "x86_64-apple-darwin", "bin", "codex"),
+			filepath.Join(dir, "..", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
 		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {

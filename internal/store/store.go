@@ -398,7 +398,10 @@ func (s *Store) QuerySessionEvents(q EventQuery) ([]model.TraceEvent, error) {
 
 	sort.Slice(eventsCopy, func(i, j int) bool {
 		if eventsCopy[i].Timestamp == eventsCopy[j].Timestamp {
-			return eventsCopy[i].StepIndex < eventsCopy[j].StepIndex
+			if eventsCopy[i].StepIndex != eventsCopy[j].StepIndex {
+				return eventsCopy[i].StepIndex < eventsCopy[j].StepIndex
+			}
+			return eventsCopy[i].TurnIndex < eventsCopy[j].TurnIndex
 		}
 		return eventsCopy[i].Timestamp < eventsCopy[j].Timestamp
 	})

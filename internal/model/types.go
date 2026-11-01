@@ -9,6 +9,8 @@ const (
 	ProtocolAnthropic       ProtocolType = "anthropic"
 	ProtocolGemini          ProtocolType = "gemini"
 	ProtocolOllama          ProtocolType = "ollama"
+	ProtocolBedrock         ProtocolType = "bedrock"
+	ProtocolMCP             ProtocolType = "mcp"
 	ProtocolUnknown         ProtocolType = "unknown"
 )
 

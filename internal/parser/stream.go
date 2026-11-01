@@ -352,7 +352,9 @@ func isSSEDone(b []byte) bool {
 		bytes.Contains(b, []byte(`"type":"message_stop"`)) ||
 		bytes.Contains(b, []byte(`"type": "message_stop"`)) ||
 		bytes.Contains(b, []byte(`"type":"response.completed"`)) ||
-		bytes.Contains(b, []byte(`"type": "response.completed"`))
+		bytes.Contains(b, []byte(`"type": "response.completed"`)) ||
+		bytes.Contains(b, []byte(`"finishReason":"STOP"`)) ||
+		bytes.Contains(b, []byte(`"finishReason": "STOP"`))
 }
 
 func (sr *StreamReassembler) advanceKeepAliveLocked(cb *connBuffer, ts int64) {

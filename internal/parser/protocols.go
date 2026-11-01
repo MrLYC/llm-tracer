@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -80,11 +81,22 @@ func DetectProtocol(path string, reqBody []byte, respBody []byte) model.Protocol
 		return model.ProtocolGemini
 	case strings.Contains(lowerPath, "/api/chat") || strings.Contains(lowerPath, "/api/generate"):
 		return model.ProtocolOllama
+	case strings.Contains(lowerPath, "/model/") && (strings.Contains(lowerPath, "/converse") || strings.Contains(lowerPath, "/invoke")):
+		return model.ProtocolBedrock
+	case strings.HasSuffix(lowerPath, "/mcp") || strings.Contains(lowerPath, "/mcp/") || strings.Contains(lowerPath, "/mcp?"):
+		return model.ProtocolMCP
 	}
 
 	// Fallback: inspect JSON structure
 	var reqMap map[string]any
 	if len(reqBody) > 0 && json.Unmarshal(reqBody, &reqMap) == nil {
+		if asString(reqMap["jsonrpc"]) == "2.0" {
+			m := asString(reqMap["method"])
+			if strings.HasPrefix(m, "tools/") || strings.HasPrefix(m, "resources/") || strings.HasPrefix(m, "prompts/") ||
+				strings.HasPrefix(m, "sampling/") || strings.HasPrefix(m, "notifications/") || m == "initialize" || m == "ping" {
+				return model.ProtocolMCP
+			}
+		}
 		if _, hasQuestions := reqMap["questions"]; hasQuestions {
 			if _, hasState := reqMap["state"]; hasState {
 				return model.ProtocolSystemOne
@@ -99,6 +111,12 @@ func DetectProtocol(path string, reqBody []byte, respBody []byte) model.Protocol
 			}
 		}
 		if _, hasMsgs := reqMap["messages"]; hasMsgs {
+			if _, hasInfCfg := reqMap["inferenceConfig"]; hasInfCfg {
+				return model.ProtocolBedrock
+			}
+			if _, hasToolCfg := reqMap["toolConfig"]; hasToolCfg {
+				return model.ProtocolBedrock
+			}
 			if _, hasAnthropicVer := reqMap["anthropic_version"]; hasAnthropicVer {
 				return model.ProtocolAnthropic
 			}
@@ -185,6 +203,9 @@ func ParseExchange(ev *model.TraceEvent, reqBody []byte, respBody []byte, isSSE 
 		return err
 	case model.ProtocolOpenAIChat:
 		chat, err := ParseOpenAIChat(reqBody, respBody, isSSE)
+		if chat != nil && chat.Model == "" {
+			chat.Model = extractAzureDeploymentModel(ev.Path)
+		}
 		ev.Chat = chat
 		return err
 	case model.ProtocolOpenAIResponses:
@@ -203,9 +224,30 @@ func ParseExchange(ev *model.TraceEvent, reqBody []byte, respBody []byte, isSSE 
 		chat, err := ParseOllama(reqBody, respBody)
 		ev.Chat = chat
 		return err
+	case model.ProtocolBedrock:
+		chat, err := ParseBedrock(ev.Path, reqBody, respBody)
+		ev.Chat = chat
+		return err
+	case model.ProtocolMCP:
+		chat, err := ParseMCP(ev.Path, reqBody, respBody, isSSE)
+		ev.Chat = chat
+		return err
 	default:
 		return nil
 	}
+}
+
+func extractAzureDeploymentModel(path string) string {
+	const marker = "/deployments/"
+	idx := strings.Index(strings.ToLower(path), marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := path[idx+len(marker):]
+	if slash := strings.IndexByte(rest, '/'); slash > 0 {
+		return rest[:slash]
+	}
+	return ""
 }
 
 // ParseSystemOne parses a TypeSafe JEV /systemone request and response.
@@ -434,7 +476,7 @@ func ParseOpenAIChat(reqBody []byte, respBody []byte, isSSE bool) (*model.ChatSu
 				continue
 			}
 			cm := parseOpenAIMessage(m)
-			if cm.Role == "system" && chat.SystemPrompt == "" {
+			if (cm.Role == "system" || cm.Role == "developer") && chat.SystemPrompt == "" {
 				chat.SystemPrompt = cm.Content
 			}
 			chat.Messages = append(chat.Messages, cm)
@@ -474,9 +516,13 @@ func ParseOpenAIChat(reqBody []byte, respBody []byte, isSSE bool) (*model.ChatSu
 }
 
 func parseOpenAIMessage(m map[string]any) model.ChatMessage {
+	thinking := asString(m["reasoning_content"])
+	if thinking == "" {
+		thinking = asString(m["reasoning"])
+	}
 	cm := model.ChatMessage{
 		Role:       asString(m["role"]),
-		Thinking:   asString(m["reasoning_content"]),
+		Thinking:   thinking,
 		ToolCallID: asString(m["tool_call_id"]),
 	}
 	switch content := m["content"].(type) {
@@ -542,7 +588,11 @@ func parseOpenAISSEResponse(respBody []byte, chat *model.ChatSummary) {
 				}
 				if delta, ok := c0["delta"].(map[string]any); ok {
 					textBuf.WriteString(asString(delta["content"]))
-					reasonBuf.WriteString(asString(delta["reasoning_content"]))
+					if rc := asString(delta["reasoning_content"]); rc != "" {
+						reasonBuf.WriteString(rc)
+					} else if r := asString(delta["reasoning"]); r != "" {
+						reasonBuf.WriteString(r)
+					}
 					if tcs, ok := delta["tool_calls"].([]any); ok {
 						for i, rawTC := range tcs {
 							tcMap, ok := rawTC.(map[string]any)
@@ -631,9 +681,35 @@ func ParseOpenAIResponses(reqBody []byte, respBody []byte, isSSE bool) (*model.C
 		case []any:
 			for _, item := range inp {
 				if m, ok := item.(map[string]any); ok {
+					itemType := asString(m["type"])
+					switch itemType {
+					case "function_call":
+						callID := asString(m["call_id"])
+						if callID == "" {
+							callID = asString(m["id"])
+						}
+						chat.Messages = append(chat.Messages, model.ChatMessage{
+							Role: "assistant",
+							ToolCalls: []model.ToolCallItem{
+								{
+									ID:        callID,
+									Name:      asString(m["name"]),
+									Arguments: asString(m["arguments"]),
+								},
+							},
+						})
+						continue
+					case "function_call_output":
+						chat.Messages = append(chat.Messages, model.ChatMessage{
+							Role:       "tool",
+							ToolCallID: asString(m["call_id"]),
+							Content:    asString(m["output"]),
+						})
+						continue
+					}
 					role := asString(m["role"])
 					if role == "" {
-						role = asString(m["type"])
+						role = itemType
 					}
 					cm := parseOpenAIMessage(m)
 					cm.Role = role
@@ -648,21 +724,73 @@ func ParseOpenAIResponses(reqBody []byte, respBody []byte, isSSE bool) (*model.C
 	if isSSE || bytes.HasPrefix(bytes.TrimSpace(respBody), []byte("event:")) || bytes.HasPrefix(bytes.TrimSpace(respBody), []byte("data:")) {
 		chat.IsStream = true
 		var textBuf strings.Builder
+		var reasonBuf strings.Builder
+		var toolCalls []model.ToolCallItem
+		seenCallIDs := map[string]int{}
+
+		addOrUpdateToolCall := func(tc model.ToolCallItem) {
+			if tc.ID != "" {
+				if idx, exists := seenCallIDs[tc.ID]; exists {
+					if tc.Name != "" {
+						toolCalls[idx].Name = tc.Name
+					}
+					if tc.Arguments != "" {
+						toolCalls[idx].Arguments = tc.Arguments
+					}
+					return
+				}
+				seenCallIDs[tc.ID] = len(toolCalls)
+			}
+			toolCalls = append(toolCalls, tc)
+		}
+
 		for _, line := range strings.Split(string(respBody), "\n") {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
 			var ev map[string]any
 			if json.Unmarshal([]byte(payload), &ev) != nil {
 				continue
 			}
 			switch asString(ev["type"]) {
+			case "response.created":
+				if rObj, ok := ev["response"].(map[string]any); ok {
+					if m := asString(rObj["model"]); m != "" && chat.Model == "" {
+						chat.Model = m
+					}
+				}
 			case "response.output_text.delta":
 				textBuf.WriteString(asString(ev["delta"]))
+			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+				reasonBuf.WriteString(asString(ev["delta"]))
+			case "response.output_item.added", "response.output_item.done":
+				if item, ok := ev["item"].(map[string]any); ok && asString(item["type"]) == "function_call" {
+					callID := asString(item["call_id"])
+					if callID == "" {
+						callID = asString(item["id"])
+					}
+					addOrUpdateToolCall(model.ToolCallItem{
+						ID:        callID,
+						Name:      asString(item["name"]),
+						Arguments: asString(item["arguments"]),
+					})
+				}
 			case "response.completed":
 				if rObj, ok := ev["response"].(map[string]any); ok {
+					if m := asString(rObj["model"]); m != "" && chat.Model == "" {
+						chat.Model = m
+					}
+					if st := asString(rObj["status"]); st != "" && chat.StopReason == "" {
+						chat.StopReason = st
+					}
+					if outputs, ok := rObj["output"].([]any); ok {
+						parseResponsesOutputItems(outputs, &textBuf, &reasonBuf, addOrUpdateToolCall)
+					}
 					if u, ok := rObj["usage"].(map[string]any); ok {
 						parseOpenAIUsage(u, &chat.Usage)
 					}
@@ -670,34 +798,92 @@ func ParseOpenAIResponses(reqBody []byte, respBody []byte, isSSE bool) (*model.C
 			}
 		}
 		chat.ResponseText = textBuf.String()
+		chat.ReasoningText = reasonBuf.String()
+		chat.ToolCalls = toolCalls
 		return chat, nil
 	}
 	var resp map[string]any
 	if json.Unmarshal(respBody, &resp) == nil {
+		if m := asString(resp["model"]); m != "" && chat.Model == "" {
+			chat.Model = m
+		}
+		if st := asString(resp["status"]); st != "" {
+			chat.StopReason = st
+		}
 		if outText := asString(resp["output_text"]); outText != "" {
 			chat.ResponseText = outText
-		} else if outputs, ok := resp["output"].([]any); ok {
-			var parts []string
-			for _, o := range outputs {
-				if om, ok := o.(map[string]any); ok {
-					if content, ok := om["content"].([]any); ok {
-						for _, c := range content {
-							if cm, ok := c.(map[string]any); ok {
-								if t := asString(cm["text"]); t != "" {
-									parts = append(parts, t)
-								}
-							}
-						}
-					}
-				}
+		}
+		if outputs, ok := resp["output"].([]any); ok {
+			var textBuf, reasonBuf strings.Builder
+			parseResponsesOutputItems(outputs, &textBuf, &reasonBuf, func(tc model.ToolCallItem) {
+				chat.ToolCalls = append(chat.ToolCalls, tc)
+			})
+			if chat.ResponseText == "" {
+				chat.ResponseText = textBuf.String()
 			}
-			chat.ResponseText = strings.Join(parts, "\n")
+			if chat.ReasoningText == "" {
+				chat.ReasoningText = reasonBuf.String()
+			}
 		}
 		if u, ok := resp["usage"].(map[string]any); ok {
 			parseOpenAIUsage(u, &chat.Usage)
 		}
 	}
 	return chat, nil
+}
+
+func parseResponsesOutputItems(outputs []any, textBuf *strings.Builder, reasonBuf *strings.Builder, onToolCall func(model.ToolCallItem)) {
+	needTextFallback := textBuf.Len() == 0
+	needReasonFallback := reasonBuf.Len() == 0
+	var textParts, reasonParts []string
+	for _, o := range outputs {
+		om, ok := o.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch asString(om["type"]) {
+		case "function_call":
+			callID := asString(om["call_id"])
+			if callID == "" {
+				callID = asString(om["id"])
+			}
+			onToolCall(model.ToolCallItem{
+				ID:        callID,
+				Name:      asString(om["name"]),
+				Arguments: asString(om["arguments"]),
+			})
+		case "reasoning":
+			if needReasonFallback {
+				if summary, ok := om["summary"].([]any); ok {
+					for _, s := range summary {
+						if sm, ok := s.(map[string]any); ok {
+							if t := asString(sm["text"]); t != "" {
+								reasonParts = append(reasonParts, t)
+							}
+						}
+					}
+				}
+			}
+		default:
+			if needTextFallback {
+				if content, ok := om["content"].([]any); ok {
+					for _, c := range content {
+						if cm, ok := c.(map[string]any); ok {
+							if t := asString(cm["text"]); t != "" {
+								textParts = append(textParts, t)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if needTextFallback && len(textParts) > 0 {
+		textBuf.WriteString(strings.Join(textParts, "\n"))
+	}
+	if needReasonFallback && len(reasonParts) > 0 {
+		reasonBuf.WriteString(strings.Join(reasonParts, "\n"))
+	}
 }
 
 // ParseAnthropic parses Anthropic /v1/messages requests & responses (both JSON and SSE).
@@ -890,6 +1076,24 @@ func ParseGemini(path string, reqBody []byte, respBody []byte, isSSE bool) (*mod
 	}
 	var req map[string]any
 	if len(reqBody) > 0 && json.Unmarshal(reqBody, &req) == nil {
+		for _, sysKey := range []string{"systemInstruction", "system_instruction"} {
+			if sysObj, ok := req[sysKey].(map[string]any); ok {
+				if pList, ok := sysObj["parts"].([]any); ok {
+					var sp []string
+					for _, p := range pList {
+						if pm, ok := p.(map[string]any); ok {
+							if t := asString(pm["text"]); t != "" {
+								sp = append(sp, t)
+							}
+						}
+					}
+					if len(sp) > 0 {
+						chat.SystemPrompt = strings.Join(sp, "\n")
+						break
+					}
+				}
+			}
+		}
 		if contents, ok := req["contents"].([]any); ok {
 			for _, c := range contents {
 				if cm, ok := c.(map[string]any); ok {
@@ -897,44 +1101,147 @@ func ParseGemini(path string, reqBody []byte, respBody []byte, isSSE bool) (*mod
 					if role == "" {
 						role = "user"
 					}
-					var parts []string
+					var parts, thoughts []string
+					var toolCalls []model.ToolCallItem
+					var toolCallID string
 					if pList, ok := cm["parts"].([]any); ok {
 						for _, p := range pList {
 							if pm, ok := p.(map[string]any); ok {
+								isThought, _ := pm["thought"].(bool)
 								if t := asString(pm["text"]); t != "" {
-									parts = append(parts, t)
+									if isThought {
+										thoughts = append(thoughts, t)
+									} else {
+										parts = append(parts, t)
+									}
+								}
+								if fc, ok := pm["functionCall"].(map[string]any); ok {
+									argsBytes, _ := json.Marshal(fc["args"])
+									name := asString(fc["name"])
+									id := asString(fc["id"])
+									if id == "" {
+										id = name
+									}
+									toolCalls = append(toolCalls, model.ToolCallItem{
+										ID:        id,
+										Name:      name,
+										Arguments: string(argsBytes),
+									})
+								}
+								if fr, ok := pm["functionResponse"].(map[string]any); ok {
+									name := asString(fr["name"])
+									id := asString(fr["id"])
+									if id == "" {
+										id = name
+									}
+									toolCallID = id
+									respBytes, _ := json.Marshal(fr["response"])
+									parts = append(parts, string(respBytes))
 								}
 							}
 						}
 					}
 					chat.Messages = append(chat.Messages, model.ChatMessage{
-						Role:    role,
-						Content: strings.Join(parts, "\n"),
+						Role:       role,
+						Content:    strings.Join(parts, "\n"),
+						Thinking:   strings.Join(thoughts, "\n"),
+						ToolCalls:  toolCalls,
+						ToolCallID: toolCallID,
 					})
 				}
 			}
 		}
 	}
-	var resp map[string]any
-	if len(respBody) > 0 && json.Unmarshal(respBody, &resp) == nil {
+	if len(respBody) == 0 {
+		return chat, nil
+	}
+
+	var textParts, thoughtParts []string
+	consumeGeminiRespObj := func(resp map[string]any) {
+		if mv := asString(resp["modelVersion"]); mv != "" && chat.Model == "" {
+			chat.Model = mv
+		}
 		if cands, ok := resp["candidates"].([]any); ok && len(cands) > 0 {
 			if c0, ok := cands[0].(map[string]any); ok {
+				if fr := asString(c0["finishReason"]); fr != "" {
+					chat.StopReason = fr
+				}
 				if content, ok := c0["content"].(map[string]any); ok {
 					if parts, ok := content["parts"].([]any); ok {
-						var texts []string
 						for _, p := range parts {
-							if pm, ok := p.(map[string]any); ok {
-								if t := asString(pm["text"]); t != "" {
-									texts = append(texts, t)
+							pm, ok := p.(map[string]any)
+							if !ok {
+								continue
+							}
+							isThought, _ := pm["thought"].(bool)
+							if t := asString(pm["text"]); t != "" {
+								if isThought {
+									thoughtParts = append(thoughtParts, t)
+								} else {
+									textParts = append(textParts, t)
 								}
 							}
+							if fc, ok := pm["functionCall"].(map[string]any); ok {
+								argsBytes, _ := json.Marshal(fc["args"])
+								name := asString(fc["name"])
+								id := asString(fc["id"])
+								if id == "" {
+									id = name
+								}
+								chat.ToolCalls = append(chat.ToolCalls, model.ToolCallItem{
+									ID:        id,
+									Name:      name,
+									Arguments: string(argsBytes),
+								})
+							}
 						}
-						chat.ResponseText = strings.Join(texts, "\n")
 					}
 				}
 			}
 		}
+		if u, ok := resp["usageMetadata"].(map[string]any); ok {
+			if v, ok := asFloat(u["promptTokenCount"]); ok {
+				chat.Usage.InputTokens = int(v)
+			}
+			if v, ok := asFloat(u["candidatesTokenCount"]); ok {
+				chat.Usage.OutputTokens = int(v)
+			}
+			if v, ok := asFloat(u["thoughtsTokenCount"]); ok {
+				chat.Usage.ReasoningTokens = int(v)
+			}
+			if v, ok := asFloat(u["cachedContentTokenCount"]); ok {
+				chat.Usage.CachedTokens = int(v)
+			}
+			if v, ok := asFloat(u["totalTokenCount"]); ok {
+				chat.Usage.TotalTokens = int(v)
+			} else {
+				chat.Usage.TotalTokens = chat.Usage.InputTokens + chat.Usage.OutputTokens
+			}
+		}
 	}
+
+	trimmed := bytes.TrimSpace(respBody)
+	if isSSE || bytes.HasPrefix(trimmed, []byte("data:")) {
+		chat.IsStream = true
+		for _, line := range strings.Split(string(respBody), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			var chunk map[string]any
+			if json.Unmarshal([]byte(payload), &chunk) == nil {
+				consumeGeminiRespObj(chunk)
+			}
+		}
+	} else {
+		var resp map[string]any
+		if json.Unmarshal(respBody, &resp) == nil {
+			consumeGeminiRespObj(resp)
+		}
+	}
+	chat.ResponseText = strings.Join(textParts, "")
+	chat.ReasoningText = strings.Join(thoughtParts, "")
 	return chat, nil
 }
 
@@ -944,18 +1251,25 @@ func ParseOllama(reqBody []byte, respBody []byte) (*model.ChatSummary, error) {
 	var req map[string]any
 	if len(reqBody) > 0 && json.Unmarshal(reqBody, &req) == nil {
 		chat.Model = asString(req["model"])
+		if s, ok := req["stream"].(bool); ok {
+			chat.IsStream = s
+		}
 		if prompt := asString(req["prompt"]); prompt != "" {
 			chat.Messages = append(chat.Messages, model.ChatMessage{Role: "user", Content: prompt})
 		}
 		if msgs, ok := req["messages"].([]any); ok {
 			for _, m := range msgs {
 				if mm, ok := m.(map[string]any); ok {
-					chat.Messages = append(chat.Messages, parseOpenAIMessage(mm))
+					cm := parseOpenAIMessage(mm)
+					if cm.Role == "system" && chat.SystemPrompt == "" {
+						chat.SystemPrompt = cm.Content
+					}
+					chat.Messages = append(chat.Messages, cm)
 				}
 			}
 		}
 	}
-	var textBuf strings.Builder
+	var textBuf, thinkBuf strings.Builder
 	for _, line := range strings.Split(string(respBody), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -965,14 +1279,256 @@ func ParseOllama(reqBody []byte, respBody []byte) (*model.ChatSummary, error) {
 		if json.Unmarshal([]byte(line), &chunk) != nil {
 			continue
 		}
+		if m := asString(chunk["model"]); m != "" && chat.Model == "" {
+			chat.Model = m
+		}
+		if dr := asString(chunk["done_reason"]); dr != "" {
+			chat.StopReason = dr
+		}
 		if r := asString(chunk["response"]); r != "" {
 			textBuf.WriteString(r)
 		}
+		if th := asString(chunk["thinking"]); th != "" {
+			thinkBuf.WriteString(th)
+		}
 		if msg, ok := chunk["message"].(map[string]any); ok {
 			textBuf.WriteString(asString(msg["content"]))
+			thinkBuf.WriteString(asString(msg["thinking"]))
+			parsed := parseOpenAIMessage(msg)
+			if len(parsed.ToolCalls) > 0 {
+				chat.ToolCalls = append(chat.ToolCalls, parsed.ToolCalls...)
+			}
+		}
+		if pe, ok := asFloat(chunk["prompt_eval_count"]); ok {
+			chat.Usage.InputTokens = int(pe)
+		}
+		if ec, ok := asFloat(chunk["eval_count"]); ok {
+			chat.Usage.OutputTokens = int(ec)
 		}
 	}
+	chat.Usage.TotalTokens = chat.Usage.InputTokens + chat.Usage.OutputTokens
 	chat.ResponseText = textBuf.String()
+	chat.ReasoningText = thinkBuf.String()
+	return chat, nil
+}
+
+// ParseBedrock parses AWS Bedrock Converse & Invoke API requests and responses.
+func ParseBedrock(path string, reqBody []byte, respBody []byte) (*model.ChatSummary, error) {
+	chat := &model.ChatSummary{}
+	if idx := strings.Index(path, "/model/"); idx >= 0 {
+		rest := path[idx+len("/model/"):]
+		if slash := strings.IndexByte(rest, '/'); slash > 0 {
+			rawModel := rest[:slash]
+			if unescaped, err := url.PathUnescape(rawModel); err == nil {
+				chat.Model = unescaped
+			} else {
+				chat.Model = rawModel
+			}
+		}
+	}
+	var req map[string]any
+	if len(reqBody) > 0 && json.Unmarshal(reqBody, &req) == nil {
+		if m := asString(req["modelId"]); m != "" && chat.Model == "" {
+			chat.Model = m
+		}
+		if sysList, ok := req["system"].([]any); ok {
+			var sp []string
+			for _, s := range sysList {
+				if sm, ok := s.(map[string]any); ok {
+					if t := asString(sm["text"]); t != "" {
+						sp = append(sp, t)
+					}
+				}
+			}
+			chat.SystemPrompt = strings.Join(sp, "\n")
+		}
+		if msgs, ok := req["messages"].([]any); ok {
+			for _, rawMsg := range msgs {
+				if m, ok := rawMsg.(map[string]any); ok {
+					chat.Messages = append(chat.Messages, parseBedrockMessage(m))
+				}
+			}
+		}
+	}
+	var resp map[string]any
+	if len(respBody) > 0 && json.Unmarshal(respBody, &resp) == nil {
+		chat.StopReason = asString(resp["stopReason"])
+		if outObj, ok := resp["output"].(map[string]any); ok {
+			if msgObj, ok := outObj["message"].(map[string]any); ok {
+				parsed := parseBedrockMessage(msgObj)
+				chat.ResponseText = parsed.Content
+				chat.ReasoningText = parsed.Thinking
+				chat.ToolCalls = parsed.ToolCalls
+			}
+		}
+		if u, ok := resp["usage"].(map[string]any); ok {
+			if v, ok := asFloat(u["inputTokens"]); ok {
+				chat.Usage.InputTokens = int(v)
+			}
+			if v, ok := asFloat(u["outputTokens"]); ok {
+				chat.Usage.OutputTokens = int(v)
+			}
+			if v, ok := asFloat(u["cacheReadInputTokens"]); ok {
+				chat.Usage.CachedTokens = int(v)
+			}
+			if v, ok := asFloat(u["totalTokens"]); ok {
+				chat.Usage.TotalTokens = int(v)
+			} else {
+				chat.Usage.TotalTokens = chat.Usage.InputTokens + chat.Usage.OutputTokens
+			}
+		}
+	}
+	return chat, nil
+}
+
+func parseBedrockMessage(m map[string]any) model.ChatMessage {
+	cm := model.ChatMessage{Role: asString(m["role"])}
+	if content, ok := m["content"].([]any); ok {
+		var texts, thoughts []string
+		for _, blk := range content {
+			bm, ok := blk.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t := asString(bm["text"]); t != "" {
+				texts = append(texts, t)
+			}
+			if rc, ok := bm["reasoningContent"].(map[string]any); ok {
+				if rt, ok := rc["reasoningText"].(map[string]any); ok {
+					if t := asString(rt["text"]); t != "" {
+						thoughts = append(thoughts, t)
+					}
+				}
+			}
+			if tu, ok := bm["toolUse"].(map[string]any); ok {
+				argsBytes, _ := json.Marshal(tu["input"])
+				cm.ToolCalls = append(cm.ToolCalls, model.ToolCallItem{
+					ID:        asString(tu["toolUseId"]),
+					Name:      asString(tu["name"]),
+					Arguments: string(argsBytes),
+				})
+			}
+			if tr, ok := bm["toolResult"].(map[string]any); ok {
+				cm.ToolCallID = asString(tr["toolUseId"])
+				if trContent, ok := tr["content"].([]any); ok {
+					for _, item := range trContent {
+						if im, ok := item.(map[string]any); ok {
+							if t := asString(im["text"]); t != "" {
+								texts = append(texts, t)
+							} else if j, hasJ := im["json"]; hasJ {
+								jb, _ := json.Marshal(j)
+								texts = append(texts, string(jb))
+							}
+						}
+					}
+				}
+			}
+		}
+		cm.Content = strings.Join(texts, "\n")
+		cm.Thinking = strings.Join(thoughts, "\n")
+	}
+	return cm
+}
+
+// ParseMCP parses Model Context Protocol (MCP) JSON-RPC 2.0 requests and responses over HTTP/SSE.
+func ParseMCP(path string, reqBody []byte, respBody []byte, isSSE bool) (*model.ChatSummary, error) {
+	chat := &model.ChatSummary{IsStream: isSSE}
+	var req map[string]any
+	if len(reqBody) > 0 && json.Unmarshal(reqBody, &req) == nil {
+		method := asString(req["method"])
+		rpcID := fmt.Sprintf("%v", req["id"])
+		chat.Model = "mcp:" + method
+		params, _ := req["params"].(map[string]any)
+		switch method {
+		case "tools/call":
+			toolName := asString(params["name"])
+			argsBytes, _ := json.Marshal(params["arguments"])
+			tc := model.ToolCallItem{
+				ID:        rpcID,
+				Name:      toolName,
+				Arguments: string(argsBytes),
+			}
+			chat.ToolCalls = append(chat.ToolCalls, tc)
+			chat.Messages = append(chat.Messages, model.ChatMessage{
+				Role:      "user",
+				Content:   fmt.Sprintf("tools/call %s %s", toolName, string(argsBytes)),
+				ToolCalls: []model.ToolCallItem{tc},
+			})
+		default:
+			pBytes, _ := json.Marshal(params)
+			chat.Messages = append(chat.Messages, model.ChatMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("%s %s", method, string(pBytes)),
+			})
+		}
+	}
+	if len(respBody) == 0 {
+		return chat, nil
+	}
+
+	parseMCPRespObj := func(resp map[string]any) {
+		if errObj, ok := resp["error"].(map[string]any); ok {
+			chat.StopReason = "error"
+			chat.ResponseText = asString(errObj["message"])
+			return
+		}
+		resObj, ok := resp["result"].(map[string]any)
+		if !ok {
+			return
+		}
+		if isErr, _ := resObj["isError"].(bool); isErr {
+			chat.StopReason = "error"
+		} else {
+			chat.StopReason = "ok"
+		}
+		if content, ok := resObj["content"].([]any); ok {
+			var texts []string
+			for _, c := range content {
+				if cm, ok := c.(map[string]any); ok {
+					if t := asString(cm["text"]); t != "" {
+						texts = append(texts, t)
+					}
+				}
+			}
+			chat.ResponseText = strings.Join(texts, "\n")
+			return
+		}
+		if tools, ok := resObj["tools"].([]any); ok {
+			var names []string
+			for _, t := range tools {
+				if tm, ok := t.(map[string]any); ok {
+					if n := asString(tm["name"]); n != "" {
+						names = append(names, n)
+					}
+				}
+			}
+			chat.ResponseText = "tools: " + strings.Join(names, ", ")
+			return
+		}
+		b, _ := json.Marshal(resObj)
+		chat.ResponseText = string(b)
+	}
+
+	trimmed := bytes.TrimSpace(respBody)
+	if isSSE || bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) {
+		chat.IsStream = true
+		for _, line := range strings.Split(string(respBody), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			var resp map[string]any
+			if json.Unmarshal([]byte(payload), &resp) == nil {
+				parseMCPRespObj(resp)
+			}
+		}
+	} else {
+		var resp map[string]any
+		if json.Unmarshal(respBody, &resp) == nil {
+			parseMCPRespObj(resp)
+		}
+	}
 	return chat, nil
 }
 

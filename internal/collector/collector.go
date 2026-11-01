@@ -137,9 +137,10 @@ func (c *Collector) Start(ctx context.Context) error {
 		c.mu.Unlock()
 		if c.mon != nil {
 			c.mon.RecordOK(selfmon.StageProbe, "build_runtime_hooks", map[string]any{
-				"py_hook":   rtHooks.PyHookDir,
-				"node_hook": rtHooks.NodeHookJS,
-				"ptrace":    rtHooks.PtraceBin,
+				"py_hook":    rtHooks.PyHookDir,
+				"node_hook":  rtHooks.NodeHookJS,
+				"java_agent": rtHooks.JavaAgentJar,
+				"ptrace":     rtHooks.PtraceBin,
 			})
 		}
 	} else if err != nil && c.mon != nil {
@@ -359,25 +360,25 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 
 	env := os.Environ()
 	if sockPath != "" {
-		env = append(env, "LLM_TRACER_SOCK="+sockPath)
+		env = setEnvVar(env, "LLM_TRACER_SOCK", sockPath)
 	}
 	if pipePath != "" {
-		env = append(env, "LLM_TRACER_PIPE="+pipePath)
+		env = setEnvVar(env, "LLM_TRACER_PIPE", pipePath)
 	}
 	if preloadPath != "" {
 		if runtime.GOOS == "darwin" {
 			existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
 			if existingDyld != "" {
-				env = append(env, "DYLD_INSERT_LIBRARIES="+preloadPath+":"+existingDyld)
+				env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath+":"+existingDyld)
 			} else {
-				env = append(env, "DYLD_INSERT_LIBRARIES="+preloadPath)
+				env = setEnvVar(env, "DYLD_INSERT_LIBRARIES", preloadPath)
 			}
 		} else if runtime.GOOS == "linux" {
 			existingPreload := os.Getenv("LD_PRELOAD")
 			if existingPreload != "" {
-				env = append(env, "LD_PRELOAD="+preloadPath+":"+existingPreload)
+				env = setEnvVar(env, "LD_PRELOAD", preloadPath+":"+existingPreload)
 			} else {
-				env = append(env, "LD_PRELOAD="+preloadPath)
+				env = setEnvVar(env, "LD_PRELOAD", preloadPath)
 			}
 		}
 	}
@@ -386,43 +387,67 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 			existingPyPath := os.Getenv("PYTHONPATH")
 			sep := string(os.PathListSeparator)
 			if existingPyPath != "" {
-				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir+sep+existingPyPath)
+				env = setEnvVar(env, "PYTHONPATH", rtHooks.PyHookDir+sep+existingPyPath)
 			} else {
-				env = append(env, "PYTHONPATH="+rtHooks.PyHookDir)
+				env = setEnvVar(env, "PYTHONPATH", rtHooks.PyHookDir)
 			}
 		}
 		if rtHooks.NodeHookJS != "" {
 			nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
 			reqOpt := "--require " + nodeHookSlash
 			if existingNodeOpts := os.Getenv("NODE_OPTIONS"); existingNodeOpts != "" {
-				env = append(env, "NODE_OPTIONS="+existingNodeOpts+" "+reqOpt)
+				env = setEnvVar(env, "NODE_OPTIONS", existingNodeOpts+" "+reqOpt)
 			} else {
-				env = append(env, "NODE_OPTIONS="+reqOpt)
+				env = setEnvVar(env, "NODE_OPTIONS", reqOpt)
 			}
 			preloadOpt := "--preload " + nodeHookSlash
 			if existingBunOpts := os.Getenv("BUN_OPTIONS"); existingBunOpts != "" {
-				env = append(env, "BUN_OPTIONS="+existingBunOpts+" "+preloadOpt)
+				env = setEnvVar(env, "BUN_OPTIONS", existingBunOpts+" "+preloadOpt)
 			} else {
-				env = append(env, "BUN_OPTIONS="+preloadOpt)
+				env = setEnvVar(env, "BUN_OPTIONS", preloadOpt)
+			}
+		}
+		if rtHooks.JavaAgentJar != "" {
+			javaOpt := "-javaagent:" + rtHooks.JavaAgentJar
+			if existingJavaOpts := os.Getenv("JAVA_TOOL_OPTIONS"); existingJavaOpts != "" {
+				env = setEnvVar(env, "JAVA_TOOL_OPTIONS", existingJavaOpts+" "+javaOpt)
+			} else {
+				env = setEnvVar(env, "JAVA_TOOL_OPTIONS", javaOpt)
 			}
 		}
 	}
-	if tap != nil && ((prof != nil && prof.RequiresPtrace) || runtime.GOOS != "linux") {
-		if os.Getenv("HTTP_PROXY") == "" && os.Getenv("HTTPS_PROXY") == "" {
-			env = append(env,
-				"HTTPS_PROXY="+tap.ProxyURL(),
-				"https_proxy="+tap.ProxyURL(),
-				"SSL_CERT_FILE="+tap.CABundlePath(),
-				"CURL_CA_BUNDLE="+tap.CABundlePath(),
-				"REQUESTS_CA_BUNDLE="+tap.CABundlePath(),
-				"NODE_EXTRA_CA_CERTS="+tap.CABundlePath(),
-			)
-			if !CanUsePtrace() {
-				env = append(env,
-					"HTTP_PROXY="+tap.ProxyURL(),
-					"http_proxy="+tap.ProxyURL(),
-				)
+	if tap != nil {
+		pHost, pPort := tap.HostPort()
+		env = setEnvVar(env, "LLM_TRACER_PROXY_HOST", pHost)
+		env = setEnvVar(env, "LLM_TRACER_PROXY_PORT", pPort)
+		env = setEnvVar(env, "SSL_CERT_FILE", tap.CABundlePath())
+		env = setEnvVar(env, "CURL_CA_BUNDLE", tap.CABundlePath())
+		env = setEnvVar(env, "REQUESTS_CA_BUNDLE", tap.CABundlePath())
+		env = setEnvVar(env, "NODE_EXTRA_CA_CERTS", tap.CABundlePath())
+		env = setEnvVar(env, "CARGO_HTTP_CAINFO", tap.CABundlePath())
+		targetResolved := binPath
+		if prof != nil && prof.ResolvedELF != "" {
+			targetResolved = prof.ResolvedELF
+		}
+		isRuntime := isShellOrRuntimeBinary(binPath) || isShellOrRuntimeBinary(targetResolved)
+		needsProxyEnv := !isRuntime &&
+			(runtime.GOOS != "linux" || (prof != nil && (prof.RequiresPtrace || prof.TLSStack == "stripped-embedded-tls")))
+		env = unsetEnvVar(env, "ALL_PROXY")
+		env = unsetEnvVar(env, "all_proxy")
+		env = unsetEnvVar(env, "NO_PROXY")
+		env = unsetEnvVar(env, "no_proxy")
+		if needsProxyEnv {
+			env = setEnvVar(env, "HTTPS_PROXY", tap.ProxyURL())
+			env = setEnvVar(env, "https_proxy", tap.ProxyURL())
+			if !CanUsePtrace() || (prof != nil && prof.TLSStack == "stripped-embedded-tls") {
+				env = setEnvVar(env, "HTTP_PROXY", tap.ProxyURL())
+				env = setEnvVar(env, "http_proxy", tap.ProxyURL())
 			}
+		} else {
+			env = unsetEnvVar(env, "HTTPS_PROXY")
+			env = unsetEnvVar(env, "https_proxy")
+			env = unsetEnvVar(env, "HTTP_PROXY")
+			env = unsetEnvVar(env, "http_proxy")
 		}
 	}
 	cmd.Env = env
@@ -752,4 +777,43 @@ func headerValueCI(hdrs map[string]string, key string) string {
 		}
 	}
 	return ""
+}
+
+func isShellOrRuntimeBinary(exePath string) bool {
+	base := strings.ToLower(filepath.Base(exePath))
+	base = strings.TrimSuffix(base, ".exe")
+	if strings.HasPrefix(base, "python") ||
+		strings.HasPrefix(base, "pypy") ||
+		strings.HasPrefix(base, "node") ||
+		strings.HasPrefix(base, "bun") ||
+		strings.HasPrefix(base, "java") {
+		return true
+	}
+	switch base {
+	case "sh", "bash", "dash", "zsh", "fish", "env":
+		return true
+	default:
+		return false
+	}
+}
+
+func setEnvVar(env []string, key, value string) []string {
+	out := unsetEnvVar(env, key)
+	return append(out, key+"="+value)
+}
+
+func unsetEnvVar(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if runtime.GOOS == "windows" {
+			if len(kv) >= len(prefix) && strings.EqualFold(kv[:len(prefix)], prefix) {
+				continue
+			}
+		} else if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

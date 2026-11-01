@@ -193,6 +193,7 @@ static int is_http_request_prefix(const void *buf, size_t len) {
 }
 
 static void record_http_tx(int fd, const void *buf, size_t len) {
+    if (runtime_tls_hook_active()) return;
     if (fd <= 2 || fd >= 65536 || !buf || len == 0) return;
     if (is_http_request_prefix(buf, len)) {
         struct stat st;
@@ -208,6 +209,7 @@ static void record_http_tx(int fd, const void *buf, size_t len) {
 }
 
 static void record_http_rx(int fd, const void *buf, size_t len) {
+    if (runtime_tls_hook_active()) return;
     if (fd <= 2 || fd >= 65536 || !buf || len == 0) return;
     if (tracked_http_gen[fd] > 0) {
         uint32_t tag = 0x80000000U | (((uint32_t)(tracked_http_gen[fd] & 0x7fffU)) << 16) | ((uint32_t)fd & 0xffffU);

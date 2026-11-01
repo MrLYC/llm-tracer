@@ -45,7 +45,7 @@ jobs:
         run: |
           GO_BIN="$(which go)"
           sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
-            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform'
+            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios'
 
       - name: Build Linux amd64 & arm64 binaries
         run: |

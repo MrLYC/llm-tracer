@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,15 +29,16 @@ import (
 // LoopbackTap is an ephemeral local HTTP + HTTPS MITM proxy used as fallback for static-pie (codex/rustls)
 // and Go (crypto/tls) binaries that bypass libc LD_PRELOAD and ptrace.
 type LoopbackTap struct {
-	ln       net.Listener
-	addr     string
-	caCert   *x509.Certificate
-	caKey    *ecdsa.PrivateKey
-	caPath   string
-	certMu   sync.Mutex
-	certMap  map[string]*tls.Certificate
-	seq      atomic.Uint64
-	onChunk  func(connID string, dir parser.Direction, data []byte)
+	ln            net.Listener
+	addr          string
+	caCert        *x509.Certificate
+	caKey         *ecdsa.PrivateKey
+	caPath        string
+	upstreamProxy string
+	certMu        sync.Mutex
+	certMap       map[string]*tls.Certificate
+	seq           atomic.Uint64
+	onChunk       func(connID string, dir parser.Direction, data []byte)
 }
 
 func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Direction, data []byte)) (*LoopbackTap, error) {
@@ -87,14 +89,25 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 	if err != nil {
 		return nil, err
 	}
+	upProxy := strings.TrimSpace(os.Getenv("HTTPS_PROXY"))
+	if upProxy == "" {
+		upProxy = strings.TrimSpace(os.Getenv("https_proxy"))
+	}
+	if upProxy == "" {
+		upProxy = strings.TrimSpace(os.Getenv("HTTP_PROXY"))
+	}
+	if upProxy == "" {
+		upProxy = strings.TrimSpace(os.Getenv("http_proxy"))
+	}
 	tap := &LoopbackTap{
-		ln:      ln,
-		addr:    ln.Addr().String(),
-		caCert:  caCert,
-		caKey:   caKey,
-		caPath:  caPath,
-		certMap: make(map[string]*tls.Certificate),
-		onChunk: onChunk,
+		ln:            ln,
+		addr:          ln.Addr().String(),
+		caCert:        caCert,
+		caKey:         caKey,
+		caPath:        caPath,
+		upstreamProxy: upProxy,
+		certMap:       make(map[string]*tls.Certificate),
+		onChunk:       onChunk,
 	}
 	go tap.serve()
 	return tap, nil
@@ -102,6 +115,14 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 
 func (t *LoopbackTap) ProxyURL() string {
 	return "http://" + t.addr
+}
+
+func (t *LoopbackTap) HostPort() (string, string) {
+	h, p, err := net.SplitHostPort(t.addr)
+	if err != nil {
+		return "127.0.0.1", ""
+	}
+	return h, p
 }
 
 func (t *LoopbackTap) CABundlePath() string {
@@ -221,18 +242,17 @@ func (t *LoopbackTap) handleConnect(clientConn net.Conn, targetHost string) {
 	}
 	defer tlsClient.Close()
 
-	upConn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", targetHost, &tls.Config{
-		ServerName:         hostOnly,
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"http/1.1"},
-	})
+	upConn, err := t.dialUpstreamTLS(targetHost, hostOnly)
 	if err != nil {
 		return
 	}
 	defer upConn.Close()
 
 	connID := fmt.Sprintf("taptls_%d", t.seq.Add(1))
-	done := make(chan struct{}, 2)
+	var clientEOF atomic.Bool
+	var upReadBytes atomic.Int64
+	upDone := make(chan struct{})
+
 	go func() {
 		buf := make([]byte, 32768)
 		for {
@@ -246,30 +266,70 @@ func (t *LoopbackTap) handleConnect(clientConn net.Conn, targetHost string) {
 				_, _ = upConn.Write(buf[:n])
 			}
 			if err != nil {
+				clientEOF.Store(true)
+				if upReadBytes.Load() > 0 {
+					_ = upConn.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+				} else {
+					_ = upConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				}
 				break
 			}
 		}
-		done <- struct{}{}
 	}()
 	go func() {
+		defer close(upDone)
 		buf := make([]byte, 32768)
 		for {
 			n, err := upConn.Read(buf)
 			if n > 0 {
+				upReadBytes.Add(int64(n))
 				if t.onChunk != nil {
 					cp := make([]byte, n)
 					copy(cp, buf[:n])
 					t.onChunk(connID, parser.DirRead, cp)
 				}
 				_, _ = tlsClient.Write(buf[:n])
+				if clientEOF.Load() {
+					_ = upConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				}
 			}
 			if err != nil {
 				break
 			}
 		}
-		done <- struct{}{}
 	}()
-	<-done
+	<-upDone
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == "localhost" || h == "127.0.0.1" || h == "::1" || strings.HasPrefix(h, "127.")
+}
+
+func (t *LoopbackTap) dialUpstreamTLS(targetHost, hostOnly string) (*tls.Conn, error) {
+	tlsCfg := &tls.Config{
+		ServerName:         hostOnly,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+	}
+	if !isLoopbackHost(hostOnly) && t.upstreamProxy != "" {
+		if pu, err := url.Parse(t.upstreamProxy); err == nil && pu.Host != "" && pu.Host != t.addr {
+			if proxyConn, err := net.DialTimeout("tcp", pu.Host, 5*time.Second); err == nil {
+				connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHost, targetHost)
+				if _, err := io.WriteString(proxyConn, connectReq); err == nil {
+					br := bufio.NewReader(proxyConn)
+					if resp, err := http.ReadResponse(br, nil); err == nil && resp.StatusCode == http.StatusOK {
+						tlsConn := tls.Client(proxyConn, tlsCfg)
+						if err := tlsConn.Handshake(); err == nil {
+							return tlsConn, nil
+						}
+					}
+				}
+				_ = proxyConn.Close()
+			}
+		}
+	}
+	return tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", targetHost, tlsCfg)
 }
 
 func (t *LoopbackTap) getOrCreateLeafCert(host string) (*tls.Certificate, error) {

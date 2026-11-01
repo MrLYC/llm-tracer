@@ -94,6 +94,9 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 		}
 		if st, ok := c.sessions[slot.sessionID]; ok {
 			st.lastUpdatedAt = ev.Timestamp
+			if respID := extractResponseObjectID(ev.ResponseRaw); respID != "" {
+				c.explicitIdx["resp:"+respID] = st.sessionID
+			}
 			if ev.Status != "streaming" && ev.Chat != nil {
 				c.recordChatSnapshotLocked(st, ev)
 			}
@@ -178,9 +181,6 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 	}
 	if ev.Process.PID > 0 {
 		matched.pids[ev.Process.PID] = true
-	}
-	if ev.Process.PPID > 0 {
-		matched.pids[ev.Process.PPID] = true
 	}
 	if matched.cwd == "" && ev.Process.Cwd != "" {
 		matched.cwd = ev.Process.Cwd
@@ -407,9 +407,17 @@ func hashMessages(msgs []model.ChatMessage) []string {
 
 func hashSingleMessage(m model.ChatMessage) string {
 	var b strings.Builder
-	b.WriteString(strings.ToLower(strings.TrimSpace(m.Role)))
+	role := strings.ToLower(strings.TrimSpace(m.Role))
+	if role == "model" {
+		role = "assistant"
+	}
+	b.WriteString(role)
 	b.WriteByte('|')
 	b.WriteString(strings.TrimSpace(m.Content))
+	if m.ToolCallID != "" {
+		b.WriteByte('|')
+		b.WriteString(strings.TrimSpace(m.ToolCallID))
+	}
 	for _, tc := range m.ToolCalls {
 		b.WriteByte('|')
 		b.WriteString(tc.Name)
@@ -438,7 +446,9 @@ func extractExplicitSessionKeys(ev *model.TraceEvent) ([]string, string) {
 
 	for k, v := range ev.RequestHeaders {
 		lk := strings.ToLower(k)
-		if lk == "x-session-id" || lk == "x-conversation-id" || lk == "x-thread-id" || lk == "openai-conversation-id" {
+		switch lk {
+		case "x-session-id", "x-conversation-id", "x-thread-id", "openai-conversation-id",
+			"mcp-session-id", "x-claude-session-id", "x-codex-session-id", "x-agent-session-id", "x-langsmith-trace-id":
 			if strings.TrimSpace(v) != "" {
 				keys = append(keys, lk+":"+strings.TrimSpace(v))
 			}
@@ -475,6 +485,25 @@ func extractResponseObjectID(respRaw string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(respRaw), &obj) == nil {
 		if id, ok := obj["id"].(string); ok && strings.HasPrefix(id, "resp_") {
+			return id
+		}
+	}
+	for _, line := range strings.Split(respRaw, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var ev map[string]any
+		if json.Unmarshal([]byte(payload), &ev) != nil {
+			continue
+		}
+		if rObj, ok := ev["response"].(map[string]any); ok {
+			if id, ok := rObj["id"].(string); ok && strings.HasPrefix(id, "resp_") {
+				return id
+			}
+		}
+		if id, ok := ev["id"].(string); ok && strings.HasPrefix(id, "resp_") {
 			return id
 		}
 	}

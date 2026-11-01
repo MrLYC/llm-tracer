@@ -16,6 +16,9 @@
 | **Node.js (v24+)** | 动态链接 `libc.so.6` / `libstdc++.so.6` | **静态内嵌 OpenSSL 3**（符号在 `bin/node` 内） | **默认失效**：不经过系统 `libssl.so`，需手动传 `--libssl=/path/to/node` | **HTTPS 失效**：内部静态调用 `SSL_write`，不走动态符号表重定位 |
 | **OpenAI Codex CLI (`codex`)** | `node` 包装脚本拉起 **`x86_64-unknown-linux-musl/bin/codex` (`static-pie`, `stripped`)** | **Rust `musl` 全静态链接 + `rustls` + 内联 `syscall`** | **完全失效**：`eCapture` 不支持 `rustls`，且二进制完全 `stripped` | **完全失效**：二进制无动态链接器 `PT_INTERP`，内核在 `execve` 时直接忽略 `LD_PRELOAD` |
 | **Go 原生程序 (`ollama`、Go Agent)** | 无 `libc` 依赖（或仅 cgo 壳） | **Go 原生 `crypto/tls` + `runtime/internal/syscall` 直接系统调用** | 需 Root 权限且手动指定 `gotls --elfpath`；若二进制 strip 或走明文 HTTP 则失效 | **完全失效**：不经过 `libc.so` 与 `libssl.so` |
+| **Java / JVM (`Spring AI`、`LangChain4j`)** | JVM 字节码 + `libnet.so` | **JDK JSSE (`sun.security.ssl.SSLSocketImpl` / `SSLEngineImpl`) 纯 Java 实现** | **完全失效**：TLS 握手与加解密在 JVM 字节码层完成，不调用 `libssl.so` | **完全失效**：HTTPS 明文不经过 C 层 `SSL_write`，底层 Socket 写出已加密密文 |
+| **Rust (`reqwest` + `rustls`、`goose`)** | 动态链接 `libc.so.6` 或 `musl` 静态链接 | **Rust 原生 `rustls`（`ring` / `aws-lc-rs`）** | **完全失效**：无 OpenSSL 符号，`eCapture` 不支持 `rustls` | **HTTPS 失效**：不经过 `libssl.so`，Socket 层仅见 TLS 密文 |
+| **C/C++ (`libcurl`、`cpp-httplib`、`llama.cpp`)** | 动态链接 `libssl.so`、静态内嵌 OpenSSL/BoringSSL 或 `gcc -s` 剥离符号 | OpenSSL / BoringSSL / mbedTLS | 仅未 strip 的 OpenSSL 可抓；静态 strip 或 BoringSSL 失效 | 静态内嵌 TLS 时 `LD_PRELOAD` `SSL_write` 失效 |
 
 ---
 
@@ -37,7 +40,7 @@
 
 ---
 
-## 三、七大采集机制原理详解（内核态 eBPF + 用户态六层自适应）
+## 三、八大采集机制原理详解（内核态 eBPF + 用户态七层自适应）
 
 所有采集通道在提取到明文 HTTP/1.1 或 HTTP/2 载荷后，统一封装为 **24 字节定长 `LLMT` 二进制帧** 写入本地 Unix Domain Socket (`LLM_TRACER_SOCK`) 或追加管道文件 (`LLM_TRACER_PIPE`)，再交由 `StreamReassembler` 进行流重组：
 
@@ -132,12 +135,24 @@
 ### 机制 6：内置动态 CA 与本地透明代理 (`internal/collector/loopback_tap.go`)
 
 - **适用场景**：
-  - `codex`（Rust `rustls`）与 Go 二进制（`crypto/tls`）在无 Root 权限下发起 **HTTPS** 请求；
+  - `codex` / `goose`（Rust `rustls`）、Go 二进制（`crypto/tls`）、C/C++ 剥离符号静态 TLS 二进制在无 Root 权限下发起 **HTTPS** 请求；
   - 在禁用 `ptrace` 的容器环境运行全静态或 Go 二进制。
 - **实现原理**：
   1. `NewLoopbackTap` 在内存中动态生成 ECDSA P-256 临时根证书（有效期 7 天），与系统 `/etc/ssl/certs/ca-certificates.crt` 合并写入 `<cache_dir>/hooks/llm_tracer_ca_bundle.pem`，并在 `127.0.0.1:0` 启动本地监听。
-  2. 仅当拉起 `RequiresPtrace` 目标（静态 ELF 或 Go 二进制）且用户未自定义代理时，自动注入 `HTTPS_PROXY`、`SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`（若当前环境禁用了 `ptrace`，则同时注入 `HTTP_PROXY`）。
-  3. 收到 `CONNECT host:443` 请求时，根据目标域名动态签发内存态 ECDSA 叶子证书完成本地 TLS 握手，在转发至真实上游的同时将解密后的明文双向镜像至 `StreamReassembler`。
+  2. 当拉起 `RequiresPtrace` 目标（静态二进制或 Go 二进制）或 `stripped-embedded-tls` 原生二进制（如 Rust `rustls`、C/C++ 静态 strip 二进制）且用户未自定义代理时，自动注入 `HTTPS_PROXY`、`SSL_CERT_FILE`、`CARGO_HTTP_CAINFO`、`CURL_CA_BUNDLE`、`REQUESTS_CA_BUNDLE`。
+  3. 收到 `CONNECT host:443` 请求时，根据目标域名动态签发内存态 ECDSA 叶子证书完成本地 TLS 握手，在转发至真实上游的同时将解密后的明文双向镜像至 `StreamReassembler`（含客户端 `SHUT_WR` 半关闭等待上游响应读完保护）。
+
+### 机制 7：Java / JVM 零代码注入 `-javaagent` 字节码代理 (`internal/collector/java_agent.go`)
+
+- **适用场景**：
+  - **Java / Kotlin / Scala 应用与 Agent 框架**：`Spring AI`、`LangChain4j`、AWS Bedrock Java SDK、OpenAI Java SDK（底层使用 `java.net.http.HttpClient`、`HttpsURLConnection`、`OkHttp`、`Apache HttpClient`、`Reactor Netty`）。
+- **实现原理**：
+  1. JVM 的 TLS 协议栈（JSSE `sun.security.ssl`）完全由 Java 字节码实现，既不调用 `libssl.so` 也不受系统环境变量 `SSL_CERT_FILE` 影响（默认只认 `$JAVA_HOME/lib/security/cacerts`）。
+  2. `EnsureJavaAgentJar` 在启动时自动生成 `<cache_dir>/hooks/llm_tracer_java.jar`（若环境有 `javac` 则通过 `javac --release 8` 现场编译，若仅有 JRE 则直接使用内嵌的 Java 8 `.class` 字节码打包），并通过 `JAVA_TOOL_OPTIONS="-javaagent:.../llm_tracer_java.jar"` 零侵入注入所有子 JVM 进程。
+  3. `LlmTracerAgent.premain` 在目标 `main()` 执行前完成三项初始化：
+     - 注册全局 `X509ExtendedTrustManager` 至 `SSLContext.setDefault(...)` 与 `HttpsURLConnection.setDefaultSSLSocketFactory(...)`，使 JVM 无需修改系统 `cacerts` 即可信任 `LoopbackTap` 的动态证书；
+     - 设置 `https.proxyHost` / `https.proxyPort`、`http.proxyHost` / `http.proxyPort` 及 `jdk.http.auth.tunneling.disabledSchemes=""`；
+     - 安装自定义 `ProxySelector.setDefault(...)`（`TapProxySelector`），将 `http://` 与 `https://` 流量透明路由至本地 `LoopbackTap`（同时自动绕过回环地址本身防止递归死循环）。
 
 ---
 
@@ -214,3 +229,35 @@ sudo /path/to/go test -v -count=1 ./internal/collector -run 'TestEBPF|TestRealKe
   3. 交叉构建 `linux/amd64` 与 `linux/arm64` 二进制。
 - **`macos-scenarios` (`macos-latest`)**：验证 Darwin `sysctl` 进程树过滤、ELF/Mach-O/PE 三格式符号解析、Python `ssl.SSLSocket`、Node.js `tls.TLSSocket` 多轮对话及原生 Mach-O Go HTTPS 客户端通过 `LoopbackTap` 的端到端抓取，并构建 `darwin/arm64` 与 `darwin/amd64` 二进制。
 - **`windows-scenarios` (`windows-latest`)**：验证 Windows `Toolhelp32` 进程树过滤、ELF/Mach-O/PE 三格式符号解析、Python/Node.js TLS Hook（含 `O_BINARY` 管道帧）及原生 PE `.exe` Go HTTPS 客户端端到端抓取，并构建 `windows/amd64` 二进制。
+
+---
+
+## 七、多语言 (`Java` / `C/C++` / `Rust`)、主流 Agent 框架与常用 Agent CLI 全面支持矩阵 (`internal/collector/polyglot_agents_test.go`)
+
+### 1. 多语言运行时覆盖矩阵
+
+| 语言 / 运行时 | 典型 HTTP / TLS 栈 | Linux Root 采集通道 | Linux 非特权 / macOS / Windows 采集通道 | 自动化验证用例 |
+|---|---|---|---|---|
+| **Python** (`CPython` / `uv` / `conda`) | `httpx` (`ssl.MemoryBIO`)、`aiohttp`、`requests`、`urllib3`、`http.client`（含本地明文 HTTP） | eBPF `uprobe/SSL_*` + `sitecustomize.py` | `sitecustomize.py`（`SSLObject` + `SSLSocket` + `HTTPConnection`） | `Scenario3`、`EBPF_Scenario2`、`TestAgentFrameworksAndAgentCLIsScenarios` |
+| **Node.js / TypeScript / Bun** | `undici`/`fetch`、`tls.TLSSocket`、`net.Socket`、Bun `globalThis.fetch` (BoringSSL) | eBPF `uprobe` / `sys_enter_writev` + `node_hook.cjs` | `NODE_OPTIONS` / `BUN_OPTIONS` (`node_hook.cjs`) | `Scenario2`、`Scenario4`、`EBPF_Scenario4` |
+| **Go** (`crypto/tls` / `net/http`) | Go 原生 `crypto/tls` + 直接 `syscall` | eBPF `uprobe/crypto/tls.(*Conn).Write` & `RET` 探针 | `llm_tracer_ptrace` + `LoopbackTap` (`SSL_CERT_FILE`) | `Scenario6`、`EBPF_Scenario5`、`TestCrossPlatformNativeHTTPSClientViaLoopbackTap` |
+| **Java / JVM** (JDK 8 ~ 25+) | JSSE (`HttpClient`、`OkHttp`、`Apache HttpClient`、`HttpsURLConnection`) | `JAVA_TOOL_OPTIONS="-javaagent:llm_tracer_java.jar"` + `LoopbackTap` | `JAVA_TOOL_OPTIONS="-javaagent:llm_tracer_java.jar"` + `LoopbackTap` | `TestPolyglotLanguagesCapture/1_Java_JVM_ZeroCode_Agent_Capture` |
+| **C / C++** (`gcc` / `clang`) | 动态 `libssl.so`、静态 OpenSSL、或 stripped 静态 TLS (`libcurl`) | eBPF `uprobe/SSL_*` + `tp/syscalls/sys_enter_*` | `LD_PRELOAD` (`libllm_tracer_ssl.so`) + `LoopbackTap` (`CURL_CA_BUNDLE` / `SSL_CERT_FILE`) | `Scenario1`、`EBPF_Scenario1/3/9`、`TestPolyglotLanguagesCapture/2_Cpp_Native_Stripped_Binary_Capture` |
+| **Rust** (`cargo` / `rustc`) | `reqwest` + `rustls`（默认无 OpenSSL 符号）或 `native-tls` | eBPF `tp/syscalls/sys_enter_*` (明文) + `LoopbackTap` (HTTPS) | `LoopbackTap` (`HTTPS_PROXY` + `SSL_CERT_FILE` + `CARGO_HTTP_CAINFO`) | `Scenario5`、`EBPF_Scenario7`、`TestPolyglotLanguagesCapture/3_Rust_Stripped_Binary_Capture` |
+
+### 2. 主流 Agent CLI 与 Agent 框架协议特性支持
+
+| Agent CLI / 框架 | 核心协议 (`protocol`) | 关键特性解析与会话串联支持 |
+|---|---|---|
+| **Claude Code (`claude`)** | `anthropic` (`/v1/messages`) + `mcp` (JSON-RPC 2.0) | 解析 `system` 数组、`thinking` 块、`tool_use` / `tool_result`、Prompt Cache Token (`cache_read_input_tokens`)；通过 `L3_proctree` 将 Claude 主对话与子进程/远端 **MCP Server (`tools/call`)** 自动串联至同一 Session |
+| **OpenAI Codex CLI (`codex`) & OpenAI Agents SDK** | `openai-responses` (`/v1/responses`) | 解析 `instructions`、`reasoning` (`response.reasoning_summary_text.delta`)、`function_call` / `function_call_output`；从 SSE `response.completed` 提取 `resp_...` 并通过 `previous_response_id` 实现 **L1 精确串联** |
+| **Google Gemini CLI (`gemini`) & Vertex AI** | `gemini` (`:generateContent` / `:streamGenerateContent?alt=sse`) | 解析 `systemInstruction`、Gemini 2.5 Thinking (`thought: true`)、`functionCall` / `functionResponse`、`usageMetadata`（含 `thoughtsTokenCount`）；自动脱敏 URL `?key=[REDACTED]`；归一化 `role: "model" -> "assistant"` 实现多轮 `L2_context` 串联 |
+| **LangChain / LangGraph / LlamaIndex / AutoGen / CrewAI / Aider** | `openai-chat` (`/v1/chat/completions`) + `ollama` (`http://.../api/chat`) | 支持 `role: "developer"`、DeepSeek/QwQ `reasoning_content` / `reasoning`、Azure OpenAI `/openai/deployments/{model}/chat/completions` 模型名提取；支持 **云端 HTTPS + 本地明文 HTTP (`Ollama` / `vLLM`) 混合 Agent 循环** 同进程树自动串联 |
+| **Spring AI / LangChain4j / AWS Agents** | `bedrock` (`/model/{id}/converse` & `/converse-stream`) | 解析 AWS Bedrock Converse `system`、`messages`、`reasoningContent`、`toolUse` / `toolResult` 及 `usage` (`inputTokens`/`outputTokens`) |
+| **Hermes / TypeSafe JEV** | `systemone` (`/api/jev/decide`、`/api/v1/step`) | 解析 `goal`、`dom_summary`、`recent_actions`、`action/target/value/confidence` 并按 `goal + recent_actions` 步进串联 |
+
+运行多语言与 Agent 场景验证命令：
+
+```bash
+mise exec go@1.26.5 -- go test -v -count=1 ./internal/collector -run 'TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios'
+```
