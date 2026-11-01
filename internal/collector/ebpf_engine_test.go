@@ -242,6 +242,16 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 					}
 				}
 			}
+			if len(matched) == 0 {
+				for _, s := range sessions {
+					evs, _ := st.QuerySessionEvents(store.EventQuery{SessionID: s.ID})
+					for _, ev := range evs {
+						if ev.Process.PID == pid {
+							t.Logf("diag found non-ok event for pid=%d status=%s proto=%s", pid, ev.Status, ev.Protocol)
+						}
+					}
+				}
+			}
 			return len(matched) >= 1
 		}, 3*time.Second, 25*time.Millisecond, msg)
 		return matched
@@ -548,23 +558,25 @@ int main(void) {
 		binPath := filepath.Join(dir, "scen_ebpf_static_pie")
 		code := `
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <string.h>
 int main(void) {
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+    volatile char warmup[8192];
+    for (int i = 0; i < (int)sizeof(warmup); i += 64) warmup[i] = (char)i;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
     const char *req = "POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n{\"model\":\"gpt-5-codex\",\"input\":\"static binary via kernel ebpf tracepoint\"}";
     const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":\"resp_static_tp\",\"object\":\"response\",\"model\":\"gpt-5-codex\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"static pie ebpf tracepoint ok\"}]}]}";
     char req_buf[512], resp_buf[512], sink[512];
-    size_t req_len = strlen(req);
-    size_t resp_len = strlen(resp);
-    for (size_t i = 0; i <= req_len; i++) ((volatile char *)req_buf)[i] = req[i];
-    for (size_t i = 0; i <= resp_len; i++) ((volatile char *)resp_buf)[i] = resp[i];
-    for (size_t i = 0; i < sizeof(sink); i++) ((volatile char *)sink)[i] = 0;
+    memcpy(req_buf, req, strlen(req) + 1);
+    memcpy(resp_buf, resp, strlen(resp) + 1);
+    memset(sink, 0, sizeof(sink));
     __asm__ volatile("" : "+m"(req_buf), "+m"(resp_buf), "+m"(sink));
-    write(sv[0], req_buf, req_len);
+    write(sv[0], req_buf, strlen(req_buf));
     read(sv[1], sink, sizeof(sink));
-    write(sv[1], resp_buf, resp_len);
+    write(sv[1], resp_buf, strlen(resp_buf));
     read(sv[0], sink, sizeof(sink));
     close(sv[0]);
     close(sv[1]);
