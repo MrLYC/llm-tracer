@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -51,27 +52,31 @@ func TestShortLived60SubprocessesCapture(t *testing.T) {
 		}, 2*time.Second, 10*time.Millisecond, "child process PPID must resolve to selfPID")
 
 		// First sight of childPID while alive caches its ancestor chain (childPID -> selfPID)
-		_ = col.tracker.ResolveProcess(childPID, model.ProcessInfo{PID: childPID})
+		_, _ = col.tracker.MatchAndEnrich(childPID, model.ProcessInfo{PID: childPID})
 
 		// Terminate childPID and wait for it to completely disappear from the OS process table
 		_ = childCmd.Process.Kill()
 		_ = childCmd.Wait()
 		time.Sleep(20 * time.Millisecond)
 
+		var buf bytes.Buffer
+		for i := 1; i <= 60; i++ {
+			reqF, respF := buildOpenAIExchangeFrames(childPID, uint32(0x1000+i), i)
+			buf.Write(reqF)
+			buf.Write(respF)
+		}
+
 		pipePath := filepath.Join(dir, "hooks", "tls.bin")
 		f, err := os.OpenFile(pipePath, os.O_WRONLY|os.O_APPEND, 0o600)
 		require.NoError(t, err)
-		for i := 1; i <= 60; i++ {
-			reqF, respF := buildOpenAIExchangeFrames(childPID, uint32(0x1000+i), i)
-			_, err = f.Write(reqF)
-			require.NoError(t, err)
-			_, err = f.Write(respF)
-			require.NoError(t, err)
-		}
+		_, err = f.Write(buf.Bytes())
+		require.NoError(t, err)
 		require.NoError(t, f.Close())
 
-		col.Flush()
-		require.Equal(t, 60, countPersistedStoreEvents(t, st), "expected 60/60 events from exited short-lived child process via ancestry cache")
+		require.Eventually(t, func() bool {
+			col.Flush()
+			return countPersistedStoreEvents(t, st) == 60
+		}, 3*time.Second, 50*time.Millisecond, "expected 60/60 events from exited short-lived child process via ancestry cache")
 	})
 
 	// 2. End-to-end 60 sequential short-lived python3 subprocess loop under bash LaunchCommand

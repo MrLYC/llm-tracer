@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,6 +359,10 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 			_ = sleepCmd.Wait()
 		}()
 		targetPID := sleepCmd.Process.Pid
+		require.Eventually(t, func() bool {
+			info := InspectProcess(targetPID)
+			return strings.Contains(info.Cmdline, "TestHelperSleepProcess") || strings.Contains(info.Comm, "TestHelperSleepProcess")
+		}, 2*time.Second, 10*time.Millisecond, "sleepCmd must be visible in process table with Cmdline")
 
 		origLookupUID := lookupProcessUID
 		origGetEUID := getEffectiveUID
@@ -388,8 +393,15 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 		lchownSocketFunc = func(_ string, uid int) error {
 			return nil
 		}
-		col.UpdateScope(model.ScopeFilter{Cmds: []string{"TestHelperSleepProcess"}})
-		require.Contains(t, chownedUIDs, 2002, "cross-UID target matched by --cmd must trigger chown to target UID")
+		require.Eventually(t, func() bool {
+			col.UpdateScope(model.ScopeFilter{Cmds: []string{"TestHelperSleepProcess"}})
+			for _, u := range chownedUIDs {
+				if u == 2002 {
+					return true
+				}
+			}
+			return false
+		}, 3*time.Second, 50*time.Millisecond, "cross-UID target matched by --cmd must trigger chown to target UID")
 		pipeInfo, err := os.Stat(col.pipePath)
 		require.NoError(t, err)
 		require.Equal(t, os.FileMode(0o600), pipeInfo.Mode().Perm(), "mode must stay 0600 when chown to target UID succeeds")

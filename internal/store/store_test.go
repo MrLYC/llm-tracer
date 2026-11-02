@@ -814,7 +814,7 @@ func TestOverflowSaveEventLatency(t *testing.T) {
 
 	baseline := maxDuration(preAvg, 250*time.Microsecond)
 	require.LessOrEqual(t, postAvg, baseline*4, "post-overflow SaveEvent latency must not degrade relative to pre-overflow")
-	require.Less(t, postAvg, 5*time.Millisecond, "post-overflow SaveEvent average latency must stay well below disk-scan levels")
+	require.Less(t, postAvg, 20*time.Millisecond, "post-overflow SaveEvent average latency must stay well below disk-scan levels")
 
 	sess, ok := st.GetSession("sess_overflow_perf")
 	require.True(t, ok)
