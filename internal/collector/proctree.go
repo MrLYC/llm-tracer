@@ -275,7 +275,9 @@ func (pt *ProcessTracker) SetScope(scope model.ScopeFilter) {
 	pt.rootStartTimes = make(map[int]uint64, len(scope.PIDs))
 	pt.trackedPIDs = make(map[procKey]int)
 	pt.ancestryCache = make(map[procKey][]int)
-	pt.procCache = make(map[procKey]model.ProcessInfo)
+	if pt.procCache == nil {
+		pt.procCache = make(map[procKey]model.ProcessInfo)
+	}
 	pt.lastSeenStart = make(map[int]uint64)
 	for _, pid := range scope.PIDs {
 		if pid > 0 {

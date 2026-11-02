@@ -654,10 +654,12 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 				}
 			}
 		}
-		dwarfFuncs := extractMachoGoDWARFFuncs(mf)
-		for name, fn := range dwarfFuncs {
-			if fn.Addr > 0 {
-				syms[name] = fn.Addr
+		if len(syms) == 0 {
+			dwarfFuncs := extractMachoGoDWARFFuncs(mf)
+			for name, fn := range dwarfFuncs {
+				if fn.Addr > 0 {
+					syms[name] = fn.Addr
+				}
 			}
 		}
 		if len(syms) == 0 {

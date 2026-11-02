@@ -174,6 +174,7 @@ func TestPipeSourceDrainTruncationAndStopReclaim(t *testing.T) {
 	for batch := 0; batch < 10; batch++ {
 		f, err := os.OpenFile(pipePath, os.O_WRONLY|os.O_APPEND, 0o600)
 		require.NoError(t, err)
+		lockPipeFile(f)
 		for i := 0; i < 10; i++ {
 			idx := batch*10 + i + 1
 			reqF, respF := buildOpenAIExchangeFrames(selfPID, uint32(0x500+idx), idx)
@@ -182,6 +183,7 @@ func TestPipeSourceDrainTruncationAndStopReclaim(t *testing.T) {
 			_, err = f.Write(respF)
 			require.NoError(t, err)
 		}
+		unlockPipeFile(f)
 		require.NoError(t, f.Close())
 
 		col.Flush()

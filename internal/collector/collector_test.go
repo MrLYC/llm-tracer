@@ -33,7 +33,7 @@ func TestHelperSleepProcess(t *testing.T) {
 	if os.Getenv("LLM_TRACER_TEST_HELPER_SLEEP") != "1" {
 		return
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(15 * time.Second)
 }
 
 // TestHelperNoop is the target of child processes that only need to start and

@@ -367,7 +367,7 @@ func runCaptureWithContext(parentCtx context.Context, flags captureFlags, launch
 		fmt.Println("LLM-Tracer Web UI : Web UI 已禁用")
 	}
 	fmt.Printf("Cache Directory   : %s (默认加载窗口: %s)\n", flags.cacheDir, winDur)
-	if col.ProxyURL() != "" {
+	if col.ProxyURL() != "" && (!isWebListenDisabled(flags.listen) || (flags.proxyListen != "" && flags.proxyListen != "127.0.0.1:0")) {
 		fmt.Printf("HTTP/HTTPS Proxy  : %s (CA: %s)\n", col.ProxyURL(), col.CABundlePath())
 	}
 	fmt.Printf("Record Headers    : %v (默认关闭防凭据泄露)\n", flags.recordHeaders)
