@@ -3,6 +3,7 @@ package collector
 import (
 	"debug/dwarf"
 	"debug/elf"
+	"debug/macho"
 	"errors"
 	"os"
 	"strconv"
@@ -158,15 +159,61 @@ type goDWARFFunc struct {
 	Size uint64
 }
 
+func wantedGoTLSFuncs() map[string]bool {
+	return map[string]bool{
+		"crypto/tls.(*Conn).Write":            true,
+		"crypto/tls.(*Conn).Read":             true,
+		"crypto/tls.(*Conn).HandshakeContext": true,
+	}
+}
+
 // extractGoDWARFFuncs recovers TLS function entries and sizes from DWARF
 // subprogram entries. It complements .symtab and .gopclntab for stripped
 // binaries that still retain their debug information.
 func extractGoDWARFFuncs(f *elf.File) map[string]goDWARFFunc {
-	wanted := map[string]bool{
-		"crypto/tls.(*Conn).Write":             true,
-		"crypto/tls.(*Conn).Read":              true,
-		"crypto/tls.(*Conn).HandshakeContext": true,
+	wanted := wantedGoTLSFuncs()
+	out := make(map[string]goDWARFFunc)
+	dw, err := f.DWARF()
+	if err != nil {
+		return out
 	}
+	reader := dw.Reader()
+	for {
+		entry, err := reader.Next()
+		if err != nil || entry == nil {
+			return out
+		}
+		if entry.Tag != dwarf.TagSubprogram {
+			continue
+		}
+		nameVal, ok := entry.Val(dwarf.AttrName).(string)
+		if !ok || !wanted[nameVal] {
+			continue
+		}
+		lowpc, ok := entry.Val(dwarf.AttrLowpc).(uint64)
+		if !ok || lowpc == 0 {
+			continue
+		}
+		var size uint64
+		switch highpc := entry.Val(dwarf.AttrHighpc).(type) {
+		case uint64:
+			if highpc > lowpc {
+				size = highpc - lowpc
+			}
+		case int64:
+			// DWARF encodes AttrHighpc as a relative offset in DWARF 4+.
+			if highpc > 0 {
+				size = uint64(highpc)
+			}
+		}
+		if size > 0 {
+			out[nameVal] = goDWARFFunc{Addr: lowpc, Size: size}
+		}
+	}
+}
+
+func extractMachoGoDWARFFuncs(f *macho.File) map[string]goDWARFFunc {
+	wanted := wantedGoTLSFuncs()
 	out := make(map[string]goDWARFFunc)
 	dw, err := f.DWARF()
 	if err != nil {

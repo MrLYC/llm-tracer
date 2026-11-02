@@ -79,6 +79,7 @@ func (e *exitCodeError) Unwrap() error {
 
 type captureFlags struct {
 	listen               string
+	proxyListen          string
 	cacheDir             string
 	window               string
 	pids                 []int
@@ -211,6 +212,7 @@ func newRootCmd() *cobra.Command {
 
 func bindCaptureFlags(cmd *cobra.Command, f *captureFlags) {
 	cmd.Flags().StringVarP(&f.listen, "listen", "l", "127.0.0.1:8787", "Web 界面监听地址")
+	cmd.Flags().StringVar(&f.proxyListen, "proxy-listen", "127.0.0.1:0", "本地 HTTP/HTTPS 抓包代理监听地址 (默认随机端口 127.0.0.1:0)")
 	cmd.Flags().StringVarP(&f.cacheDir, "cache-dir", "d", "./traces", "本地文件缓存目录")
 	cmd.Flags().StringVarP(&f.window, "window", "w", "10m", "默认预加载时间窗 (默认 10m)")
 	cmd.Flags().IntSliceVarP(&f.pids, "pid", "p", nil, "指定抓取的 PID 列表 (默认包含其所有后代子进程)")
@@ -281,6 +283,7 @@ func runCaptureWithContext(parentCtx context.Context, flags captureFlags, launch
 	}
 	col.SetAutoIntrusive(flags.autoIntrusive)
 	col.SetAutoInjectLive(flags.injectLive || flags.yes)
+	col.SetProxyListen(flags.proxyListen)
 	col.SetTapInsecure(flags.tapInsecure)
 	applyCaptureUnknown(col, flags.captureUnknown)
 
@@ -364,6 +367,9 @@ func runCaptureWithContext(parentCtx context.Context, flags captureFlags, launch
 		fmt.Println("LLM-Tracer Web UI : Web UI 已禁用")
 	}
 	fmt.Printf("Cache Directory   : %s (默认加载窗口: %s)\n", flags.cacheDir, winDur)
+	if col.ProxyURL() != "" {
+		fmt.Printf("HTTP/HTTPS Proxy  : %s (CA: %s)\n", col.ProxyURL(), col.CABundlePath())
+	}
 	fmt.Printf("Record Headers    : %v (默认关闭防凭据泄露)\n", flags.recordHeaders)
 	fmt.Printf("TOTP Auth Enabled : %v\n", guard.Enabled())
 

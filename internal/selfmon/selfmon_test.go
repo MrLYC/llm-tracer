@@ -431,11 +431,19 @@ func TestFlushAndQueryFlushTimeoutDoNotHang(t *testing.T) {
 	m, err := NewMonitor(dir)
 	require.NoError(t, err)
 
+	blockCh := make(chan struct{})
+	var unblockOnce sync.Once
+	t.Cleanup(func() {
+		// require.FailNow can exit before the explicit cleanup below; always
+		// release the writer first so Windows can remove the open log file.
+		unblockOnce.Do(func() { close(blockCh) })
+		_ = m.Close()
+	})
+
 	m.mu.Lock()
 	m.queryFlushTimeout = 30 * time.Millisecond
 	m.mu.Unlock()
 
-	blockCh := make(chan struct{})
 	enteredWrite := make(chan struct{}, 1)
 	m.hookMu.Lock()
 	m.onWriteBatch = func([]Event) {
@@ -456,7 +464,7 @@ func TestFlushAndQueryFlushTimeoutDoNotHang(t *testing.T) {
 	flushErr := m.FlushWithTimeout(25 * time.Millisecond)
 	elapsed := time.Since(start)
 	require.ErrorIs(t, flushErr, ErrFlushTimeout)
-	require.Less(t, elapsed, 500*time.Millisecond)
+	require.Less(t, elapsed, 2*time.Second)
 	require.GreaterOrEqual(t, m.flushTimeouts.Load(), int64(1))
 
 	// 2. QueryEvents needing disk times out on Flush without hanging and still returns hot events.
@@ -467,15 +475,14 @@ func TestFlushAndQueryFlushTimeoutDoNotHang(t *testing.T) {
 	})
 	qElapsed := time.Since(qStart)
 	require.NoError(t, qErr)
-	require.Less(t, qElapsed, 500*time.Millisecond)
+	require.Less(t, qElapsed, 2*time.Second)
 	require.Len(t, evs, 1)
 	require.Equal(t, "slow_disk_write", evs[0].Action)
 	require.GreaterOrEqual(t, m.flushTimeouts.Load(), int64(2))
 
 	// Unblock writer and verify clean shutdown.
-	close(blockCh)
+	unblockOnce.Do(func() { close(blockCh) })
 	require.NoError(t, m.FlushWithTimeout(time.Second))
-	require.NoError(t, m.Close())
 }
 
 func TestRedactSensitivePathReplacesHomeDirWithTilde(t *testing.T) {

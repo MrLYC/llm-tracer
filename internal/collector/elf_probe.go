@@ -619,6 +619,30 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 		}
 	} else if mf, err := macho.Open(realPath); err == nil {
 		defer mf.Close()
+		goarch := ""
+		switch mf.Cpu {
+		case macho.CpuAmd64:
+			goarch = "amd64"
+		case macho.CpuArm64:
+			goarch = "arm64"
+		}
+		if goarch != "" && !SupportsGoRegisterABI(bi.GoVersion, goarch) {
+			return &ProbeTarget{
+				BinaryPath:          realPath,
+				Type:                "gotls",
+				GoVersion:           bi.GoVersion,
+				Symbols:             make(map[string]uint64),
+				GoTLSReadRetOffsets: nil,
+				Note:                "Go version " + bi.GoVersion + " uses stack ABI; register-based GoTLS uprobe disabled",
+			}, nil
+		}
+		processGoFunc := func(name string, vaddr, fnSize uint64) {
+			_ = fnSize
+			if vaddr == 0 {
+				return
+			}
+			syms[name] = vaddr
+		}
 		if mf.Symtab != nil {
 			for _, s := range mf.Symtab.Syms {
 				name := strings.TrimPrefix(s.Name, "_")
@@ -626,6 +650,32 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 				case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
 					if s.Value > 0 {
 						syms[name] = s.Value
+					}
+				}
+			}
+		}
+		dwarfFuncs := extractMachoGoDWARFFuncs(mf)
+		for name, fn := range dwarfFuncs {
+			if fn.Addr > 0 {
+				syms[name] = fn.Addr
+			}
+		}
+		if len(syms) == 0 {
+			if pclnSec := mf.Section("__gopclntab"); pclnSec != nil {
+				if pclnData, err := pclnSec.Data(); err == nil && len(pclnData) > 16 {
+					var textStart uint64
+					if txtSec := mf.Section("__text"); txtSec != nil {
+						textStart = txtSec.Addr
+					}
+					lt := gosym.NewLineTable(pclnData, textStart)
+					if tab, err := gosym.NewTable(nil, lt); err == nil && tab != nil {
+						for _, fn := range tab.Funcs {
+							var sz uint64
+							if fn.End > fn.Entry {
+								sz = fn.End - fn.Entry
+							}
+							processGoFunc(fn.Name, fn.Entry, sz)
+						}
 					}
 				}
 			}

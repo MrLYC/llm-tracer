@@ -12,6 +12,7 @@ import (
 type tapSource struct {
 	mu         sync.RWMutex
 	hooksDir   string
+	listenAddr string
 	insecure   bool
 	mon        *selfmon.Monitor
 	resolvePID func() int
@@ -42,6 +43,7 @@ func (s *tapSource) Name() string {
 func (s *tapSource) Start(_ context.Context, sink Sink) error {
 	s.mu.RLock()
 	insecure := s.insecure
+	listenAddr := s.listenAddr
 	s.mu.RUnlock()
 
 	tap, err := NewLoopbackTap(s.hooksDir, func(connID string, dir parser.Direction, data []byte) {
@@ -55,7 +57,7 @@ func (s *tapSource) Start(_ context.Context, sink Sink) error {
 		if sink != nil {
 			sink(pid, pid, connID, dir, data, "loopback_tap")
 		}
-	}, WithTapInsecure(insecure), WithTapMonitor(s.mon))
+	}, WithTapListenAddr(listenAddr), WithTapInsecure(insecure), WithTapMonitor(s.mon))
 	if err != nil {
 		return err
 	}
@@ -84,6 +86,12 @@ func (s *tapSource) SetInsecure(insecure bool) {
 	if tap != nil {
 		tap.SetInsecure(insecure)
 	}
+}
+
+func (s *tapSource) SetListenAddr(addr string) {
+	s.mu.Lock()
+	s.listenAddr = addr
+	s.mu.Unlock()
 }
 
 func (s *tapSource) Close() error {

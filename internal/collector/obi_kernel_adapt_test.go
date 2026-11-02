@@ -187,6 +187,7 @@ func main() {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(goTool, "build", "-gcflags=all=-N -l", "-ldflags=-s", "-o", binary, source)
+	cmd.Env = append(os.Environ(), "GOOS=linux")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build probe binary: %v\n%s", err, output)
 	}

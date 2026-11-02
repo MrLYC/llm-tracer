@@ -3,12 +3,14 @@ package collector
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -23,21 +25,85 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"github.com/mrlyc/llm-tracer/internal/parser"
 	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
+
+// UpstreamProxyConfig stores the parent process proxy configuration so LoopbackTap can
+// chain outbound HTTP and HTTPS traffic through the parent proxy while respecting NO_PROXY.
+type UpstreamProxyConfig struct {
+	HTTPProxy  string
+	HTTPSProxy string
+	AllProxy   string
+	NoProxy    string
+}
+
+// ParseUpstreamProxyEnv extracts HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY from an
+// environment variable slice, ignoring any proxy entry that points back to selfAddr.
+func ParseUpstreamProxyEnv(env []string, selfAddr string) UpstreamProxyConfig {
+	getCI := func(upper, lower string) string {
+		if v := strings.TrimSpace(lookupEnvVar(env, upper)); v != "" {
+			return v
+		}
+		return strings.TrimSpace(lookupEnvVar(env, lower))
+	}
+	cfg := UpstreamProxyConfig{
+		HTTPProxy:  getCI("HTTP_PROXY", "http_proxy"),
+		HTTPSProxy: getCI("HTTPS_PROXY", "https_proxy"),
+		AllProxy:   getCI("ALL_PROXY", "all_proxy"),
+		NoProxy:    getCI("NO_PROXY", "no_proxy"),
+	}
+	return sanitizeUpstreamProxyConfig(cfg, selfAddr)
+}
+
+func normalizeProxyHostPort(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil && u.Host != "" {
+			return strings.ToLower(strings.TrimSpace(u.Host))
+		}
+	}
+	return strings.ToLower(s)
+}
+
+func sanitizeUpstreamProxyConfig(cfg UpstreamProxyConfig, selfAddr string) UpstreamProxyConfig {
+	selfHP := normalizeProxyHostPort(selfAddr)
+	isSelf := func(p string) bool {
+		if p == "" || selfHP == "" {
+			return false
+		}
+		return normalizeProxyHostPort(p) == selfHP
+	}
+	if isSelf(cfg.HTTPProxy) {
+		cfg.HTTPProxy = ""
+	}
+	if isSelf(cfg.HTTPSProxy) {
+		cfg.HTTPSProxy = ""
+	}
+	if isSelf(cfg.AllProxy) {
+		cfg.AllProxy = ""
+	}
+	return cfg
+}
 
 // LoopbackTap is an ephemeral local HTTP + HTTPS MITM proxy used as fallback for static-pie (codex/rustls)
 // and Go (crypto/tls) binaries that bypass libc LD_PRELOAD and ptrace.
 type LoopbackTap struct {
 	ln            net.Listener
+	listenAddr    string
 	addr          string
 	caCert        *x509.Certificate
 	caKey         *ecdsa.PrivateKey
 	caPath        string
-	upstreamProxy string
+	upstreamProxy UpstreamProxyConfig
 	insecure      bool
 	mon           *selfmon.Monitor
+	dialFunc      func(network, address string) (net.Conn, error)
 	certMu        sync.Mutex
 	certMap       map[string]*tls.Certificate
 	seq           atomic.Uint64
@@ -45,6 +111,40 @@ type LoopbackTap struct {
 }
 
 type LoopbackTapOption func(*LoopbackTap)
+
+// WithTapListener supplies a pre-constructed net.Listener (such as an in-memory pipe listener
+// in restricted sandboxes) instead of calling net.Listen("tcp", ...).
+func WithTapListener(ln net.Listener) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		if ln != nil {
+			t.ln = ln
+			t.addr = ln.Addr().String()
+		}
+	}
+}
+
+// WithTapDialer configures a custom outbound dialer for LoopbackTap.
+func WithTapDialer(dialFunc func(network, address string) (net.Conn, error)) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		t.dialFunc = dialFunc
+	}
+}
+
+// WithTapListenAddr configures the TCP address LoopbackTap listens on (default "127.0.0.1:0").
+func WithTapListenAddr(listenAddr string) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		if strings.TrimSpace(listenAddr) != "" {
+			t.listenAddr = strings.TrimSpace(listenAddr)
+		}
+	}
+}
+
+// WithTapUpstreamProxy configures the parent process upstream proxy settings for LoopbackTap.
+func WithTapUpstreamProxy(cfg UpstreamProxyConfig) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		t.SetUpstreamProxyConfig(cfg)
+	}
+}
 
 // WithTapInsecure configures whether LoopbackTap skips upstream TLS certificate verification
 // for non-loopback targets (default false).
@@ -105,27 +205,12 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 		return nil, err
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	upProxy := strings.TrimSpace(os.Getenv("HTTPS_PROXY"))
-	if upProxy == "" {
-		upProxy = strings.TrimSpace(os.Getenv("https_proxy"))
-	}
-	if upProxy == "" {
-		upProxy = strings.TrimSpace(os.Getenv("HTTP_PROXY"))
-	}
-	if upProxy == "" {
-		upProxy = strings.TrimSpace(os.Getenv("http_proxy"))
-	}
 	tap := &LoopbackTap{
-		ln:            ln,
-		addr:          ln.Addr().String(),
+		listenAddr:    "127.0.0.1:0",
 		caCert:        caCert,
 		caKey:         caKey,
 		caPath:        caPath,
-		upstreamProxy: upProxy,
+		upstreamProxy: ParseUpstreamProxyEnv(os.Environ(), ""),
 		certMap:       make(map[string]*tls.Certificate),
 		onChunk:       onChunk,
 	}
@@ -134,8 +219,48 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 			opt(tap)
 		}
 	}
+	if tap.ln == nil {
+		listenAddr := strings.TrimSpace(tap.listenAddr)
+		if listenAddr == "" {
+			listenAddr = "127.0.0.1:0"
+		}
+		ln, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			return nil, err
+		}
+		tap.ln = ln
+		tap.addr = ln.Addr().String()
+	}
+	tap.SetUpstreamProxyConfig(sanitizeUpstreamProxyConfig(tap.UpstreamProxyConfig(), tap.addr))
 	go tap.serve()
 	return tap, nil
+}
+
+func (t *LoopbackTap) dialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	if t != nil && t.dialFunc != nil {
+		return t.dialFunc(network, address)
+	}
+	return net.DialTimeout(network, address, timeout)
+}
+
+// SetUpstreamProxyConfig updates the parent process proxy configuration used for outbound chaining.
+func (t *LoopbackTap) SetUpstreamProxyConfig(cfg UpstreamProxyConfig) {
+	if t == nil {
+		return
+	}
+	t.certMu.Lock()
+	t.upstreamProxy = sanitizeUpstreamProxyConfig(cfg, t.addr)
+	t.certMu.Unlock()
+}
+
+// UpstreamProxyConfig returns a copy of the configured parent process proxy configuration.
+func (t *LoopbackTap) UpstreamProxyConfig() UpstreamProxyConfig {
+	if t == nil {
+		return UpstreamProxyConfig{}
+	}
+	t.certMu.Lock()
+	defer t.certMu.Unlock()
+	return t.upstreamProxy
 }
 
 // SetInsecure controls whether upstream TLS verification is skipped for non-loopback targets.
@@ -212,7 +337,23 @@ func (t *LoopbackTap) forwardPlainHTTP(clientConn net.Conn, req *http.Request) {
 		t.onChunk(connID, parser.DirWrite, reqBytes)
 	}
 
-	tr := &http.Transport{DisableCompression: false}
+	tr := &http.Transport{
+		DisableCompression: false,
+		TLSClientConfig:    t.upstreamTLSConfig(req.URL.Hostname()),
+		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+			return t.dialTimeout(network, addr, 5*time.Second)
+		},
+	}
+	if pu, err := t.resolveUpstreamProxy(req.URL); err == nil && pu != nil {
+		scheme := strings.ToLower(strings.TrimSpace(pu.Scheme))
+		if scheme == "socks5" || scheme == "socks5h" {
+			tr.DialContext = func(_ context.Context, _, addr string) (net.Conn, error) {
+				return t.dialViaUpstreamProxy(pu, addr)
+			}
+		} else {
+			tr.Proxy = http.ProxyURL(pu)
+		}
+	}
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		return
@@ -382,6 +523,210 @@ func (t *LoopbackTap) upstreamTLSConfig(hostOnly string) *tls.Config {
 	}
 }
 
+type bufferedTapConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *bufferedTapConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+type customProxyDialer func(network, address string) (net.Conn, error)
+
+func (d customProxyDialer) Dial(network, address string) (net.Conn, error) {
+	return d(network, address)
+}
+
+func (t *LoopbackTap) resolveUpstreamProxy(targetURL *url.URL) (*url.URL, error) {
+	if targetURL == nil || isLoopbackHost(targetURL.Host) {
+		return nil, nil
+	}
+	cfg := t.UpstreamProxyConfig()
+	httpP := strings.TrimSpace(cfg.HTTPProxy)
+	if httpP == "" {
+		httpP = strings.TrimSpace(cfg.AllProxy)
+	}
+	if httpP == "" {
+		httpP = strings.TrimSpace(cfg.HTTPSProxy)
+	}
+	httpsP := strings.TrimSpace(cfg.HTTPSProxy)
+	if httpsP == "" {
+		httpsP = strings.TrimSpace(cfg.AllProxy)
+	}
+	if httpsP == "" {
+		httpsP = strings.TrimSpace(cfg.HTTPProxy)
+	}
+	if httpP == "" && httpsP == "" {
+		return nil, nil
+	}
+	if matchesNoProxy(targetURL.Host, cfg.NoProxy) {
+		return nil, nil
+	}
+	rawProxy := httpP
+	if strings.EqualFold(targetURL.Scheme, "https") && httpsP != "" {
+		rawProxy = httpsP
+	}
+	if rawProxy == "" {
+		return nil, nil
+	}
+	if !strings.Contains(rawProxy, "://") {
+		rawProxy = "http://" + rawProxy
+	}
+	pu, err := url.Parse(rawProxy)
+	if err != nil || pu == nil || strings.TrimSpace(pu.Host) == "" {
+		return nil, err
+	}
+	if normalizeProxyHostPort(pu.Host) == normalizeProxyHostPort(t.addr) {
+		return nil, nil
+	}
+	return pu, nil
+}
+
+func matchesNoProxy(targetHost, noProxy string) bool {
+	noProxy = strings.TrimSpace(noProxy)
+	if noProxy == "" {
+		return false
+	}
+	if noProxy == "*" {
+		return true
+	}
+	hostOnly := strings.TrimSpace(targetHost)
+	portOnly := ""
+	if h, p, err := net.SplitHostPort(hostOnly); err == nil {
+		hostOnly = strings.Trim(h, "[]")
+		portOnly = p
+	} else {
+		hostOnly = strings.Trim(hostOnly, "[]")
+	}
+	hostLower := strings.ToLower(hostOnly)
+	targetIP := net.ParseIP(hostOnly)
+
+	for _, token := range strings.Split(noProxy, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if token == "*" {
+			return true
+		}
+		tokHost := token
+		tokPort := ""
+		if h, p, err := net.SplitHostPort(token); err == nil {
+			tokHost = strings.Trim(h, "[]")
+			tokPort = p
+		} else {
+			tokHost = strings.Trim(tokHost, "[]")
+		}
+		if tokPort != "" && portOnly != "" && tokPort != portOnly {
+			continue
+		}
+		if targetIP != nil {
+			if _, ipNet, err := net.ParseCIDR(tokHost); err == nil && ipNet.Contains(targetIP) {
+				return true
+			}
+			if tokIP := net.ParseIP(tokHost); tokIP != nil && tokIP.Equal(targetIP) {
+				return true
+			}
+		}
+		tokLower := strings.ToLower(strings.TrimPrefix(tokHost, "*"))
+		if tokLower == hostLower {
+			return true
+		}
+		if strings.HasPrefix(tokLower, ".") {
+			if hostLower == tokLower[1:] || strings.HasSuffix(hostLower, tokLower) {
+				return true
+			}
+		} else if strings.HasSuffix(hostLower, "."+tokLower) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *LoopbackTap) dialViaUpstreamProxy(pu *url.URL, targetHost string) (net.Conn, error) {
+	if pu == nil || strings.TrimSpace(pu.Host) == "" {
+		return nil, fmt.Errorf("empty upstream proxy URL")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(pu.Scheme))
+	if scheme == "" {
+		scheme = "http"
+	}
+	proxyHost := strings.TrimSpace(pu.Host)
+	if _, _, err := net.SplitHostPort(proxyHost); err != nil {
+		defaultPort := "80"
+		switch scheme {
+		case "https":
+			defaultPort = "443"
+		case "socks5", "socks5h":
+			defaultPort = "1080"
+		}
+		proxyHost = net.JoinHostPort(strings.Trim(proxyHost, "[]"), defaultPort)
+	}
+
+	if scheme == "socks5" || scheme == "socks5h" {
+		var auth *proxy.Auth
+		if pu.User != nil {
+			pwd, _ := pu.User.Password()
+			auth = &proxy.Auth{
+				User:     pu.User.Username(),
+				Password: pwd,
+			}
+		}
+		var forward proxy.Dialer = &net.Dialer{Timeout: 5 * time.Second}
+		if t != nil && t.dialFunc != nil {
+			forward = customProxyDialer(t.dialFunc)
+		}
+		dialer, err := proxy.SOCKS5("tcp", proxyHost, auth, forward)
+		if err != nil {
+			return nil, err
+		}
+		return dialer.Dial("tcp", targetHost)
+	}
+
+	rawConn, err := t.dialTimeout("tcp", proxyHost, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	proxyConn := rawConn
+	if scheme == "https" {
+		tlsProxy := tls.Client(rawConn, t.upstreamTLSConfig(pu.Hostname()))
+		if err := tlsProxy.Handshake(); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+		proxyConn = tlsProxy
+	}
+
+	var reqBuf strings.Builder
+	fmt.Fprintf(&reqBuf, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetHost, targetHost)
+	if pu.User != nil {
+		pwd, _ := pu.User.Password()
+		cred := base64.StdEncoding.EncodeToString([]byte(pu.User.Username() + ":" + pwd))
+		fmt.Fprintf(&reqBuf, "Proxy-Authorization: Basic %s\r\n", cred)
+	}
+	reqBuf.WriteString("\r\n")
+
+	if _, err := io.WriteString(proxyConn, reqBuf.String()); err != nil {
+		_ = proxyConn.Close()
+		return nil, err
+	}
+	br := bufio.NewReader(proxyConn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		_ = proxyConn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("upstream proxy CONNECT %s returned status %s", targetHost, resp.Status)
+	}
+	if br.Buffered() > 0 {
+		return &bufferedTapConn{Conn: proxyConn, r: io.MultiReader(br, proxyConn)}, nil
+	}
+	return proxyConn, nil
+}
+
 func (t *LoopbackTap) dialUpstreamTLS(targetHost, hostOnly string) (*tls.Conn, error) {
 	if _, _, err := net.SplitHostPort(strings.TrimSpace(targetHost)); err != nil {
 		targetHost, _ = parseConnectAuthority(targetHost)
@@ -392,22 +737,29 @@ func (t *LoopbackTap) dialUpstreamTLS(targetHost, hostOnly string) (*tls.Conn, e
 		_, hostOnly = parseConnectAuthority(hostOnly)
 	}
 	tlsCfg := t.upstreamTLSConfig(hostOnly)
-	if !isLoopbackHost(hostOnly) && t.upstreamProxy != "" {
-		if pu, err := url.Parse(t.upstreamProxy); err == nil && pu.Host != "" && pu.Host != t.addr {
-			if proxyConn, err := net.DialTimeout("tcp", pu.Host, 5*time.Second); err == nil {
-				connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHost, targetHost)
-				if _, err := io.WriteString(proxyConn, connectReq); err == nil {
-					br := bufio.NewReader(proxyConn)
-					if resp, err := http.ReadResponse(br, nil); err == nil && resp.StatusCode == http.StatusOK {
-						tlsConn := tls.Client(proxyConn, tlsCfg)
-						if err := tlsConn.Handshake(); err == nil {
-							return tlsConn, nil
-						}
-					}
-				}
-				_ = proxyConn.Close()
+	targetURL := &url.URL{Scheme: "https", Host: targetHost}
+	if pu, err := t.resolveUpstreamProxy(targetURL); err == nil && pu != nil {
+		if proxyConn, err := t.dialViaUpstreamProxy(pu, targetHost); err == nil {
+			tlsConn := tls.Client(proxyConn, tlsCfg)
+			if err := tlsConn.Handshake(); err == nil {
+				return tlsConn, nil
 			}
+			_ = proxyConn.Close()
 		}
+	}
+	if t.dialFunc != nil {
+		rawConn, err := t.dialFunc("tcp", targetHost)
+		if err != nil {
+			t.recordUpstreamTLSFailure(targetHost, hostOnly, err)
+			return nil, err
+		}
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		if err := tlsConn.Handshake(); err != nil {
+			_ = rawConn.Close()
+			t.recordUpstreamTLSFailure(targetHost, hostOnly, err)
+			return nil, err
+		}
+		return tlsConn, nil
 	}
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", targetHost, tlsCfg)
 	if err != nil {

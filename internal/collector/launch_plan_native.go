@@ -1,6 +1,9 @@
 package collector
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 func planNativeLaunch(in launchPlanInput, _ []string, plan *LaunchAttachPlan) {
 	isGo := in.GoTarget != nil && len(in.GoTarget.Symbols) > 0
@@ -83,22 +86,58 @@ func planNativePreloadMethods(in launchPlanInput, isJVM bool, plan *LaunchAttach
 	}
 }
 
-func planNativeTapMethods(in launchPlanInput, isJVM bool, resolvedELF string, plan *LaunchAttachPlan) {
+func planNativeTapMethods(in launchPlanInput, kind launchRuntimeKind, resolvedELF string, plan *LaunchAttachPlan) {
 	if !in.TapActive {
 		return
 	}
-	if nativeNeedsProxyEnv(in, resolvedELF) {
-		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:HTTPS_PROXY", "env:SSL_CERT_FILE", "loopback_tap")
+	if shouldFallbackToProxyEnv(in, kind, resolvedELF, plan) {
+		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:HTTPS_PROXY", "env:HTTP_PROXY", "env:SSL_CERT_FILE", "loopback_tap")
 	}
-	if isJVM {
+	if kind == runtimeKindJVM {
 		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "loopback_tap")
 	}
 }
 
+// shouldFallbackToProxyEnv reports whether injecting HTTP_PROXY / HTTPS_PROXY environment
+// variables pointing to LoopbackTap is required as the last-resort fallback for a launched
+// child process when neither non-intrusive eBPF nor any runtime-specific hook/preload can cover it.
+func shouldFallbackToProxyEnv(
+	in launchPlanInput,
+	kind launchRuntimeKind,
+	resolvedELF string,
+	plan *LaunchAttachPlan,
+) bool {
+	if !in.TapActive || !in.AutoIntrusive {
+		return false
+	}
+	if plan != nil && plan.NonIntrusiveOK {
+		return false
+	}
+	switch kind {
+	case runtimeKindPython:
+		return strings.TrimSpace(in.PyHookDir) == ""
+	case runtimeKindNode, runtimeKindBun:
+		return strings.TrimSpace(in.NodeHookJS) == ""
+	case runtimeKindJVM:
+		return strings.TrimSpace(in.JavaAgentJar) == ""
+	default:
+		isRuntime := isShellOrRuntimeBinary(in.BinPath) || isShellOrRuntimeBinary(resolvedELF)
+		if isRuntime {
+			hasAnyHook := (in.PreloadPath != "" && (in.GOOS == "linux" || in.GOOS == "darwin")) ||
+				in.PyHookDir != "" || in.NodeHookJS != "" || in.JavaAgentJar != ""
+			return !hasAnyHook
+		}
+		if in.Profile != nil && in.Profile.TLSStack == "dynamic-libssl" && !in.Profile.RequiresPtrace &&
+			in.PreloadPath != "" && (in.GOOS == "linux" || in.GOOS == "darwin") {
+			return false
+		}
+		return true
+	}
+}
+
 func nativeNeedsProxyEnv(in launchPlanInput, resolvedELF string) bool {
-	isRuntime := isShellOrRuntimeBinary(in.BinPath) || isShellOrRuntimeBinary(resolvedELF)
-	return !isRuntime &&
-		(in.GOOS != "linux" || (in.Profile != nil && (in.Profile.RequiresPtrace || in.Profile.TLSStack == "stripped-embedded-tls")))
+	kind := classifyLaunchRuntime(in.BinPath, resolvedELF)
+	return shouldFallbackToProxyEnv(in, kind, resolvedELF, nil)
 }
 
 func applyNativePreloadEnv(
@@ -134,15 +173,20 @@ func applyNativePreloadEnv(
 }
 
 func applyNativeTapEnv(
+	c *Collector,
 	in launchPlanInput,
-	isJVM bool,
+	kind launchRuntimeKind,
 	resolvedELF string,
 	plan *LaunchAttachPlan,
+	baseEnv []string,
 	env []string,
 	setAndTrackEnv func(env []string, k, v string) []string,
 ) []string {
 	if !in.TapActive {
 		return env
+	}
+	if c != nil && len(baseEnv) > 0 {
+		c.SetUpstreamProxyConfig(ParseUpstreamProxyEnv(baseEnv, in.ProxyURL))
 	}
 	env = setAndTrackEnv(env, "LLM_TRACER_PROXY_HOST", in.ProxyHost)
 	env = setAndTrackEnv(env, "LLM_TRACER_PROXY_PORT", in.ProxyPort)
@@ -152,27 +196,33 @@ func applyNativeTapEnv(
 	env = setAndTrackEnv(env, "NODE_EXTRA_CA_CERTS", in.CABundlePath)
 	env = setAndTrackEnv(env, "CARGO_HTTP_CAINFO", in.CABundlePath)
 
-	needsProxyEnv := nativeNeedsProxyEnv(in, resolvedELF)
-	env = unsetEnvVar(env, "ALL_PROXY")
-	env = unsetEnvVar(env, "all_proxy")
-	env = unsetEnvVar(env, "NO_PROXY")
-	env = unsetEnvVar(env, "no_proxy")
+	needsProxyEnv := shouldFallbackToProxyEnv(in, kind, resolvedELF, plan)
 	if needsProxyEnv {
-		archCap := resolvePlanArchCapabilities(in)
+		// Clear child ALL_PROXY and NO_PROXY so the child routes traffic to LoopbackTap;
+		// LoopbackTap itself honors the parent process's HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY.
+		env = unsetEnvVar(env, "ALL_PROXY")
+		env = unsetEnvVar(env, "all_proxy")
+		env = unsetEnvVar(env, "NO_PROXY")
+		env = unsetEnvVar(env, "no_proxy")
 		env = setAndTrackEnv(env, "HTTPS_PROXY", in.ProxyURL)
 		env = setAndTrackEnv(env, "https_proxy", in.ProxyURL)
-		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:HTTPS_PROXY", "env:SSL_CERT_FILE", "loopback_tap")
-		if !in.CanUsePtrace || !archCap.PtraceUserspaceSupported || (in.Profile != nil && in.Profile.TLSStack == "stripped-embedded-tls") {
-			env = setAndTrackEnv(env, "HTTP_PROXY", in.ProxyURL)
-			env = setAndTrackEnv(env, "http_proxy", in.ProxyURL)
+		env = setAndTrackEnv(env, "HTTP_PROXY", in.ProxyURL)
+		env = setAndTrackEnv(env, "http_proxy", in.ProxyURL)
+		if kind == runtimeKindNode || kind == runtimeKindBun {
+			env = setAndTrackEnv(env, "NODE_USE_ENV_PROXY", "1")
 		}
-	} else {
-		env = unsetEnvVar(env, "HTTPS_PROXY")
-		env = unsetEnvVar(env, "https_proxy")
-		env = unsetEnvVar(env, "HTTP_PROXY")
-		env = unsetEnvVar(env, "http_proxy")
+		if kind == runtimeKindJVM && in.ProxyHost != "" && in.ProxyPort != "" {
+			proxyJvmOpts := fmt.Sprintf("-Dhttp.proxyHost=%s -Dhttp.proxyPort=%s -Dhttps.proxyHost=%s -Dhttps.proxyPort=%s",
+				in.ProxyHost, in.ProxyPort, in.ProxyHost, in.ProxyPort)
+			if existingJavaOpts := lookupEnvVar(env, "JAVA_TOOL_OPTIONS"); existingJavaOpts != "" {
+				env = setAndTrackEnv(env, "JAVA_TOOL_OPTIONS", existingJavaOpts+" "+proxyJvmOpts)
+			} else {
+				env = setAndTrackEnv(env, "JAVA_TOOL_OPTIONS", proxyJvmOpts)
+			}
+		}
+		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:HTTPS_PROXY", "env:HTTP_PROXY", "env:SSL_CERT_FILE", "loopback_tap")
 	}
-	if isJVM {
+	if kind == runtimeKindJVM {
 		plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "loopback_tap")
 	}
 	return env

@@ -201,7 +201,7 @@ func planLaunch(in launchPlanInput) *LaunchAttachPlan {
 		planPythonEnvMethods(in, isPython, plan)
 		planNodeBunEnvMethods(in, isNode, isBun, plan)
 		planJVMEnvMethods(in, isJVM, plan)
-		planNativeTapMethods(in, isJVM, resolvedELF, plan)
+		planNativeTapMethods(in, kind, resolvedELF, plan)
 	}
 
 	return plan
@@ -307,7 +307,7 @@ func applyLaunchPlan(c *Collector, in launchPlanInput, plan *LaunchAttachPlan, b
 		env = applyPythonLaunchEnv(in, isPython, plan, env, setAndTrackEnv)
 		env = applyNodeBunLaunchEnv(in, isNode, isBun, plan, env, setAndTrackEnv)
 		env = applyJVMLaunchEnv(in, isJVM, plan, env, setAndTrackEnv)
-		env = applyNativeTapEnv(in, isJVM, resolvedELF, plan, env, setAndTrackEnv)
+		env = applyNativeTapEnv(c, in, kind, resolvedELF, plan, baseEnv, env, setAndTrackEnv)
 	}
 
 	for k := range plan.InjectedEnv {

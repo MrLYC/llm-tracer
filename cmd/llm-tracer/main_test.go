@@ -1137,7 +1137,9 @@ globalThis.fetch = async (url) => {
 })();
 `, scriptBody, authWindowMs)
 
-	cmd := exec.Command(nodePath, "-e", harness)
+	scriptFile := filepath.Join(t.TempDir(), "harness.js")
+	require.NoError(t, os.WriteFile(scriptFile, []byte(harness), 0o600))
+	cmd := exec.Command(nodePath, scriptFile)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "node harness failed: %s", string(out))
 	var delta int64

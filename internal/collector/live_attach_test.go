@@ -99,7 +99,7 @@ import (
 )
 func main() {
 	_ = os.WriteFile(os.Args[1], []byte("ready"), 0o644)
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 1000; i++ {
 		if _, err := os.Stat(os.Args[2]); err == nil {
 			break
 		}

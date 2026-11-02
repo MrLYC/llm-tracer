@@ -935,17 +935,22 @@ func (s *Server) handleGetScope(w http.ResponseWriter, r *http.Request) {
 	var probes []collector.ProbeTarget
 	var pidPlans []collector.PIDAttachPlan
 	var launchPlan *collector.LaunchAttachPlan
+	var proxyURL, caBundle string
 	if s.collector != nil {
 		scope = s.collector.Scope()
 		probes = s.collector.Probes()
 		pidPlans = s.collector.PIDPlans()
 		launchPlan = s.sanitizeLaunchPlan(s.collector.LastLaunchPlan())
+		proxyURL = s.collector.ProxyURL()
+		caBundle = s.collector.CABundlePath()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"scope":       scope,
 		"probes":      probes,
 		"pid_plans":   pidPlans,
 		"launch_plan": launchPlan,
+		"proxy_url":   proxyURL,
+		"ca_bundle":   caBundle,
 	})
 }
 

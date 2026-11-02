@@ -182,3 +182,15 @@ curl -X POST http://127.0.0.1:8787/api/pid/inject \
 # 运行期间可通过 /api/scope 查看脱敏后的 InjectedArgs 与 InjectedEnv 键列表
 curl -s http://127.0.0.1:8787/api/scope | jq .launch_plan
 ```
+
+### 4. 本地 HTTP/HTTPS 代理抓包 (`--proxy-listen`) 与最后兜底代理环境变量注入
+
+- **显式 HTTP/HTTPS 代理模式**：
+  - `llm-tracer capture` 启动时内置 `LoopbackTap` 本地 HTTP + HTTPS MITM 抓包代理，可通过 `--proxy-listen` 指定固定监听地址（默认随机回环端口 `127.0.0.1:0`），并在启动日志及 `GET /api/scope`（`proxy_url`、`ca_bundle` 字段）中输出代理地址与合并了系统根证书的本地 CA 证书束路径（`<cache-dir>/hooks/llm_tracer_ca_bundle.pem`）。
+  - 外部程序或容器可直接配置 `HTTP_PROXY`、`HTTPS_PROXY` 与 `SSL_CERT_FILE` 接入该代理完成抓包。
+- **拉起子进程 (`-- <cmd>`) 的最后兜底策略 (`shouldFallbackToProxyEnv`)**：
+  - 当非侵入式 eBPF Uprobe 可直接覆盖目标（如动态/静态 OpenSSL 或 GoTLS 且内核 eBPF 激活），或对应运行时的专用 Hook 可用（Python `PYTHONPATH`、Node/Bun `--require`/`--preload`、JVM `-javaagent`、Linux/macOS 下 `dynamic-libssl` 的 `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`）时，**不改写**子进程的 `HTTP_PROXY`/`HTTPS_PROXY`，并完整保留父进程原有的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量。
+  - 仅当所有非侵入式与运行时专用 Hook 手段均无法注入时（如 `stripped-embedded-tls` / Rust `rustls`、无 eBPF 权限下的静态 Go/OpenSSL 二进制、或缺失对应运行时 Hook 文件），才将注入 `HTTP_PROXY`/`HTTPS_PROXY`（连同 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`、`REQUESTS_CA_BUNDLE` 等）作为最后的兜底手段。
+- **父进程代理配置遵从 (`UpstreamProxyConfig`)**：
+  - `LoopbackTap` 启动及拉起子进程兜底时会自动解析父进程的 `HTTP_PROXY`/`http_proxy`、`HTTPS_PROXY`/`https_proxy`、`ALL_PROXY`/`all_proxy` 与 `NO_PROXY`/`no_proxy`。
+  - 子进程流量进入本地 `LoopbackTap` 解密抓包后，出站请求（含明文 HTTP 转发与 HTTPS `CONNECT` 隧道）会严格遵从父进程代理配置向上游代理（支持 `http://`、`https://`、`socks5://`、`socks5h://` 及 Basic Auth `Proxy-Authorization`）串联转发，并按父进程 `NO_PROXY` 规则（域名后缀、精确主机、IP 与 CIDR）直连白名单目标，同时自动识别并剔除指向 `LoopbackTap` 自身的代理地址以防止死循环。

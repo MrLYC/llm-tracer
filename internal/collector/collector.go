@@ -73,6 +73,8 @@ type Collector struct {
 	stagedAgentJars   []string
 	autoIntrusive     bool
 	autoInjectLive    bool
+	proxyListen       string
+	upstreamProxy     UpstreamProxyConfig
 	tapInsecure       bool
 	captureUnknown    bool
 	ingestToken       string
@@ -131,6 +133,8 @@ func NewCollector(
 		liveInjectedPIDs: make(map[int]string),
 		dropRateByPID:    make(map[int]*pidDropRateState),
 		autoIntrusive:    true,
+		proxyListen:      "127.0.0.1:0",
+		upstreamProxy:    ParseUpstreamProxyEnv(os.Environ(), ""),
 		tracker:          tracker,
 		correlator:       corr,
 		store:            st,
@@ -188,6 +192,90 @@ func (c *Collector) TapInsecure() bool {
 	c.cfgMu.RLock()
 	defer c.cfgMu.RUnlock()
 	return c.tapInsecure
+}
+
+// SetProxyListen configures the TCP address for the local HTTP/HTTPS MITM proxy (LoopbackTap).
+// Must be called before Start; defaults to "127.0.0.1:0".
+func (c *Collector) SetProxyListen(addr string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
+	c.cfgMu.Lock()
+	c.proxyListen = addr
+	c.cfgMu.Unlock()
+
+	c.sourcesMu.RLock()
+	tapSrc := c.tapSrc
+	c.sourcesMu.RUnlock()
+	if tapSrc != nil {
+		tapSrc.SetListenAddr(addr)
+	}
+}
+
+// ProxyListen returns the configured TCP listen address for LoopbackTap.
+func (c *Collector) ProxyListen() string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	if c.proxyListen == "" {
+		return "127.0.0.1:0"
+	}
+	return c.proxyListen
+}
+
+// SetUpstreamProxyConfig updates the parent process proxy configuration used by LoopbackTap.
+func (c *Collector) SetUpstreamProxyConfig(cfg UpstreamProxyConfig) {
+	if c == nil {
+		return
+	}
+	c.cfgMu.Lock()
+	c.upstreamProxy = cfg
+	c.cfgMu.Unlock()
+
+	c.mu.RLock()
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+	if tap != nil {
+		tap.SetUpstreamProxyConfig(cfg)
+	}
+}
+
+// UpstreamProxyConfig returns the parent process proxy configuration recorded by Collector / LoopbackTap.
+func (c *Collector) UpstreamProxyConfig() UpstreamProxyConfig {
+	if c == nil {
+		return UpstreamProxyConfig{}
+	}
+	c.mu.RLock()
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+	if tap != nil {
+		return tap.UpstreamProxyConfig()
+	}
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.upstreamProxy
+}
+
+// ProxyURL returns the active HTTP/HTTPS proxy URL (e.g., "http://127.0.0.1:54321") once started.
+func (c *Collector) ProxyURL() string {
+	c.mu.RLock()
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+	if tap == nil {
+		return ""
+	}
+	return tap.ProxyURL()
+}
+
+// CABundlePath returns the active LoopbackTap CA bundle PEM path once started.
+func (c *Collector) CABundlePath() string {
+	c.mu.RLock()
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+	if tap == nil {
+		return ""
+	}
+	return tap.CABundlePath()
 }
 
 // SetCaptureUnknown configures whether unknown-protocol HTTP exchanges are retained when host filters are empty.
@@ -271,13 +359,29 @@ func (c *Collector) Start(ctx context.Context) error {
 	}, c.markUserHookPID)
 	tapSrc := newTapSource(hooksDir, c.TapInsecure(), c.mon, func() int {
 		c.mu.RLock()
-		defer c.mu.RUnlock()
-		return c.activeTapPID
+		pid := c.activeTapPID
+		c.mu.RUnlock()
+		if pid > 0 {
+			return pid
+		}
+		if c.tracker != nil {
+			if pids := c.tracker.DiscoverMatchingPIDs(); len(pids) > 0 {
+				return pids[0]
+			}
+		}
+		return 0
 	}, func(tap *LoopbackTap) {
 		c.mu.Lock()
 		c.loopbackTap = tap
 		c.mu.Unlock()
+		c.cfgMu.RLock()
+		upCfg := c.upstreamProxy
+		c.cfgMu.RUnlock()
+		if upCfg != (UpstreamProxyConfig{}) {
+			tap.SetUpstreamProxyConfig(upCfg)
+		}
 	})
+	tapSrc.SetListenAddr(c.ProxyListen())
 	ebpfSrc := newEBPFSource(initialProbes, c.mon, c.isUserHookPID, func(eng *EBPFEngine, updatedProbes []ProbeTarget) {
 		c.mu.Lock()
 		c.ebpfEngine = eng
