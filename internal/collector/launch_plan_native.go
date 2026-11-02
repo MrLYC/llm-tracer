@@ -188,15 +188,17 @@ func applyNativeTapEnv(
 	if c != nil && len(baseEnv) > 0 {
 		c.SetUpstreamProxyConfig(ParseUpstreamProxyEnv(baseEnv, in.ProxyURL))
 	}
-	env = setAndTrackEnv(env, "LLM_TRACER_PROXY_HOST", in.ProxyHost)
-	env = setAndTrackEnv(env, "LLM_TRACER_PROXY_PORT", in.ProxyPort)
-	env = setAndTrackEnv(env, "SSL_CERT_FILE", in.CABundlePath)
-	env = setAndTrackEnv(env, "CURL_CA_BUNDLE", in.CABundlePath)
-	env = setAndTrackEnv(env, "REQUESTS_CA_BUNDLE", in.CABundlePath)
-	env = setAndTrackEnv(env, "NODE_EXTRA_CA_CERTS", in.CABundlePath)
-	env = setAndTrackEnv(env, "CARGO_HTTP_CAINFO", in.CABundlePath)
 
 	needsProxyEnv := shouldFallbackToProxyEnv(in, kind, resolvedELF, plan)
+	if needsProxyEnv || plan.PtraceWrapped || kind == runtimeKindJVM {
+		env = setAndTrackEnv(env, "LLM_TRACER_PROXY_HOST", in.ProxyHost)
+		env = setAndTrackEnv(env, "LLM_TRACER_PROXY_PORT", in.ProxyPort)
+		env = setAndTrackEnv(env, "SSL_CERT_FILE", in.CABundlePath)
+		env = setAndTrackEnv(env, "CURL_CA_BUNDLE", in.CABundlePath)
+		env = setAndTrackEnv(env, "REQUESTS_CA_BUNDLE", in.CABundlePath)
+		env = setAndTrackEnv(env, "NODE_EXTRA_CA_CERTS", in.CABundlePath)
+		env = setAndTrackEnv(env, "CARGO_HTTP_CAINFO", in.CABundlePath)
+	}
 	if needsProxyEnv {
 		// Clear child ALL_PROXY and NO_PROXY so the child routes traffic to LoopbackTap;
 		// LoopbackTap itself honors the parent process's HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY.

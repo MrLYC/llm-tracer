@@ -638,10 +638,12 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 		}
 		processGoFunc := func(name string, vaddr, fnSize uint64) {
 			_ = fnSize
-			if vaddr == 0 {
-				return
+			switch name {
+			case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
+				if vaddr > 0 {
+					syms[name] = vaddr
+				}
 			}
-			syms[name] = vaddr
 		}
 		if mf.Symtab != nil {
 			for _, s := range mf.Symtab.Syms {

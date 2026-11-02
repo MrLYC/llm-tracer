@@ -32,6 +32,7 @@ func TestNodeWritevHookWithoutListening(t *testing.T) {
 		require.NotEmpty(t, hooks.NodeHookJS)
 
 		pipeFile := filepath.Join(dir, "writev_pipe.bin")
+		require.NoError(t, os.WriteFile(pipeFile, nil, 0o600))
 		scriptPath := filepath.Join(dir, "verify_writev_direct.js")
 		script := `"use strict";
 const net = require("node:net");

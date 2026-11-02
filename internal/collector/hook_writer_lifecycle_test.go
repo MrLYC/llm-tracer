@@ -20,32 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func init() {
-	// Compatibility shim for legacy unit test TestNodeWritevHookWithoutListening/DirectHook_PrototypeReplacementAndBinaryFrameEmission,
-	// which invokes node_hook.cjs directly without starting Collector/pipeSource to pre-create writev_pipe.bin.
-	go func() {
-		tmpRoot := os.TempDir()
-		pattern := filepath.Join(tmpRoot, "TestNodeWritevHookWithoutListening*", "*", "node_hook.cjs")
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
-		for range ticker.C {
-			matches, err := filepath.Glob(pattern)
-			if err != nil {
-				continue
-			}
-			for _, hookFile := range matches {
-				dir := filepath.Dir(hookFile)
-				pipeFile := filepath.Join(dir, "writev_pipe.bin")
-				if _, statErr := os.Lstat(pipeFile); os.IsNotExist(statErr) {
-					if f, openErr := os.OpenFile(pipeFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600); openErr == nil {
-						_ = f.Close()
-					}
-				}
-			}
-		}
-	}()
-}
-
 func parseLLMTFramesFromBytes(t *testing.T, raw []byte) []string {
 	t.Helper()
 	var payloads []string

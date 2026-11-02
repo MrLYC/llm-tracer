@@ -39,6 +39,7 @@ type pidInjectBackoffState struct {
 	lastBackoff time.Duration
 	nextRetryAt time.Time
 	lastError   string
+	inFlight    bool
 }
 
 var (
@@ -84,16 +85,36 @@ func checkInjectBackoff(c *Collector, pid int, now time.Time) (pidInjectBackoffS
 		return pidInjectBackoffState{}, false
 	}
 	byPID := injectBackoffByCol[c]
+	if byPID != nil {
+		if st, ok := byPID[pid]; ok && st != nil {
+			if st.inFlight || now.Before(st.nextRetryAt) {
+				cp := *st
+				if cp.lastError == "" && cp.inFlight {
+					cp.lastError = "injection already in progress"
+				}
+				return cp, true
+			}
+			st.inFlight = true
+			return *st, false
+		}
+	}
 	if byPID == nil {
-		return pidInjectBackoffState{}, false
+		byPID = make(map[int]*pidInjectBackoffState)
+		injectBackoffByCol[c] = byPID
+		if c != nil && c.stopCh != nil {
+			cancel := make(chan struct{})
+			injectBackoffCancelByCol[c] = cancel
+			go func(col *Collector, stopCh, cancelCh <-chan struct{}) {
+				select {
+				case <-stopCh:
+					ResetInjectBackoff(col)
+				case <-cancelCh:
+				}
+			}(c, c.stopCh, cancel)
+		}
 	}
-	st, ok := byPID[pid]
-	if !ok || st == nil {
-		return pidInjectBackoffState{}, false
-	}
-	if now.Before(st.nextRetryAt) {
-		return *st, true
-	}
+	st := &pidInjectBackoffState{inFlight: true}
+	byPID[pid] = st
 	return *st, false
 }
 
@@ -126,6 +147,7 @@ func recordInjectFailure(c *Collector, pid int, now time.Time, injectErr error) 
 		st = &pidInjectBackoffState{}
 		byPID[pid] = st
 	}
+	st.inFlight = false
 	st.failures++
 	shift := st.failures - 1
 	if shift < 0 {
