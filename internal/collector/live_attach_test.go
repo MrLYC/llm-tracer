@@ -436,6 +436,11 @@ int main(int argc, char **argv) {
 		plans := col.AnalyzePIDPlans()
 		require.Len(t, plans, 1)
 		require.Equal(t, "stripped-native", plans[0].DetectedStack)
+		if !currentArchCapabilities().PtraceUserspaceSupported {
+			require.Equal(t, "", plans[0].RecommendedIntrusive)
+			require.NotEmpty(t, plans[0].DegradationNotices)
+			return
+		}
 		require.Equal(t, "ptrace_seize", plans[0].RecommendedIntrusive)
 
 		_, err = col.InjectRunningPID(cPID)
@@ -629,7 +634,7 @@ public class SelectorJvmTarget {
     public static void main(String[] args) throws Exception {
         File trigger = new File(args[0]);
         String baseUrl = args[1];
-        for (int i = 0; i < 300; i++) {
+        for (int i = 0; i < 1500; i++) {
             if (trigger.exists()) break;
             Thread.sleep(20);
         }

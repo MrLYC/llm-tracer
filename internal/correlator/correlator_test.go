@@ -11,6 +11,7 @@ import (
 func TestCorrelatorThreeLevels(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 	corr := NewCorrelator(mon)
 
 	// 1. SystemOne Step 1 (root) -> Step 2 (L2_context via Goal) -> Helper OpenAI Chat for TYPE_TEXT (L3_proctree)

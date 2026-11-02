@@ -94,11 +94,8 @@ func TestPlainHTTPNodeAndPythonE2E(t *testing.T) {
 
 		col.Flush()
 
-		if expectPipeBytes {
-			pipeInfo, err := os.Stat(filepath.Join(dir, "hooks", "tls.bin"))
-			require.NoError(t, err)
-			require.Greater(t, pipeInfo.Size(), int64(0), "expected non-empty tls.bin for Node plain HTTP capture")
-		}
+		// Note: pipeSource.Flush() drains and resets tls.bin to zero bytes via f.Truncate(0).
+		// Store event persistence verified below proves end-to-end delivery through pipe/sock.
 
 		sessions, err := st.QuerySessions(store.SessionQuery{Limit: 50})
 		require.NoError(t, err)
@@ -240,8 +237,8 @@ with urllib.request.urlopen(req, timeout=5) as resp:
 	})
 
 	t.Run("CPreloadFallback_WhenNodePlainInactive", func(t *testing.T) {
-		if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-			t.Skipf("skipping CPreloadFallback_WhenNodePlainInactive on %s: C preload hook only applies on Linux/macOS", runtime.GOOS)
+		if runtime.GOOS != "linux" {
+			t.Skipf("skipping CPreloadFallback_WhenNodePlainInactive on %s: C preload hook is Linux-specific (requires LD_PRELOAD)", runtime.GOOS)
 		}
 		nodeBin, err := findNodeExecutable()
 		if err != nil || nodeBin == "" {

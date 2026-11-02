@@ -418,7 +418,7 @@ func main() {
 	require.NoError(t, err)
 	// Scenario 1 (dynamic libssl), Scenario 2 (Bun-like writev), Scenario 3 (Python MemoryBIO), Scenario 4 (Node TLSSocket) always produce 4 sessions;
 	// When ptrace is permitted on the host, Scenario 5 (static-pie C) and Scenario 6 (native Go syscall) produce 2 more (= 6 sessions).
-	if CanUsePtrace() {
+	if CanUsePtrace() && currentArchCapabilities().PtraceUserspaceSupported {
 		require.Len(t, sessions, 6, "all 6 end-to-end LLM sessions must be captured")
 	} else {
 		require.GreaterOrEqual(t, len(sessions), 4)

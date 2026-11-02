@@ -78,7 +78,7 @@ func TestHookWriterLifecycle_NoRecreateAfterPipeRemoval(t *testing.T) {
 	t.Run("1_SSLHookC_PreloadWriterDoesNotRecreatePipe", func(t *testing.T) {
 		diskBytes, err := os.ReadFile(filepath.Join("assets", "c", "ssl_hook.c"))
 		require.NoError(t, err)
-		if runtime.GOOS != "windows" {
+		if runtime.GOOS == "linux" {
 			if ccBin, lookErr := exec.LookPath("gcc"); lookErr == nil {
 				dir := t.TempDir()
 				hooksDir := filepath.Join(dir, "hooks")
