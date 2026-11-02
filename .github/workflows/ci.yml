@@ -17,7 +17,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.26.5'
           check-latest: true
 
       - name: Set up Python 3
@@ -30,6 +30,33 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Ensure & verify eBPF/polyglot test dependencies (curl, openssl, libssl-dev, gcc, g++, javac, rustc, node symbols)
+        run: |
+          MISSING_PKGS=""
+          command -v curl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS curl"
+          command -v openssl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS openssl"
+          command -v gcc >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS build-essential"
+          command -v g++ >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS g++"
+          echo '#include <openssl/ssl.h>' | gcc -E - >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS libssl-dev"
+          command -v javac >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS default-jdk-headless"
+          command -v rustc >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS rustc"
+          if [ -n "$MISSING_PKGS" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends $MISSING_PKGS
+          fi
+          curl --version | head -n 1
+          openssl version
+          gcc --version | head -n 1
+          g++ --version | head -n 1
+          javac -version
+          rustc --version
+          NODE_BIN="$(which node)"
+          echo "Node binary: $NODE_BIN ($(node --version))"
+          if ! nm -D "$NODE_BIN" 2>/dev/null | grep -qE ' SSL_(write|read)'; then
+            echo "::error::node binary ($NODE_BIN) lacks dynamic OpenSSL symbols required by EBPF_Scenario4"
+            exit 1
+          fi
+
       - name: Ensure kernel debugfs/tracefs and perf_event_paranoid for eBPF uprobes
         run: |
           sudo mount -t debugfs none /sys/kernel/debug || true
@@ -39,14 +66,49 @@ jobs:
           sudo sysctl -w kernel.yama.ptrace_scope=0 || true
           uname -a
 
+      - name: Quality gate (gofmt / go vet)
+        run: |
+          UNFORMATTED="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "以下文件未通过 gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+          go vet ./...
+          GOARCH=arm64 go vet ./...
+
       - name: Run full test suite (Unprivileged User-Space Mode)
         run: go test -v -count=1 ./...
 
-      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios), Live Attach & All Runtime Compatibility Scenarios (Root)
+      - name: Run race detector on the full module
+        run: go test -race -count=1 ./...
+
+      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios) & All Runtime Compatibility Scenarios (Root)
         run: |
           GO_BIN="$(which go)"
+          set -o pipefail
           sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
-            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios|TestLivePIDAttachWithoutRestart'
+            -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios' \
+            2>&1 | tee /tmp/ebpf-15-scenarios.log
+          if grep -q -- '--- SKIP' /tmp/ebpf-15-scenarios.log; then
+            echo "::error::Root eBPF 15 场景及运行时兼容矩阵存在被跳过的子场景，root 环境下不允许 SKIP:"
+            grep -- '--- SKIP' /tmp/ebpf-15-scenarios.log
+            exit 1
+          fi
+
+      - name: Assert live-attach scenarios actually run as root (no SKIP allowed)
+        run: |
+          # JVM 动态 attach / Node SIGUSR1 inspector / ptrace 三类免重启热注入在非 root 下会 skip，
+          # 等于从未被 CI 验证；这里显式要求它们在 root 环境下真实执行通过。
+          GO_BIN="$(which go)"
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 \
+            -run 'TestLivePIDAttachWithoutRestart' ./internal/collector 2>&1 | tee /tmp/live-attach.log
+          if grep -q -- '--- SKIP' /tmp/live-attach.log; then
+            echo "::error::TestLivePIDAttachWithoutRestart 存在被跳过的子场景，root 环境下不允许 SKIP:"
+            grep -- '--- SKIP' /tmp/live-attach.log
+            exit 1
+          fi
 
       - name: Verify GoReleaser configuration
         uses: goreleaser/goreleaser-action@v6
@@ -55,11 +117,118 @@ jobs:
           version: '~> v2'
           args: check
 
-      - name: Build Linux amd64 & arm64 binaries
+      - name: Build Linux & Cross-Compile Darwin/Windows Binaries
         run: |
           mkdir -p dist
           GOOS=linux GOARCH=amd64 go build -o dist/llm-tracer-linux-amd64 ./cmd/llm-tracer
           GOOS=linux GOARCH=arm64 go build -o dist/llm-tracer-linux-arm64 ./cmd/llm-tracer
+          GOOS=darwin GOARCH=amd64 go build -o dist/llm-tracer-darwin-amd64 ./cmd/llm-tracer
+          GOOS=darwin GOARCH=arm64 go build -o dist/llm-tracer-darwin-arm64 ./cmd/llm-tracer
+          GOOS=windows GOARCH=amd64 go build -o dist/llm-tracer-windows-amd64.exe ./cmd/llm-tracer
+          GOOS=windows GOARCH=arm64 go build -o dist/llm-tracer-windows-arm64.exe ./cmd/llm-tracer
+
+  fuzz-smoke:
+    name: Parser Fuzz Smoke (FuzzIngestChunk & FuzzParseExchange)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+
+      - name: Run FuzzIngestChunk smoke (30s)
+        run: go test -run=^$ -fuzz=^FuzzIngestChunk$ -fuzztime=30s ./internal/parser/
+
+      - name: Run FuzzParseExchange smoke (30s)
+        run: go test -run=^$ -fuzz=^FuzzParseExchange$ -fuzztime=30s ./internal/parser/
+
+  linux-arm64-ebpf:
+    name: Linux arm64 (Root Kernel eBPF on real aarch64 hardware)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ensure & verify arm64 eBPF/polyglot test dependencies (curl, openssl, libssl-dev, gcc, g++, javac, rustc, node symbols)
+        run: |
+          MISSING_PKGS=""
+          command -v curl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS curl"
+          command -v openssl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS openssl"
+          command -v gcc >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS build-essential"
+          command -v g++ >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS g++"
+          echo '#include <openssl/ssl.h>' | gcc -E - >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS libssl-dev"
+          command -v javac >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS default-jdk-headless"
+          command -v rustc >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS rustc"
+          if [ -n "$MISSING_PKGS" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends $MISSING_PKGS
+          fi
+          curl --version | head -n 1
+          openssl version
+          gcc --version | head -n 1
+          g++ --version | head -n 1
+          javac -version
+          rustc --version
+          NODE_BIN="$(which node)"
+          echo "Node binary: $NODE_BIN ($(node --version))"
+          if ! nm -D "$NODE_BIN" 2>/dev/null | grep -qE ' SSL_(write|read)'; then
+            echo "::error::node binary ($NODE_BIN) lacks dynamic OpenSSL symbols required by EBPF_Scenario4"
+            exit 1
+          fi
+
+      - name: Report architecture
+        run: |
+          uname -m
+          go env GOARCH
+
+      - name: Ensure kernel debugfs/tracefs and perf_event_paranoid for eBPF uprobes
+        run: |
+          sudo mount -t debugfs none /sys/kernel/debug || true
+          sudo mount -t tracefs none /sys/kernel/tracing || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          sudo sysctl -w kernel.kptr_restrict=0 || true
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Run full test suite on arm64 (unprivileged)
+        run: go test -v -count=1 ./...
+
+      - name: Run race detector on arm64
+        run: go test -race -count=1 ./...
+
+      - name: Run arm64 kernel eBPF scenarios (Root)
+        run: |
+          # ebpf_arch_arm64.go 的 user_pt_regs 偏移与 RET(0xd65f03c0) 扫描此前只在交叉编译下验证过，
+          # 这里在真实 aarch64 内核上执行，确保 arm64 不是"只能编译"。
+          GO_BIN="$(which go)"
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
+            -run 'TestEBPFArch|TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestPolyglotLanguagesCapture' \
+            2>&1 | tee /tmp/ebpf-arm64.log
+          if grep -q -- '--- SKIP' /tmp/ebpf-arm64.log; then
+            echo "::error::arm64 Root eBPF 场景存在被跳过的子场景，root 环境下不允许 SKIP:"
+            grep -- '--- SKIP' /tmp/ebpf-arm64.log
+            exit 1
+          fi
 
   macos-scenarios:
     name: macOS (Darwin Process Tree + Mach-O + Runtime & LoopbackTap Capture)
@@ -71,7 +240,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.26.5'
           check-latest: true
 
       - name: Set up Python 3
@@ -103,7 +272,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.26.5'
           check-latest: true
 
       - name: Set up Python 3

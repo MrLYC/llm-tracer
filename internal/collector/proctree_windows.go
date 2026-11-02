@@ -5,10 +5,10 @@ package collector
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"unsafe"
 
-	"github.com/liuyicong/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 	"golang.org/x/sys/windows"
 )
 
@@ -44,11 +44,12 @@ func InspectProcess(pid int) model.ProcessInfo {
 			}
 		}
 		if info.Cmdline == "" {
-			info.Cmdline = strings.Join(os.Args, " ")
+			info.Cmdline = selfmon.RedactCmdArgs(os.Args)
 		}
 	} else if info.Cmdline == "" && info.Exe != "" {
 		info.Cmdline = info.Exe
 	}
+	info.Cmdline = selfmon.RedactCmdline(info.Cmdline)
 	return info
 }
 
@@ -60,6 +61,24 @@ func readPPID(pid int) int {
 		return int(entry.ParentProcessID)
 	}
 	return 0
+}
+
+func readProcessStartTime(pid int) uint64 {
+	if pid <= 0 {
+		return 0
+	}
+	// Conservative fallback: if OpenProcess or GetProcessTimes fails (e.g. elevated/protected process),
+	// return 0 so caller never reuses stale cached identity and evicts disappeared PIDs on RefreshSubtree.
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(h)
+	var creation, exit, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
+		return 0
+	}
+	return uint64(creation.HighDateTime)<<32 | uint64(creation.LowDateTime)
 }
 
 func readTaskChildren(_ int) []int {

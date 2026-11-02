@@ -2,9 +2,8 @@ package collector
 
 import (
 	"context"
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -16,42 +15,81 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/liuyicong/llm-tracer/internal/correlator"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/parser"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
-	"github.com/liuyicong/llm-tracer/internal/store"
+	"github.com/mrlyc/llm-tracer/internal/correlator"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/store"
 )
 
 var sockSeq uint64
 
+// Sink delivers a captured raw TLS/HTTP frame from a Source into the Collector pipeline.
+type Sink func(pid, tid int, connID string, dir parser.Direction, payload []byte, tlsMode string)
+
+// Source represents an independent capture channel managed by Collector.
+type Source interface {
+	Name() string
+	Start(ctx context.Context, sink Sink) error
+	Close() error
+}
+
+type flushableSource interface {
+	Flush()
+}
+
+const outOfScopeDropRateWindow = 1 * time.Second
+
+type pidDropRateState struct {
+	lastEmit        time.Time
+	suppressedCount int
+	suppressedBytes int
+	comm            string
+	exe             string
+	tlsMode         string
+}
+
 type Collector struct {
-	mu           sync.RWMutex
-	cacheDir     string
-	sockPath     string
-	pipePath     string
-	pipeMu       sync.Mutex
-	pipeOffset   int64
-	preloadPath  string
-	runtimeHooks *RuntimeHookPaths
-	loopbackTap  *LoopbackTap
-	ebpfEngine   *EBPFEngine
-	userHookPIDs map[int]bool
-	liveInjectedPIDs map[int]string
-	autoIntrusive    bool
-	autoInjectLive   bool
-	lastLaunchPlan   *LaunchAttachPlan
-	activeTapPID int
-	listener     net.Listener
-	tracker      *ProcessTracker
-	reassembler  *parser.StreamReassembler
-	correlator   *correlator.Correlator
-	store        *store.Store
-	mon          *selfmon.Monitor
-	probes       []ProbeTarget
-	pidPlans     []PIDAttachPlan
-	stopCh       chan struct{}
-	stopOnce     sync.Once
+	cfgMu             sync.RWMutex
+	sourcesMu         sync.RWMutex
+	permMu            sync.Mutex
+	dropRateMu        sync.Mutex
+	mu                sync.RWMutex
+	cacheDir          string
+	hooksDir          string
+	sockPath          string
+	pipePath          string
+	preloadPath       string
+	runtimeHooks      *RuntimeHookPaths
+	loopbackTap       *LoopbackTap
+	ebpfEngine        *EBPFEngine
+	sources           []Source
+	tapSrc            *tapSource
+	channelRelaxed    bool
+	channelTargetUID  int
+	userHookPIDs      map[int]bool
+	liveInjectedPIDs  map[int]string
+	dropRateByPID     map[int]*pidDropRateState
+	stagedAgentJars   []string
+	autoIntrusive     bool
+	autoInjectLive    bool
+	tapInsecure       bool
+	captureUnknown    bool
+	ingestToken       string
+	secretIngestToken string
+	lastLaunchPlan    *LaunchAttachPlan
+	activeTapPID      int
+	tracker           *ProcessTracker
+	reassembler       *parser.StreamReassembler
+	correlator        *correlator.Correlator
+	store             *store.Store
+	mon               *selfmon.Monitor
+	probes            []ProbeTarget
+	pidPlans          []PIDAttachPlan
+	stopCh            chan struct{}
+	periodicStarted   bool
+	periodicDoneCh    chan struct{}
+	stopOnce          sync.Once
 }
 
 type DirectExchangeInput struct {
@@ -87,22 +125,116 @@ func NewCollector(
 	tracker := NewProcessTracker(scope, mon)
 	c := &Collector{
 		cacheDir:         cacheDir,
+		channelTargetUID: -1,
 		userHookPIDs:     make(map[int]bool),
 		liveInjectedPIDs: make(map[int]string),
+		dropRateByPID:    make(map[int]*pidDropRateState),
 		autoIntrusive:    true,
 		tracker:          tracker,
-		correlator:   corr,
-		store:        st,
-		mon:          mon,
-		stopCh:       make(chan struct{}),
+		correlator:       corr,
+		store:            st,
+		mon:              mon,
+		stopCh:           make(chan struct{}),
+		periodicDoneCh:   make(chan struct{}),
 	}
 	c.reassembler = parser.NewStreamReassembler(scope.RecordHeaders, scope.Hosts, mon, c.handleReassembledEvent)
 	return c, nil
 }
 
+// RegisterSource adds a capture Source to the Collector registry before Start.
+func (c *Collector) RegisterSource(src Source) {
+	if src == nil {
+		return
+	}
+	c.sourcesMu.Lock()
+	c.sources = append(c.sources, src)
+	c.sourcesMu.Unlock()
+}
+
+// Sources returns a snapshot of registered capture sources.
+func (c *Collector) Sources() []Source {
+	c.sourcesMu.RLock()
+	defer c.sourcesMu.RUnlock()
+	out := make([]Source, len(c.sources))
+	copy(out, c.sources)
+	return out
+}
+
+// SetTapInsecure configures whether LoopbackTap skips certificate verification for non-loopback upstreams.
+func (c *Collector) SetTapInsecure(insecure bool) {
+	c.cfgMu.Lock()
+	c.tapInsecure = insecure
+	c.cfgMu.Unlock()
+
+	c.sourcesMu.RLock()
+	tapSrc := c.tapSrc
+	c.sourcesMu.RUnlock()
+	if tapSrc != nil {
+		tapSrc.SetInsecure(insecure)
+		return
+	}
+
+	c.mu.RLock()
+	tap := c.loopbackTap
+	c.mu.RUnlock()
+	if tap != nil {
+		tap.SetInsecure(insecure)
+	}
+}
+
+// TapInsecure reports whether LoopbackTap skips certificate verification for non-loopback upstreams.
+func (c *Collector) TapInsecure() bool {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.tapInsecure
+}
+
+// SetCaptureUnknown configures whether unknown-protocol HTTP exchanges are retained when host filters are empty.
+func (c *Collector) SetCaptureUnknown(v bool) {
+	c.cfgMu.Lock()
+	c.captureUnknown = v
+	c.cfgMu.Unlock()
+	if c.reassembler != nil {
+		c.reassembler.SetDropUnknown(!v)
+	}
+}
+
+// CaptureUnknown reports whether unknown-protocol HTTP exchanges are retained when host filters are empty.
+func (c *Collector) CaptureUnknown() bool {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.captureUnknown
+}
+
+// SetIngestToken stores the local HTTP ingest shared secret token for child hooks.
+func (c *Collector) SetIngestToken(token string) {
+	c.cfgMu.Lock()
+	c.secretIngestToken = token
+	c.cfgMu.Unlock()
+	c.mu.Lock()
+	c.ingestToken = ""
+	c.mu.Unlock()
+}
+
+// IngestToken returns the local HTTP ingest shared secret token.
+func (c *Collector) IngestToken() string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.secretIngestToken
+}
+
+// StagedAgentJars returns temporary JVM agent JAR paths created via os.CreateTemp during live attach.
+func (c *Collector) StagedAgentJars() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, len(c.stagedAgentJars))
+	copy(out, c.stagedAgentJars)
+	return out
+}
+
 func (c *Collector) Start(ctx context.Context) error {
 	hooksDir := filepath.Join(c.cacheDir, "hooks")
-	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+	if err := ensureSafeHooksDir(hooksDir); err != nil {
 		return err
 	}
 
@@ -112,23 +244,61 @@ func (c *Collector) Start(ctx context.Context) error {
 		sockPath = filepath.Join("/tmp", fmt.Sprintf("llmt-%d-%d.sock", os.Getpid(), atomic.AddUint64(&sockSeq, 1)))
 	}
 	pipePath := filepath.Join(hooksDir, "tls.bin")
-	_ = os.WriteFile(pipePath, nil, 0o666)
 
-	_ = os.Remove(sockPath)
-	ln, err := net.Listen("unix", sockPath)
-	if err == nil {
-		_ = os.Chmod(sockPath, 0o666)
-		c.mu.Lock()
-		c.sockPath = sockPath
-		c.listener = ln
-		c.mu.Unlock()
-		go c.acceptLoop(ln)
-	} else if c.mon != nil {
-		c.mon.RecordWarn(selfmon.StageProbe, "listen_unix_sock_fallback_pipe", err.Error(), map[string]any{"pipe": pipePath})
+	channelPerm, targetUID, hasCross := c.resolveCrossUIDState(c.tracker.GetScope().PIDs)
+	c.permMu.Lock()
+	c.hooksDir = hooksDir
+	c.channelRelaxed = hasCross
+	c.channelTargetUID = targetUID
+	c.permMu.Unlock()
+	if hasCross && targetUID >= 0 {
+		_ = setHooksDirModeNoFollow(hooksDir, 0o711)
 	}
+
 	c.mu.Lock()
 	c.pipePath = pipePath
 	c.mu.Unlock()
+
+	scope := c.tracker.GetScope()
+	initialProbes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
+
+	pipeSrc := newPipeSource(pipePath, channelPerm, targetUID, c.markUserHookPID, c.mon)
+	unixSrc := newUnixSockSource(sockPath, pipePath, channelPerm, targetUID, c.mon, func(readySock string, _ net.Listener) {
+		c.mu.Lock()
+		c.sockPath = readySock
+		c.mu.Unlock()
+	}, c.markUserHookPID)
+	tapSrc := newTapSource(hooksDir, c.TapInsecure(), c.mon, func() int {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		return c.activeTapPID
+	}, func(tap *LoopbackTap) {
+		c.mu.Lock()
+		c.loopbackTap = tap
+		c.mu.Unlock()
+	})
+	ebpfSrc := newEBPFSource(initialProbes, c.mon, c.isUserHookPID, func(eng *EBPFEngine, updatedProbes []ProbeTarget) {
+		c.mu.Lock()
+		c.ebpfEngine = eng
+		c.probes = deduplicateProbes(updatedProbes)
+		c.mu.Unlock()
+	})
+
+	c.sourcesMu.Lock()
+	customSources := append([]Source(nil), c.sources...)
+	allSources := []Source{pipeSrc, unixSrc, tapSrc, ebpfSrc}
+	allSources = append(allSources, customSources...)
+	c.sources = allSources
+	c.tapSrc = tapSrc
+	c.sourcesMu.Unlock()
+
+	for _, src := range allSources {
+		if err := src.Start(ctx, c.ingestFromSource); err != nil {
+			if src.Name() == "pipe" {
+				return err
+			}
+		}
+	}
 
 	if soPath, err := EnsureSSLPreloadHook(hooksDir); err == nil {
 		c.mu.Lock()
@@ -157,74 +327,47 @@ func (c *Collector) Start(ctx context.Context) error {
 		c.mon.RecordWarn(selfmon.StageProbe, "build_runtime_hooks", err.Error(), nil)
 	}
 
-	if tap, err := NewLoopbackTap(hooksDir, func(connID string, dir parser.Direction, data []byte) {
-		c.mu.RLock()
-		pid := c.activeTapPID
-		c.mu.RUnlock()
-		if pid <= 0 {
-			pid = os.Getpid()
-		}
-		c.IngestRawChunk(pid, pid, connID, dir, data, "loopback_tap")
-	}); err == nil {
-		c.mu.Lock()
-		c.loopbackTap = tap
-		c.mu.Unlock()
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "start_loopback_tap", map[string]any{
-				"proxy_url": tap.ProxyURL(),
-				"ca_bundle": tap.CABundlePath(),
-			})
-		}
-	}
-
-	scope := c.tracker.GetScope()
-	probes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
-	if eng, err := StartEBPFEngine(probes, c.mon, func(pid, tid int, connID string, dir parser.Direction, payload []byte, mode string) {
-		c.mu.RLock()
-		alreadyHooked := c.userHookPIDs[pid]
-		c.mu.RUnlock()
-		if alreadyHooked {
-			return
-		}
-		c.IngestRawChunk(pid, tid, connID, dir, payload, mode)
-	}); err == nil && eng != nil {
-		c.mu.Lock()
-		c.ebpfEngine = eng
-		c.mu.Unlock()
-		for i := range probes {
-			if len(probes[i].Symbols) > 0 {
-				probes[i].Attached = eng.Active()
-				probes[i].Note = fmt.Sprintf("eBPF kernel engine active (attached=%d)", eng.AttachedCount())
-			}
-		}
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "start_ebpf_engine", map[string]any{
-				"attached_count": eng.AttachedCount(),
-			})
-		}
-	}
-	c.mu.Lock()
-	c.probes = probes
-	c.mu.Unlock()
 	c.AnalyzePIDPlans()
-
-	go c.tailPipeLoop(ctx, pipePath)
-	go c.periodicSubtreeRefresh(ctx)
+	c.mu.Lock()
+	select {
+	case <-c.stopCh:
+		c.mu.Unlock()
+		return fmt.Errorf("collector is stopped")
+	default:
+		c.periodicStarted = true
+		go func() {
+			defer close(c.periodicDoneCh)
+			c.periodicSubtreeRefresh(ctx)
+		}()
+	}
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *Collector) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
+		c.Flush()
+		c.sourcesMu.RLock()
+		sources := append([]Source(nil), c.sources...)
+		c.sourcesMu.RUnlock()
+		for _, src := range sources {
+			if src != nil {
+				_ = src.Close()
+			}
+		}
+		if c.tracker != nil {
+			c.tracker.Close()
+		}
+		c.flushSuppressedDrops()
+
 		c.mu.RLock()
-		ln := c.listener
 		sock := c.sockPath
+		pipe := c.pipePath
 		tap := c.loopbackTap
 		ebpf := c.ebpfEngine
+		stagedJars := append([]string(nil), c.stagedAgentJars...)
 		c.mu.RUnlock()
-		if ln != nil {
-			_ = ln.Close()
-		}
 		if tap != nil {
 			tap.Close()
 		}
@@ -232,17 +375,29 @@ func (c *Collector) Stop() {
 			ebpf.Close()
 		}
 		if sock != "" {
-			_ = os.Remove(sock)
+			_ = removeSocketNoFollow(sock)
+		}
+		if pipe != "" {
+			_ = truncateAndRemovePipeNoFollow(pipe)
+		}
+		for _, jar := range stagedJars {
+			if jar != "" {
+				_ = os.Remove(jar)
+			}
 		}
 	})
+	c.mu.RLock()
+	started := c.periodicStarted
+	c.mu.RUnlock()
+	if started {
+		<-c.periodicDoneCh
+	}
 }
 
 func (c *Collector) Probes() []ProbeTarget {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]ProbeTarget, len(c.probes))
-	copy(out, c.probes)
-	return out
+	return deduplicateProbes(c.probes)
 }
 
 func (c *Collector) Scope() model.ScopeFilter {
@@ -252,6 +407,7 @@ func (c *Collector) Scope() model.ScopeFilter {
 func (c *Collector) UpdateScope(scope model.ScopeFilter) {
 	c.tracker.SetScope(scope)
 	c.reassembler.SetScope(scope.RecordHeaders, scope.Hosts)
+	c.ensureHookChannelPermissions(scope.PIDs)
 	probes := ProbeAndRecordTargets(scope.PIDs, scope.Exes, c.mon)
 	c.mu.RLock()
 	ebpf := c.ebpfEngine
@@ -260,7 +416,7 @@ func (c *Collector) UpdateScope(scope model.ScopeFilter) {
 		ebpf.AttachTargets(probes)
 	}
 	c.mu.Lock()
-	c.probes = probes
+	c.probes = deduplicateProbes(probes)
 	c.mu.Unlock()
 	if c.AutoInjectLive() {
 		c.AutoInjectMatchingPIDs()
@@ -294,7 +450,7 @@ func (c *Collector) AttachBinaryTargets(exes ...string) []ProbeTarget {
 		ebpf.AttachTargets(extra)
 	}
 	c.mu.Lock()
-	c.probes = append(c.probes, extra...)
+	c.probes = appendUniqueProbes(c.probes, extra...)
 	c.mu.Unlock()
 	return extra
 }
@@ -313,6 +469,34 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 		}
 		return 127, err
 	}
+	return c.LaunchPlannedCommand(ctx, plan, env)
+}
+
+// LaunchPlannedCommand executes a pre-computed LaunchAttachPlan with the given environment,
+// registers the spawned child PID in ProcessTracker, and waits for completion.
+func (c *Collector) LaunchPlannedCommand(ctx context.Context, plan *LaunchAttachPlan, env []string) (int, error) {
+	if plan == nil || strings.TrimSpace(plan.ExecBin) == "" {
+		return 1, fmt.Errorf("empty launch plan")
+	}
+	cmdArgs := plan.OriginalCmd
+	if len(cmdArgs) == 0 {
+		cmdArgs = append([]string{plan.ExecBin}, plan.ExecArgs...)
+	}
+	if plan.InjectedEnv != nil {
+		delete(plan.InjectedEnv, "LLM_TRACER_INGEST_TOKEN")
+	}
+	c.mu.Lock()
+	c.probes = deduplicateProbes(c.probes)
+	if c.lastLaunchPlan != nil && c.lastLaunchPlan.InjectedEnv != nil {
+		delete(c.lastLaunchPlan.InjectedEnv, "LLM_TRACER_INGEST_TOKEN")
+	}
+	c.mu.Unlock()
+	if len(env) == 0 {
+		env = os.Environ()
+	}
+	// Strip every llm-tracer credential (TOTP secret, tokens) plus generic
+	// *_TOKEN/*_SECRET style keys so an observed agent cannot read them back.
+	env = StripSensitiveEnvKeys(env)
 
 	cmd := exec.CommandContext(ctx, plan.ExecBin, plan.ExecArgs...)
 	cmd.Stdin = os.Stdin
@@ -340,19 +524,20 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 			PID:    childPID,
 			Comm:   info.Comm,
 			Detail: map[string]any{
-				"args":                    cmdArgs,
-				"exe":                     plan.BinaryPath,
-				"detected_stack":          plan.DetectedStack,
-				"non_intrusive_ok":        plan.NonIntrusiveOK,
+				"args":                     cmdArgs,
+				"exe":                      plan.BinaryPath,
+				"detected_stack":           plan.DetectedStack,
+				"non_intrusive_ok":         plan.NonIntrusiveOK,
 				"auto_intrusive_triggered": plan.AutoIntrusiveTriggered,
-				"injected_args":           plan.InjectedArgs,
-				"intrusive_methods":       plan.IntrusiveMethods,
+				"injected_args":            plan.InjectedArgs,
+				"intrusive_methods":        plan.IntrusiveMethods,
 			},
 		})
 	}
 
-	err = cmd.Wait()
+	err := cmd.Wait()
 	c.Flush()
+	c.tracker.MarkRootExited(childPID)
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -378,11 +563,63 @@ func (c *Collector) LaunchCommand(ctx context.Context, cmdArgs []string) (int, e
 	return exitCode, err
 }
 
+func probeTargetKey(p ProbeTarget) string {
+	bin := filepath.Clean(p.BinaryPath)
+	if realBin, err := filepath.EvalSymlinks(bin); err == nil && realBin != "" {
+		bin = realBin
+	}
+	return bin + "\x00" + p.Type
+}
+
+func appendUniqueProbes(dst []ProbeTarget, extra ...ProbeTarget) []ProbeTarget {
+	out := make([]ProbeTarget, 0, len(dst)+len(extra))
+	idxByKey := make(map[string]int, len(dst)+len(extra))
+	add := func(p ProbeTarget) {
+		key := probeTargetKey(p)
+		if idx, exists := idxByKey[key]; exists {
+			cur := &out[idx]
+			if p.Attached {
+				cur.Attached = true
+			}
+			if cur.Note == "" && p.Note != "" {
+				cur.Note = p.Note
+			}
+			if cur.LinkMode == "" && p.LinkMode != "" {
+				cur.LinkMode = p.LinkMode
+			}
+			if cur.GoVersion == "" && p.GoVersion != "" {
+				cur.GoVersion = p.GoVersion
+			}
+			if len(cur.Symbols) == 0 && len(p.Symbols) > 0 {
+				cur.Symbols = p.Symbols
+			}
+			if len(cur.GoTLSReadRetOffsets) == 0 && len(p.GoTLSReadRetOffsets) > 0 {
+				cur.GoTLSReadRetOffsets = p.GoTLSReadRetOffsets
+			}
+			return
+		}
+		idxByKey[key] = len(out)
+		out = append(out, p)
+	}
+	for _, p := range dst {
+		add(p)
+	}
+	for _, p := range extra {
+		add(p)
+	}
+	return out
+}
+
+func deduplicateProbes(probes []ProbeTarget) []ProbeTarget {
+	return appendUniqueProbes(nil, probes...)
+}
+
 // IngestRawChunk feeds a raw TLS plaintext frame into scope filtering and stream reassembly.
 func (c *Collector) IngestRawChunk(pid int, tid int, connID string, dir parser.Direction, payload []byte, tlsMode string) bool {
 	hint := model.ProcessInfo{PID: pid, TID: tid, TLSMode: tlsMode}
 	procInfo, matched := c.tracker.MatchAndEnrich(pid, hint)
 	if !matched {
+		c.recordOutOfScopeDrop(pid, procInfo, tlsMode, len(payload))
 		return false
 	}
 	connKey := fmt.Sprintf("%d:%s", pid, connID)
@@ -409,6 +646,7 @@ func (c *Collector) IngestDirectExchange(in DirectExchangeInput) (*model.TraceEv
 	}
 	procInfo, matched := c.tracker.MatchAndEnrich(in.PID, hint)
 	if !matched {
+		c.recordOutOfScopeDrop(in.PID, procInfo, in.TLSMode, len(in.RequestBody)+len(in.ResponseBody))
 		return nil, false, nil
 	}
 
@@ -431,7 +669,7 @@ func (c *Collector) IngestDirectExchange(in DirectExchangeInput) (*model.TraceEv
 	reqDecoded, _ := parser.DecompressBody(in.RequestBody, headerValueCI(in.RequestHeaders, "content-encoding"))
 	respDecoded, _ := parser.DecompressBody(in.ResponseBody, headerValueCI(in.ResponseHeaders, "content-encoding"))
 	proto := parser.DetectProtocol(in.Path, reqDecoded, respDecoded)
-	if proto == model.ProtocolUnknown && len(scope.Hosts) == 0 {
+	if proto == model.ProtocolUnknown && len(scope.Hosts) == 0 && !c.CaptureUnknown() {
 		return nil, false, nil
 	}
 
@@ -504,130 +742,147 @@ func (c *Collector) handleReassembledEvent(ev *model.TraceEvent) {
 	_, _ = c.store.SaveEvent(ev)
 }
 
-func (c *Collector) acceptLoop(ln net.Listener) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-c.stopCh:
-				return
-			default:
-				continue
-			}
+func (c *Collector) ingestFromSource(pid, tid int, connID string, dir parser.Direction, payload []byte, tlsMode string) {
+	c.IngestRawChunk(pid, tid, connID, dir, payload, tlsMode)
+}
+
+func (c *Collector) recordOutOfScopeDrop(pid int, procInfo model.ProcessInfo, tlsMode string, nBytes int) {
+	if c.mon == nil {
+		return
+	}
+	now := time.Now()
+	c.dropRateMu.Lock()
+	if c.dropRateByPID == nil {
+		c.dropRateByPID = make(map[int]*pidDropRateState)
+	}
+	st, ok := c.dropRateByPID[pid]
+	if !ok {
+		st = &pidDropRateState{}
+		c.dropRateByPID[pid] = st
+	}
+	if procInfo.Comm != "" {
+		st.comm = procInfo.Comm
+	}
+	if procInfo.Exe != "" {
+		st.exe = procInfo.Exe
+	}
+	if tlsMode != "" {
+		st.tlsMode = tlsMode
+	}
+	if !st.lastEmit.IsZero() && now.Sub(st.lastEmit) < outOfScopeDropRateWindow {
+		st.suppressedCount++
+		st.suppressedBytes += nBytes
+		c.dropRateMu.Unlock()
+		return
+	}
+	droppedCount := 1 + st.suppressedCount
+	totalBytes := nBytes + st.suppressedBytes
+	comm := st.comm
+	exe := st.exe
+	mode := st.tlsMode
+	st.lastEmit = now
+	st.suppressedCount = 0
+	st.suppressedBytes = 0
+	c.dropRateMu.Unlock()
+
+	c.mon.Record(selfmon.Event{
+		Status: selfmon.StatusWarn,
+		Stage:  selfmon.StageTracker,
+		Action: "ingest_out_of_scope_dropped",
+		PID:    pid,
+		Comm:   comm,
+		Bytes:  totalBytes,
+		Error:  "frame from out-of-scope process dropped",
+		Detail: map[string]any{
+			"pid":           pid,
+			"comm":          comm,
+			"exe":           exe,
+			"tls_mode":      mode,
+			"dropped_count": droppedCount,
+		},
+	})
+}
+
+func (c *Collector) flushSuppressedDrops() {
+	if c.mon == nil {
+		return
+	}
+	type pendingDrop struct {
+		pid   int
+		count int
+		bytes int
+		comm  string
+		exe   string
+		mode  string
+	}
+	var pending []pendingDrop
+	c.dropRateMu.Lock()
+	for pid, st := range c.dropRateByPID {
+		if st != nil && st.suppressedCount > 0 {
+			pending = append(pending, pendingDrop{
+				pid:   pid,
+				count: st.suppressedCount,
+				bytes: st.suppressedBytes,
+				comm:  st.comm,
+				exe:   st.exe,
+				mode:  st.tlsMode,
+			})
+			st.suppressedCount = 0
+			st.suppressedBytes = 0
+			st.lastEmit = time.Now()
 		}
-		c.handleHookConn(conn)
+	}
+	c.dropRateMu.Unlock()
+
+	for _, p := range pending {
+		c.mon.Record(selfmon.Event{
+			Status: selfmon.StatusWarn,
+			Stage:  selfmon.StageTracker,
+			Action: "ingest_out_of_scope_dropped",
+			PID:    p.pid,
+			Comm:   p.comm,
+			Bytes:  p.bytes,
+			Error:  "frame from out-of-scope process dropped (aggregated)",
+			Detail: map[string]any{
+				"pid":           p.pid,
+				"comm":          p.comm,
+				"exe":           p.exe,
+				"tls_mode":      p.mode,
+				"dropped_count": p.count,
+			},
+		})
 	}
 }
 
-func (c *Collector) handleHookConn(conn net.Conn) {
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	var hdr [24]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+func (c *Collector) markUserHookPID(pid int) {
+	if pid <= 0 {
 		return
-	}
-	magic := binary.NativeEndian.Uint32(hdr[0:4])
-	if magic != 0x4c4c4d54 {
-		return
-	}
-	pid := int(binary.NativeEndian.Uint32(hdr[4:8]))
-	tid := int(binary.NativeEndian.Uint32(hdr[8:12]))
-	sslLow := binary.NativeEndian.Uint32(hdr[12:16])
-	dirVal := binary.NativeEndian.Uint32(hdr[16:20])
-	payloadLen := binary.NativeEndian.Uint32(hdr[20:24])
-	if payloadLen == 0 || payloadLen > 512*1024 {
-		return
-	}
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return
-	}
-	dir := parser.DirWrite
-	if dirVal != 0 {
-		dir = parser.DirRead
 	}
 	c.mu.Lock()
 	c.userHookPIDs[pid] = true
 	c.mu.Unlock()
-	connID := fmt.Sprintf("ssl_%x", sslLow)
-	c.IngestRawChunk(pid, tid, connID, dir, payload, "openssl_hook")
+	if c.tracker != nil {
+		c.tracker.RecordUserHookPID(pid)
+	}
 }
 
-// Flush synchronously drains any pending TLS hook frames from the fallback pipe file.
-func (c *Collector) Flush() {
+func (c *Collector) isUserHookPID(pid int) bool {
 	c.mu.RLock()
-	pipePath := c.pipePath
-	ebpf := c.ebpfEngine
-	c.mu.RUnlock()
-	if ebpf != nil {
-		ebpf.Flush()
-	}
-	if pipePath == "" {
-		return
-	}
-	c.drainPipeFile(pipePath)
+	defer c.mu.RUnlock()
+	return c.userHookPIDs[pid]
 }
 
-func (c *Collector) drainPipeFile(pipePath string) {
-	c.pipeMu.Lock()
-	defer c.pipeMu.Unlock()
-	f, err := os.Open(pipePath)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.Size() < c.pipeOffset+24 {
-		return
-	}
-	_, _ = f.Seek(c.pipeOffset, io.SeekStart)
-	for {
-		var hdr [24]byte
-		if _, err := io.ReadFull(f, hdr[:]); err != nil {
-			break
-		}
-		magic := binary.NativeEndian.Uint32(hdr[0:4])
-		if magic != 0x4c4c4d54 {
-			break
-		}
-		pid := int(binary.NativeEndian.Uint32(hdr[4:8]))
-		tid := int(binary.NativeEndian.Uint32(hdr[8:12]))
-		sslLow := binary.NativeEndian.Uint32(hdr[12:16])
-		dirVal := binary.NativeEndian.Uint32(hdr[16:20])
-		payloadLen := binary.NativeEndian.Uint32(hdr[20:24])
-		if payloadLen == 0 || payloadLen > 512*1024 {
-			break
-		}
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(f, payload); err != nil {
-			break
-		}
-		c.pipeOffset += 24 + int64(payloadLen)
-		dir := parser.DirWrite
-		if dirVal != 0 {
-			dir = parser.DirRead
-		}
-		c.mu.Lock()
-		c.userHookPIDs[pid] = true
-		c.mu.Unlock()
-		connID := fmt.Sprintf("ssl_%x", sslLow)
-		c.IngestRawChunk(pid, tid, connID, dir, payload, "openssl_hook")
-	}
-}
-
-func (c *Collector) tailPipeLoop(ctx context.Context, pipePath string) {
-	ticker := time.NewTicker(80 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			c.drainPipeFile(pipePath)
+// Flush synchronously drains any pending frames from registered capture sources.
+func (c *Collector) Flush() {
+	c.sourcesMu.RLock()
+	sources := append([]Source(nil), c.sources...)
+	c.sourcesMu.RUnlock()
+	for _, src := range sources {
+		if flusher, ok := src.(flushableSource); ok {
+			flusher.Flush()
 		}
 	}
+	c.flushSuppressedDrops()
 }
 
 func (c *Collector) periodicSubtreeRefresh(ctx context.Context) {
@@ -641,6 +896,7 @@ func (c *Collector) periodicSubtreeRefresh(ctx context.Context) {
 			return
 		case <-ticker.C:
 			c.tracker.RefreshSubtree()
+			c.ensureHookChannelPermissions(nil)
 			if c.AutoInjectLive() {
 				c.AutoInjectMatchingPIDs()
 			} else {
@@ -648,6 +904,134 @@ func (c *Collector) periodicSubtreeRefresh(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (c *Collector) ensureHookChannelPermissions(pids []int) {
+	perm, targetUID, hasCross := c.resolveCrossUIDState(pids)
+
+	c.permMu.Lock()
+	wasRelaxed := c.channelRelaxed
+	prevUID := c.channelTargetUID
+	hooksDir := c.hooksDir
+	if !hasCross && !wasRelaxed {
+		c.permMu.Unlock()
+		return
+	}
+	c.channelRelaxed = hasCross
+	c.channelTargetUID = targetUID
+	c.permMu.Unlock()
+
+	if hooksDir != "" {
+		if hasCross {
+			_ = setHooksDirModeNoFollow(hooksDir, 0o711)
+		} else {
+			_ = setHooksDirModeNoFollow(hooksDir, 0o700)
+		}
+	}
+
+	if hasCross && wasRelaxed && prevUID == targetUID {
+		return
+	}
+
+	c.mu.RLock()
+	pipePath := c.pipePath
+	sockPath := c.sockPath
+	c.mu.RUnlock()
+	permDenied := false
+	if pipePath != "" {
+		if err := applyPipePermissionsNoFollow(pipePath, perm, targetUID); errors.Is(err, errCrossUIDPermissionDenied) {
+			permDenied = true
+		}
+	}
+	if sockPath != "" {
+		if err := applySocketPermissionsNoFollow(sockPath, perm, targetUID); errors.Is(err, errCrossUIDPermissionDenied) {
+			permDenied = true
+		}
+	}
+	if permDenied {
+		if hooksDir != "" {
+			_ = setHooksDirModeNoFollow(hooksDir, 0o700)
+		}
+		if c.mon != nil {
+			c.mon.RecordWarn(
+				selfmon.StageProbe,
+				"cross_uid_channel_denied",
+				"refusing world-readable 0666 mode for cross-UID target; keeping 0600 private channel",
+				map[string]any{"target_uid": targetUID, "pipe": pipePath, "sock": sockPath},
+			)
+		}
+	}
+}
+
+func (c *Collector) resolveCrossUIDState(extraPIDs []int) (os.FileMode, int, bool) {
+	seenPIDs := make(map[int]bool)
+	var candidates []int
+	addPID := func(pid int) {
+		if pid > 0 && !seenPIDs[pid] {
+			seenPIDs[pid] = true
+			candidates = append(candidates, pid)
+		}
+	}
+	for _, pid := range extraPIDs {
+		addPID(pid)
+	}
+	if c.tracker != nil {
+		for _, pid := range c.tracker.GetScope().PIDs {
+			addPID(pid)
+		}
+		for _, pid := range c.tracker.DiscoverMatchingPIDs() {
+			addPID(pid)
+		}
+	}
+	c.mu.RLock()
+	for pid := range c.liveInjectedPIDs {
+		addPID(pid)
+	}
+	c.mu.RUnlock()
+
+	selfUID := getEffectiveUID()
+	if selfUID < 0 {
+		return 0o600, -1, false
+	}
+	crossUIDs := make(map[int]bool)
+	var singleUID int
+	for _, pid := range candidates {
+		uid, ok := lookupProcessUID(pid)
+		if !ok || uid < 0 || uid == selfUID {
+			continue
+		}
+		crossUIDs[uid] = true
+		singleUID = uid
+	}
+	switch len(crossUIDs) {
+	case 0:
+		return 0o600, -1, false
+	case 1:
+		return 0o600, singleUID, true
+	default:
+		return 0o600, -2, true
+	}
+}
+
+func hasCrossUIDTarget(pids []int) bool {
+	for _, pid := range pids {
+		if isCrossUIDProcess(pid) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCrossUIDProcess(pid int) bool {
+	if pid <= 0 || runtime.GOOS == "windows" {
+		return false
+	}
+	selfUID := getEffectiveUID()
+	if selfUID < 0 {
+		return false
+	}
+	uid, ok := lookupProcessUID(pid)
+	return ok && uid >= 0 && uid != selfUID
 }
 
 func headerValueCI(hdrs map[string]string, key string) string {

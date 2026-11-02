@@ -37,17 +37,17 @@ type ScopeFilter struct {
 }
 
 type SystemOneQuestion struct {
-	ID           string            `json:"id"`
-	Type         string            `json:"type"` // choice | score | noul
-	Goal         string            `json:"goal,omitempty"`
-	Operation    string            `json:"operation,omitempty"`
-	Guides       []string          `json:"guides,omitempty"`
-	Options      map[string]string `json:"options,omitempty"`
-	OptionOrder  []string          `json:"option_order,omitempty"`
-	AnswerChoice string            `json:"answer_choice,omitempty"`
-	TopChoice    string            `json:"top_choice,omitempty"`
-	UsedArgmax   bool              `json:"used_argmax,omitempty"`
-	Confidence   float64           `json:"confidence"`
+	ID           string             `json:"id"`
+	Type         string             `json:"type"` // choice | score | noul
+	Goal         string             `json:"goal,omitempty"`
+	Operation    string             `json:"operation,omitempty"`
+	Guides       []string           `json:"guides,omitempty"`
+	Options      map[string]string  `json:"options,omitempty"`
+	OptionOrder  []string           `json:"option_order,omitempty"`
+	AnswerChoice string             `json:"answer_choice,omitempty"`
+	TopChoice    string             `json:"top_choice,omitempty"`
+	UsedArgmax   bool               `json:"used_argmax,omitempty"`
+	Confidence   float64            `json:"confidence"`
 	Probs        map[string]float64 `json:"probabilities,omitempty"`
 }
 
@@ -60,20 +60,20 @@ type SystemOnePageSummary struct {
 }
 
 type SystemOneStepSummary struct {
-	Model             string                 `json:"model"`
-	Goal              string                 `json:"goal,omitempty"`
-	Page              SystemOnePageSummary   `json:"page"`
-	RecentActionCount int                    `json:"recent_action_count"`
-	RecentActions     []map[string]any       `json:"recent_actions,omitempty"`
-	SelectedOp        string                 `json:"selected_operation,omitempty"`
-	SelectedTarget    string                 `json:"selected_target,omitempty"`
-	SelectedElement   string                 `json:"selected_element,omitempty"`
-	SelectedText      string                 `json:"selected_text,omitempty"`
-	OpConfidence      float64                `json:"op_confidence"`
-	TargetConfidence  float64                `json:"target_confidence,omitempty"`
-	Questions         []SystemOneQuestion    `json:"questions,omitempty"`
-	QuestionsUsed     []string               `json:"questions_used,omitempty"`
-	FallbackReason    string                 `json:"fallback_reason,omitempty"`
+	Model             string               `json:"model"`
+	Goal              string               `json:"goal,omitempty"`
+	Page              SystemOnePageSummary `json:"page"`
+	RecentActionCount int                  `json:"recent_action_count"`
+	RecentActions     []map[string]any     `json:"recent_actions,omitempty"`
+	SelectedOp        string               `json:"selected_operation,omitempty"`
+	SelectedTarget    string               `json:"selected_target,omitempty"`
+	SelectedElement   string               `json:"selected_element,omitempty"`
+	SelectedText      string               `json:"selected_text,omitempty"`
+	OpConfidence      float64              `json:"op_confidence"`
+	TargetConfidence  float64              `json:"target_confidence,omitempty"`
+	Questions         []SystemOneQuestion  `json:"questions,omitempty"`
+	QuestionsUsed     []string             `json:"questions_used,omitempty"`
+	FallbackReason    string               `json:"fallback_reason,omitempty"`
 }
 
 type ToolCallItem struct {

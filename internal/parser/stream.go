@@ -1,21 +1,15 @@
 package parser
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -24,6 +18,16 @@ type Direction int
 const (
 	DirWrite Direction = 0 // Client -> Server (Request)
 	DirRead  Direction = 1 // Server -> Client (Response)
+
+	ConnIdleTimeout             = 2 * time.Minute
+	MaxConnBufferBytes          = 8 * 1024 * 1024  // 8 MiB per-buffer cap
+	MaxTotalBufferBytes         = 64 * 1024 * 1024 // 64 MiB global buffer budget across all connections
+	MaxNonHTTPPrefixBytes       = 4096             // 4 KiB cap for non-HTTP prefix / orphan response bytes
+	MaxUnknownWarnHosts         = 256              // max distinct hosts tracked in unknownWarnState (LRU)
+	MaxH2StreamsPerConn         = 256              // max concurrent HTTP/2 streams tracked per connection
+	MaxTrackedConns             = 4096             // max concurrent connections tracked
+	UnknownProtocolWarnInterval = 10 * time.Second
+	connSweepInterval           = 64
 )
 
 type RawTLSChunk struct {
@@ -36,77 +40,53 @@ type RawTLSChunk struct {
 
 type EventHandler func(ev *model.TraceEvent)
 
-type StreamReassembler struct {
-	mu            sync.Mutex
-	conns         map[string]*connBuffer
-	recordHeaders bool
-	hostFilter    []string
-	mon           *selfmon.Monitor
-	onEvent       EventHandler
+type unknownHostWarnState struct {
+	lastWarnMs      int64
+	suppressedCount int
+	suppressedBytes int
 }
 
-type h2StreamState struct {
-	streamID    uint32
-	startedAt   int64
-	method      string
-	scheme      string
-	authority   string
-	path        string
-	reqHeaders  map[string]string
-	respHeaders map[string]string
-	status      int
-	reqBody     bytes.Buffer
-	respBody    bytes.Buffer
-	reqEnded    bool
-	respEnded   bool
-	eventID     string
-	chunks      int
+type StreamReassembler struct {
+	mu               sync.Mutex
+	conns            map[string]*connBuffer
+	recordHeaders    bool
+	hostFilter       []string
+	dropUnknown      bool
+	maxTotalBytes    int
+	mon              *selfmon.Monitor
+	onEvent          EventHandler
+	ingestCount      uint64
+	lastSweepTs      int64
+	unknownWarnState map[string]*unknownHostWarnState
 }
 
 type connBuffer struct {
-	key        string
-	process    model.ProcessInfo
-	isHTTP2    bool
-	reqBuf     bytes.Buffer
-	respBuf    bytes.Buffer
-	activeH1   *activeH1Exchange
-	h2ReqBuf   bytes.Buffer
-	h2RespBuf  bytes.Buffer
-	h2Streams  map[uint32]*h2StreamState
-	reqDecoder *hpack.Decoder
-	rspDecoder *hpack.Decoder
-	updatedAt  int64
+	key             string
+	process         model.ProcessInfo
+	isHTTP2         bool
+	reqBuf          bytes.Buffer
+	respBuf         bytes.Buffer
+	activeH1        *activeH1Exchange
+	h2ReqBuf        bytes.Buffer
+	h2RespBuf       bytes.Buffer
+	h2Streams       map[uint32]*h2StreamState
+	reqDecoder      *hpack.Decoder
+	rspDecoder      *hpack.Decoder
+	updatedAt       int64
+	truncWarned     bool
+	truncSuppressed int
 }
-
-type activeH1Exchange struct {
-	eventID         string
-	startedAt       int64
-	method          string
-	host            string
-	path            string
-	httpVersion     string
-	reqHeaders      map[string]string
-	reqBody         []byte
-	respHeaderParsed bool
-	httpStatus      int
-	respHeaders     map[string]string
-	contentEncoding string
-	isChunked       bool
-	isSSE           bool
-	contentLength   int64
-	respRawBody     bytes.Buffer
-	streamChunks    int
-}
-
-const http2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 func NewStreamReassembler(recordHeaders bool, hostFilter []string, mon *selfmon.Monitor, onEvent EventHandler) *StreamReassembler {
 	return &StreamReassembler{
-		conns:         make(map[string]*connBuffer),
-		recordHeaders: recordHeaders,
-		hostFilter:    hostFilter,
-		mon:           mon,
-		onEvent:       onEvent,
+		conns:            make(map[string]*connBuffer),
+		recordHeaders:    recordHeaders,
+		hostFilter:       hostFilter,
+		dropUnknown:      true,
+		maxTotalBytes:    MaxTotalBufferBytes,
+		mon:              mon,
+		onEvent:          onEvent,
+		unknownWarnState: make(map[string]*unknownHostWarnState),
 	}
 }
 
@@ -115,6 +95,52 @@ func (sr *StreamReassembler) SetScope(recordHeaders bool, hostFilter []string) {
 	defer sr.mu.Unlock()
 	sr.recordHeaders = recordHeaders
 	sr.hostFilter = hostFilter
+}
+
+// SetDropUnknown configures whether unknown-protocol exchanges are dropped when hostFilter is empty.
+// It defaults to true and is exposed for CLI / collector flag passthrough (wired by G9).
+func (sr *StreamReassembler) SetDropUnknown(drop bool) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	sr.dropUnknown = drop
+	sr.unknownWarnState = make(map[string]*unknownHostWarnState)
+}
+
+// DropUnknown returns whether unknown-protocol exchanges are currently dropped when hostFilter is empty.
+func (sr *StreamReassembler) DropUnknown() bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.dropUnknown
+}
+
+// SetMaxTotalBufferBytes configures the global buffer byte budget across all active connections.
+// When total buffered bytes exceed this limit, the oldest connections are evicted first.
+// Passing maxBytes <= 0 restores the default MaxTotalBufferBytes (64 MiB).
+func (sr *StreamReassembler) SetMaxTotalBufferBytes(maxBytes int) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	if maxBytes <= 0 {
+		maxBytes = MaxTotalBufferBytes
+	}
+	sr.maxTotalBytes = maxBytes
+}
+
+// TotalBufferBytes returns the current sum of buffered bytes across all tracked connections.
+func (sr *StreamReassembler) TotalBufferBytes() int {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.totalBufferBytesLocked()
+}
+
+func (cb *connBuffer) totalBytes() int {
+	total := cb.reqBuf.Len() + cb.respBuf.Len() + cb.h2ReqBuf.Len() + cb.h2RespBuf.Len()
+	if cb.activeH1 != nil {
+		total += len(cb.activeH1.reqBody) + cb.activeH1.respRawBody.Len()
+	}
+	for _, st := range cb.h2Streams {
+		total += st.reqBody.Len() + st.respBody.Len()
+	}
+	return total
 }
 
 func (sr *StreamReassembler) IngestChunk(chunk RawTLSChunk) {
@@ -126,6 +152,12 @@ func (sr *StreamReassembler) IngestChunk(chunk RawTLSChunk) {
 	}
 
 	sr.mu.Lock()
+	sr.ingestCount++
+	if sr.ingestCount%connSweepInterval == 0 || sr.lastSweepTs == 0 ||
+		chunk.Timestamp-sr.lastSweepTs >= 10_000 || chunk.Timestamp < sr.lastSweepTs {
+		sr.evictIdleConnsLocked(chunk.Timestamp)
+	}
+
 	cb, ok := sr.conns[chunk.ConnKey]
 	if !ok {
 		cb = &connBuffer{
@@ -139,6 +171,7 @@ func (sr *StreamReassembler) IngestChunk(chunk RawTLSChunk) {
 	if chunk.Process.PID != 0 {
 		cb.process = chunk.Process
 	}
+	prevUpdatedAt := cb.updatedAt
 	cb.updatedAt = chunk.Timestamp
 
 	if !cb.isHTTP2 && bytes.Contains(chunk.Data, []byte(http2ClientPreface)) {
@@ -146,504 +179,329 @@ func (sr *StreamReassembler) IngestChunk(chunk RawTLSChunk) {
 	}
 	if cb.isHTTP2 {
 		sr.handleHTTP2Locked(cb, chunk)
+		if sr.enforceConnBufferLimitsLocked(cb) && prevUpdatedAt > 0 && prevUpdatedAt < chunk.Timestamp {
+			cb.updatedAt = prevUpdatedAt
+		}
+		sr.enforceGlobalBufferBudgetLocked(cb.key, chunk.Timestamp)
 		sr.mu.Unlock()
 		return
 	}
 
+	var validProgress bool
+	var truncated bool
 	if chunk.Direction == DirWrite {
 		cb.reqBuf.Write(chunk.Data)
-		sr.tryParseH1RequestLocked(cb, chunk.Timestamp)
+		if cb.reqBuf.Len() > MaxConnBufferBytes {
+			truncated = sr.enforceConnBufferLimitsLocked(cb)
+		} else {
+			validProgress = sr.tryParseH1RequestLocked(cb, chunk.Timestamp)
+			truncated = sr.enforceConnBufferLimitsLocked(cb)
+		}
 	} else {
 		cb.respBuf.Write(chunk.Data)
-		sr.tryParseH1ResponseLocked(cb, chunk.Timestamp)
+		if cb.respBuf.Len() > MaxConnBufferBytes {
+			truncated = sr.enforceConnBufferLimitsLocked(cb)
+		} else {
+			validProgress = sr.tryParseH1ResponseLocked(cb, chunk.Timestamp)
+			truncated = sr.enforceConnBufferLimitsLocked(cb)
+		}
 	}
+	if (truncated || !validProgress) && prevUpdatedAt > 0 && prevUpdatedAt < chunk.Timestamp {
+		cb.updatedAt = prevUpdatedAt
+	}
+	sr.enforceGlobalBufferBudgetLocked(cb.key, chunk.Timestamp)
 	sr.mu.Unlock()
 }
 
-func (sr *StreamReassembler) tryParseH1RequestLocked(cb *connBuffer, ts int64) {
-	if cb.activeH1 != nil {
-		return
+// EvictIdleConns removes connections whose updatedAt is older than nowMs - ConnIdleTimeout.
+// Contract:
+//   - Safe for concurrent invocation by an external periodic ticker (e.g. collector housekeeping loop)
+//     so idle connections are reclaimed even when no new TLS chunks arrive.
+//   - Passing nowMs <= 0 uses time.Now().UnixMilli().
+//   - Any in-flight HTTP/1.1 or HTTP/2 exchange (including request-only exchanges that never received
+//     response headers, or partial SSE streams) is emitted as a terminal "incomplete" TraceEvent
+//     with an explicit reason in TraceEvent.Error so store persists it to disk.
+func (sr *StreamReassembler) EvictIdleConns(nowMs int64) int {
+	if nowMs <= 0 {
+		nowMs = time.Now().UnixMilli()
 	}
-	data := cb.reqBuf.Bytes()
-	reqStart := findHTTPRequestStart(data)
-	if reqStart < 0 {
-		if bytes.Contains(data, []byte("\r\n\r\n")) || len(data) > 4096 {
-			cb.reqBuf.Reset()
-		}
-		return
-	}
-	if reqStart > 0 {
-		cb.reqBuf.Next(reqStart)
-		data = cb.reqBuf.Bytes()
-	}
-	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
-	if headerEnd < 0 {
-		return
-	}
-	reqReader := bufio.NewReader(bytes.NewReader(data))
-	req, err := http.ReadRequest(reqReader)
-	if err != nil {
-		cb.reqBuf.Next(headerEnd + 4)
-		return
-	}
-	defer req.Body.Close()
-
-	var bodyBytes []byte
-	if req.ContentLength > 0 {
-		totalNeeded := headerEnd + 4 + int(req.ContentLength)
-		if len(data) < totalNeeded {
-			return // Wait for remaining request body bytes
-		}
-		bodyBytes = make([]byte, req.ContentLength)
-		_, _ = io.ReadFull(req.Body, bodyBytes)
-		cb.reqBuf.Next(totalNeeded)
-	} else if len(req.TransferEncoding) > 0 && req.TransferEncoding[0] == "chunked" {
-		decoded, consumed, complete := decodeChunkedAvailable(data[headerEnd+4:])
-		if !complete {
-			return
-		}
-		bodyBytes = decoded
-		cb.reqBuf.Next(headerEnd + 4 + consumed)
-	} else {
-		cb.reqBuf.Next(headerEnd + 4)
-	}
-
-	contentEnc := req.Header.Get("Content-Encoding")
-	decodedReq, err := DecompressBody(bodyBytes, contentEnc)
-	if err != nil && sr.mon != nil {
-		sr.mon.RecordWarn(selfmon.StageStream, "decompress_request", err.Error(), map[string]any{
-			"pid": cb.process.PID, "encoding": contentEnc,
-		})
-	}
-
-	reqHeaders := map[string]string{}
-	if sr.recordHeaders {
-		for k, vals := range req.Header {
-			reqHeaders[k] = strings.Join(vals, ", ")
-		}
-	}
-
-	cb.activeH1 = &activeH1Exchange{
-		eventID:     "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
-		startedAt:   ts,
-		method:      req.Method,
-		host:        req.Host,
-		path:        req.URL.RequestURI(),
-		httpVersion: req.Proto,
-		reqHeaders:  reqHeaders,
-		reqBody:     decodedReq,
-	}
-	if cb.respBuf.Len() > 0 {
-		sr.tryParseH1ResponseLocked(cb, ts)
-	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.evictIdleConnsLocked(nowMs)
 }
 
-func (sr *StreamReassembler) tryParseH1ResponseLocked(cb *connBuffer, ts int64) {
-	ex := cb.activeH1
-	if ex == nil {
-		if !bytes.Contains(cb.respBuf.Bytes(), []byte("HTTP/1.")) && cb.respBuf.Len() > 4096 {
-			cb.respBuf.Reset()
-		}
-		return
-	}
-	data := cb.respBuf.Bytes()
-	if !ex.respHeaderParsed {
-		respStart := bytes.Index(data, []byte("HTTP/1."))
-		if respStart < 0 {
-			if bytes.Contains(data, []byte("\r\n\r\n")) || len(data) > 4096 {
-				cb.respBuf.Reset()
-			}
-			return
-		}
-		if respStart > 0 {
-			cb.respBuf.Next(respStart)
-			data = cb.respBuf.Bytes()
+func (sr *StreamReassembler) evictIdleConnsLocked(nowMs int64) int {
+	sr.lastSweepTs = nowMs
+	cutoffMs := nowMs - ConnIdleTimeout.Milliseconds()
+	for hostKey, st := range sr.unknownWarnState {
+		if st.lastWarnMs > 0 && st.lastWarnMs < cutoffMs {
+			delete(sr.unknownWarnState, hostKey)
 		}
 	}
-	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
-	if headerEnd < 0 {
-		return
-	}
-
-	if !ex.respHeaderParsed {
-		headerSection := data[:headerEnd+4]
-		resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(headerSection)), nil)
-		if err != nil {
-			return
-		}
-		ex.respHeaderParsed = true
-		ex.httpStatus = resp.StatusCode
-		ex.contentEncoding = resp.Header.Get("Content-Encoding")
-		ex.contentLength = resp.ContentLength
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		ex.isSSE = strings.Contains(ct, "text/event-stream")
-		te := strings.ToLower(strings.Join(resp.TransferEncoding, ","))
-		ex.isChunked = strings.Contains(te, "chunked") || strings.Contains(strings.ToLower(resp.Header.Get("Transfer-Encoding")), "chunked")
-		if sr.recordHeaders {
-			ex.respHeaders = make(map[string]string, len(resp.Header))
-			for k, vals := range resp.Header {
-				ex.respHeaders[k] = strings.Join(vals, ", ")
-			}
-		}
-	}
-
-	rawBodyBytes := data[headerEnd+4:]
-	if ex.isChunked {
-		decoded, consumed, complete := decodeChunkedAvailable(rawBodyBytes)
-		ex.streamChunks++
-		if ex.isSSE && isSSEDone(decoded) {
-			complete = true
-		}
-		if ex.isSSE && len(decoded) > 0 && !complete {
-			sr.emitH1ExchangeLocked(cb, ex, decoded, ts, false)
-		}
-		if complete {
-			sr.emitH1ExchangeLocked(cb, ex, decoded, ts, true)
-			cb.activeH1 = nil
-			if consumed > 0 && headerEnd+4+consumed <= cb.respBuf.Len() {
-				cb.respBuf.Next(headerEnd + 4 + consumed)
-			} else {
-				cb.respBuf.Reset()
-			}
-			sr.advanceKeepAliveLocked(cb, ts)
-		}
-		return
-	}
-
-	if ex.contentLength >= 0 {
-		if int64(len(rawBodyBytes)) < ex.contentLength {
-			if ex.isSSE && len(rawBodyBytes) > 0 {
-				ex.streamChunks++
-				sr.emitH1ExchangeLocked(cb, ex, rawBodyBytes, ts, false)
-			}
-			return
-		}
-		finalBody := rawBodyBytes[:ex.contentLength]
-		sr.emitH1ExchangeLocked(cb, ex, finalBody, ts, true)
-		cb.activeH1 = nil
-		cb.respBuf.Next(headerEnd + 4 + int(ex.contentLength))
-		sr.advanceKeepAliveLocked(cb, ts)
-		return
-	}
-
-	// Streaming without Content-Length or Chunked
-	if ex.isSSE {
-		ex.streamChunks++
-		done := isSSEDone(rawBodyBytes)
-		sr.emitH1ExchangeLocked(cb, ex, rawBodyBytes, ts, done)
-		if done {
-			cb.activeH1 = nil
-			cb.respBuf.Reset()
-			sr.advanceKeepAliveLocked(cb, ts)
-		}
-	} else if len(rawBodyBytes) > 0 {
-		decoded, err := DecompressBody(rawBodyBytes, ex.contentEncoding)
-		if err == nil && json.Valid(decoded) {
-			sr.emitH1ExchangeLocked(cb, ex, rawBodyBytes, ts, true)
-			cb.activeH1 = nil
-			cb.respBuf.Reset()
-			sr.advanceKeepAliveLocked(cb, ts)
-		}
-	}
-}
-
-func isSSEDone(b []byte) bool {
-	return bytes.Contains(b, []byte("[DONE]")) ||
-		bytes.Contains(b, []byte(`"type":"message_stop"`)) ||
-		bytes.Contains(b, []byte(`"type": "message_stop"`)) ||
-		bytes.Contains(b, []byte(`"type":"response.completed"`)) ||
-		bytes.Contains(b, []byte(`"type": "response.completed"`)) ||
-		bytes.Contains(b, []byte(`"finishReason":"STOP"`)) ||
-		bytes.Contains(b, []byte(`"finishReason": "STOP"`))
-}
-
-func (sr *StreamReassembler) advanceKeepAliveLocked(cb *connBuffer, ts int64) {
-	if cb.reqBuf.Len() > 0 {
-		sr.tryParseH1RequestLocked(cb, ts)
-	}
-	if cb.activeH1 != nil && cb.respBuf.Len() > 0 {
-		sr.tryParseH1ResponseLocked(cb, ts)
-	}
-}
-
-func (sr *StreamReassembler) emitH1ExchangeLocked(cb *connBuffer, ex *activeH1Exchange, rawResp []byte, ts int64, complete bool) {
-	if !sr.matchesHost(ex.host) {
-		return
-	}
-	decodedResp, err := DecompressBody(rawResp, ex.contentEncoding)
-	if err != nil && complete && sr.mon != nil {
-		sr.mon.RecordWarn(selfmon.StageStream, "decompress_response", err.Error(), map[string]any{
-			"pid": cb.process.PID, "host": ex.host, "path": ex.path,
-		})
-	}
-
-	proto := DetectProtocol(ex.path, ex.reqBody, decodedResp)
-	if proto == model.ProtocolUnknown && len( sr.hostFilter ) == 0 {
-		// Ignore non-LLM traffic when auto-sniffing
-		return
-	}
-
-	status := "streaming"
-	if complete {
-		status = "ok"
-		if ex.httpStatus >= 400 {
-			status = "error"
-		}
-	}
-	dur := ts - ex.startedAt
-	if dur < 0 {
-		dur = 0
-	}
-	ev := &model.TraceEvent{
-		ID:              ex.eventID,
-		Timestamp:       ex.startedAt,
-		DurationMs:      dur,
-		Status:          status,
-		HTTPStatus:      ex.httpStatus,
-		HTTPVersion:     ex.httpVersion,
-		Method:          ex.method,
-		Host:            ex.host,
-		Path:            ex.path,
-		URL:             fmt.Sprintf("https://%s%s", ex.host, ex.path),
-		Protocol:        proto,
-		Process:         cb.process,
-		HeadersRecorded: sr.recordHeaders,
-		RequestHeaders:  ex.reqHeaders,
-		ResponseHeaders: ex.respHeaders,
-		RequestBytes:    len(ex.reqBody),
-		ResponseBytes:   len(decodedResp),
-		StreamChunks:    ex.streamChunks,
-	}
-	if err := ParseExchange(ev, ex.reqBody, decodedResp, ex.isSSE); err != nil {
-		if sr.mon != nil && complete {
-			sr.mon.RecordError(selfmon.StageParser, "parse_"+string(proto), err, map[string]any{
-				"pid": cb.process.PID, "path": ex.path,
-			})
-		}
-	} else if sr.mon != nil && complete {
-		sr.mon.Record(selfmon.Event{
-			Status:     selfmon.StatusOK,
-			Stage:      selfmon.StageParser,
-			Action:     "parse_" + string(proto),
-			PID:        cb.process.PID,
-			Comm:       cb.process.Comm,
-			DurationMs: dur,
-			Bytes:      len(ex.reqBody) + len(decodedResp),
-			Detail: map[string]any{
-				"host": ex.host, "path": ex.path, "http_status": ex.httpStatus,
-			},
-		})
-	}
-	if sr.onEvent != nil {
-		sr.onEvent(ev)
-	}
-}
-
-// HTTP/2 frame reassembly using golang.org/x/net/http2/hpack
-func (sr *StreamReassembler) handleHTTP2Locked(cb *connBuffer, chunk RawTLSChunk) {
-	if chunk.Direction == DirWrite {
-		data := chunk.Data
-		if idx := bytes.Index(data, []byte(http2ClientPreface)); idx >= 0 {
-			data = data[idx+len(http2ClientPreface):]
-		}
-		cb.h2ReqBuf.Write(data)
-		sr.consumeH2FramesLocked(cb, &cb.h2ReqBuf, DirWrite, chunk.Timestamp)
-	} else {
-		cb.h2RespBuf.Write(chunk.Data)
-		sr.consumeH2FramesLocked(cb, &cb.h2RespBuf, DirRead, chunk.Timestamp)
-	}
-}
-
-func (sr *StreamReassembler) consumeH2FramesLocked(cb *connBuffer, buf *bytes.Buffer, dir Direction, ts int64) {
-	for buf.Len() >= 9 {
-		hdr := buf.Bytes()[:9]
-		length := int(uint32(hdr[0])<<16 | uint32(hdr[1])<<8 | uint32(hdr[2]))
-		frameType := hdr[3]
-		flags := hdr[4]
-		streamID := binary.BigEndian.Uint32(hdr[5:9]) & 0x7fffffff
-
-		if buf.Len() < 9+length {
-			return
-		}
-		payload := make([]byte, length)
-		buf.Next(9)
-		_, _ = buf.Read(payload)
-
-		if streamID == 0 {
+	evicted := 0
+	for _, cb := range sr.conns {
+		if cb.updatedAt >= cutoffMs {
 			continue
 		}
-		st, exists := cb.h2Streams[streamID]
-		if !exists {
-			st = &h2StreamState{
-				streamID:    streamID,
-				startedAt:   ts,
-				reqHeaders:  make(map[string]string),
-				respHeaders: make(map[string]string),
-				eventID:     "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
-			}
-			cb.h2Streams[streamID] = st
+		sr.evictConnLocked(cb, nowMs, "idle_timeout")
+		evicted++
+	}
+	return evicted
+}
+
+func (sr *StreamReassembler) evictConnLocked(cb *connBuffer, nowMs int64, reason string) {
+	if cb.activeH1 == nil && !cb.isHTTP2 && cb.reqBuf.Len() > 0 {
+		cb.activeH1 = sr.extractPartialH1RequestLocked(cb, cb.reqBuf.Bytes(), nowMs)
+	}
+	hadActiveH1 := cb.activeH1 != nil
+	if cb.activeH1 != nil {
+		ex := cb.activeH1
+		partialResp := sr.extractPartialH1ResponseBodyLocked(cb, ex)
+		errReason := reason + ": no response received"
+		if ex.respHeaderParsed || len(partialResp) > 0 {
+			errReason = reason + ": incomplete response"
 		}
+		sr.emitH1TerminalExchangeLocked(cb, ex, partialResp, nowMs, "incomplete", errReason)
+		cb.activeH1 = nil
+	}
+	if len(cb.h2Streams) > 0 {
+		streamIDs := make([]uint32, 0, len(cb.h2Streams))
+		for id := range cb.h2Streams {
+			streamIDs = append(streamIDs, id)
+		}
+		sort.Slice(streamIDs, func(i, j int) bool { return streamIDs[i] < streamIDs[j] })
+		for _, id := range streamIDs {
+			st := cb.h2Streams[id]
+			if st.method != "" || st.path != "" || st.reqBody.Len() > 0 || st.respBody.Len() > 0 {
+				errReason := reason + ": no response received"
+				if st.status > 0 || st.respBody.Len() > 0 {
+					errReason = reason + ": incomplete response"
+				}
+				sr.emitH2TerminalStreamLocked(cb, st, nowMs, "incomplete", errReason)
+			}
+			delete(cb.h2Streams, id)
+		}
+	}
+	if sr.mon != nil {
+		sr.mon.RecordWarn(selfmon.StageStream, "conn_evicted", "idle connection evicted", map[string]any{
+			"conn_key":   cb.key,
+			"pid":        cb.process.PID,
+			"updated_at": cb.updatedAt,
+			"active_h1":  hadActiveH1,
+			"reason":     reason,
+		})
+	}
+	delete(sr.conns, cb.key)
+}
 
-		endStream := (flags & 0x1) != 0
-		padded := (flags & 0x8) != 0
-		priority := (flags & 0x20) != 0
+func (sr *StreamReassembler) totalBufferBytesLocked() int {
+	total := 0
+	for _, cb := range sr.conns {
+		total += cb.totalBytes()
+	}
+	return total
+}
 
-		switch frameType {
-		case 0x0: // DATA
-			dataSlice := payload
-			if padded && len(dataSlice) > 0 {
-				padLen := int(dataSlice[0])
-				if 1+padLen <= len(dataSlice) {
-					dataSlice = dataSlice[1 : len(dataSlice)-padLen]
-				}
+func (sr *StreamReassembler) enforceGlobalBufferBudgetLocked(currentKey string, nowMs int64) {
+	limit := sr.maxTotalBytes
+	if limit <= 0 {
+		limit = MaxTotalBufferBytes
+	}
+	for (sr.totalBufferBytesLocked() > limit || len(sr.conns) > MaxTrackedConns) && len(sr.conns) > 0 {
+		var oldest *connBuffer
+		for k, cb := range sr.conns {
+			if k == currentKey && len(sr.conns) > 1 {
+				continue
 			}
-			if dir == DirWrite {
-				st.reqBody.Write(dataSlice)
-				if endStream {
-					st.reqEnded = true
-				}
-			} else {
-				st.respBody.Write(dataSlice)
-				st.chunks++
-				if endStream {
-					st.respEnded = true
-				} else if strings.Contains(strings.ToLower(st.respHeaders["content-type"]), "text/event-stream") && st.respBody.Len() > 0 {
-					sr.emitH2StreamLocked(cb, st, ts, false)
-				}
-			}
-		case 0x1: // HEADERS
-			frag := payload
-			if padded && len(frag) > 0 {
-				padLen := int(frag[0])
-				if 1+padLen <= len(frag) {
-					frag = frag[1 : len(frag)-padLen]
-				}
-			}
-			if priority && len(frag) >= 5 {
-				frag = frag[5:]
-			}
-			sr.decodeH2HeadersLocked(cb, st, frag, dir)
-			if endStream {
-				if dir == DirWrite {
-					st.reqEnded = true
-				} else {
-					st.respEnded = true
-				}
+			if oldest == nil || cb.updatedAt < oldest.updatedAt || (cb.updatedAt == oldest.updatedAt && cb.key < oldest.key) {
+				oldest = cb
 			}
 		}
+		if oldest == nil {
+			oldest = sr.conns[currentKey]
+		}
+		if oldest == nil {
+			break
+		}
+		sr.evictConnLocked(oldest, nowMs, "global_buffer_budget_exceeded")
+	}
+}
 
-		if st.respEnded {
-			sr.emitH2StreamLocked(cb, st, ts, true)
+func (sr *StreamReassembler) enforceConnBufferLimitsLocked(cb *connBuffer) bool {
+	truncated := false
+	ts := cb.updatedAt
+
+	if cb.reqBuf.Len() > MaxConnBufferBytes {
+		truncated = true
+		origLen := cb.reqBuf.Len()
+		sr.recordBufferTruncatedWarnLocked(cb, "reqBuf", origLen)
+		reason := fmt.Sprintf("buffer_truncated: reqBuf exceeded %d bytes", MaxConnBufferBytes)
+		if cb.activeH1 != nil {
+			ex := cb.activeH1
+			partialResp := sr.extractPartialH1ResponseBodyLocked(cb, ex)
+			sr.emitH1TerminalExchangeLocked(cb, ex, partialResp, ts, "incomplete", reason)
+			cb.activeH1 = nil
+			cb.respBuf.Reset()
+		} else {
+			prefix := cb.reqBuf.Bytes()[:MaxConnBufferBytes]
+			if ex := sr.extractPartialH1RequestLocked(cb, prefix, ts); ex != nil {
+				sr.emitH1TerminalExchangeLocked(cb, ex, nil, ts, "incomplete", reason)
+			}
+		}
+		cb.reqBuf.Reset()
+	}
+
+	if cb.respBuf.Len() > MaxConnBufferBytes {
+		truncated = true
+		origLen := cb.respBuf.Len()
+		sr.recordBufferTruncatedWarnLocked(cb, "respBuf", origLen)
+		reason := fmt.Sprintf("buffer_truncated: respBuf exceeded %d bytes", MaxConnBufferBytes)
+		if cb.activeH1 != nil {
+			ex := cb.activeH1
+			partialResp := sr.extractPartialH1ResponseBodyLocked(cb, ex)
+			sr.emitH1TerminalExchangeLocked(cb, ex, partialResp, ts, "incomplete", reason)
+			cb.activeH1 = nil
+		}
+		cb.respBuf.Reset()
+	}
+
+	if cb.activeH1 != nil && cb.activeH1.respRawBody.Len() > MaxConnBufferBytes {
+		truncated = true
+		origLen := cb.activeH1.respRawBody.Len()
+		sr.recordBufferTruncatedWarnLocked(cb, "respRawBody", origLen)
+		reason := fmt.Sprintf("buffer_truncated: respRawBody exceeded %d bytes", MaxConnBufferBytes)
+		ex := cb.activeH1
+		partialResp := append([]byte(nil), ex.respRawBody.Bytes()[:MaxConnBufferBytes]...)
+		ex.respRawBody.Reset()
+		sr.emitH1TerminalExchangeLocked(cb, ex, partialResp, ts, "incomplete", reason)
+		cb.activeH1 = nil
+		cb.respBuf.Reset()
+	}
+
+	if cb.h2ReqBuf.Len() > MaxConnBufferBytes {
+		truncated = true
+		origLen := cb.h2ReqBuf.Len()
+		sr.recordBufferTruncatedWarnLocked(cb, "h2ReqBuf", origLen)
+		reason := fmt.Sprintf("buffer_truncated: h2ReqBuf exceeded %d bytes", MaxConnBufferBytes)
+		sr.flushTruncatedH2StreamsLocked(cb, ts, reason)
+		cb.h2ReqBuf.Reset()
+	}
+
+	if cb.h2RespBuf.Len() > MaxConnBufferBytes {
+		truncated = true
+		origLen := cb.h2RespBuf.Len()
+		sr.recordBufferTruncatedWarnLocked(cb, "h2RespBuf", origLen)
+		reason := fmt.Sprintf("buffer_truncated: h2RespBuf exceeded %d bytes", MaxConnBufferBytes)
+		sr.flushTruncatedH2StreamsLocked(cb, ts, reason)
+		cb.h2RespBuf.Reset()
+	}
+
+	for streamID, st := range cb.h2Streams {
+		if st.reqBody.Len() > MaxConnBufferBytes {
+			truncated = true
+			origLen := st.reqBody.Len()
+			sr.recordBufferTruncatedWarnLocked(cb, "h2StreamReqBody", origLen)
+			st.reqBody.Truncate(MaxConnBufferBytes)
+			reason := fmt.Sprintf("buffer_truncated: h2StreamReqBody exceeded %d bytes", MaxConnBufferBytes)
+			sr.emitH2TerminalStreamLocked(cb, st, ts, "incomplete", reason)
+			delete(cb.h2Streams, streamID)
+		} else if st.respBody.Len() > MaxConnBufferBytes {
+			truncated = true
+			origLen := st.respBody.Len()
+			sr.recordBufferTruncatedWarnLocked(cb, "h2StreamRespBody", origLen)
+			st.respBody.Truncate(MaxConnBufferBytes)
+			reason := fmt.Sprintf("buffer_truncated: h2StreamRespBody exceeded %d bytes", MaxConnBufferBytes)
+			sr.emitH2TerminalStreamLocked(cb, st, ts, "incomplete", reason)
 			delete(cb.h2Streams, streamID)
 		}
 	}
+	return truncated
 }
 
-func (sr *StreamReassembler) decodeH2HeadersLocked(cb *connBuffer, st *h2StreamState, frag []byte, dir Direction) {
-	fields := make([]hpack.HeaderField, 0, 16)
-	emitFunc := func(f hpack.HeaderField) {
-		fields = append(fields, f)
-	}
-	if dir == DirWrite {
-		if cb.reqDecoder == nil {
-			cb.reqDecoder = hpack.NewDecoder(4096, emitFunc)
-		} else {
-			cb.reqDecoder.SetEmitFunc(emitFunc)
-		}
-		_, _ = cb.reqDecoder.Write(frag)
-		for _, f := range fields {
-			switch f.Name {
-			case ":method":
-				st.method = f.Value
-			case ":authority":
-				st.authority = f.Value
-			case ":path":
-				st.path = f.Value
-			case ":scheme":
-				st.scheme = f.Value
-			default:
-				st.reqHeaders[f.Name] = f.Value
-			}
-		}
-	} else {
-		if cb.rspDecoder == nil {
-			cb.rspDecoder = hpack.NewDecoder(4096, emitFunc)
-		} else {
-			cb.rspDecoder.SetEmitFunc(emitFunc)
-		}
-		_, _ = cb.rspDecoder.Write(frag)
-		for _, f := range fields {
-			if f.Name == ":status" {
-				st.status, _ = strconv.Atoi(f.Value)
-			} else {
-				st.respHeaders[f.Name] = f.Value
-			}
-		}
-	}
-}
-
-func (sr *StreamReassembler) emitH2StreamLocked(cb *connBuffer, st *h2StreamState, ts int64, complete bool) {
-	if !sr.matchesHost(st.authority) {
+func (sr *StreamReassembler) recordBufferTruncatedWarnLocked(cb *connBuffer, bufName string, origLen int) {
+	if cb.truncWarned {
+		cb.truncSuppressed++
 		return
 	}
-	reqRaw, _ := DecompressBody(st.reqBody.Bytes(), st.reqHeaders["content-encoding"])
-	respRaw, _ := DecompressBody(st.respBody.Bytes(), st.respHeaders["content-encoding"])
-	proto := DetectProtocol(st.path, reqRaw, respRaw)
-	if proto == model.ProtocolUnknown && len(sr.hostFilter) == 0 {
-		return
-	}
-	isSSE := strings.Contains(strings.ToLower(st.respHeaders["content-type"]), "text/event-stream")
-	dur := ts - st.startedAt
-	if dur < 0 {
-		dur = 0
-	}
-	status := "streaming"
-	if complete {
-		status = "ok"
-		if st.status >= 400 {
-			status = "error"
-		}
-	}
-	var reqHdrOut, respHdrOut map[string]string
-	if sr.recordHeaders {
-		reqHdrOut = st.reqHeaders
-		respHdrOut = st.respHeaders
-	}
-	ev := &model.TraceEvent{
-		ID:              st.eventID,
-		Timestamp:       st.startedAt,
-		DurationMs:      dur,
-		Status:          status,
-		HTTPStatus:      st.status,
-		HTTPVersion:     "HTTP/2.0",
-		Method:          st.method,
-		Host:            st.authority,
-		Path:            st.path,
-		URL:             fmt.Sprintf("https://%s%s", st.authority, st.path),
-		Protocol:        proto,
-		Process:         cb.process,
-		HeadersRecorded: sr.recordHeaders,
-		RequestHeaders:  reqHdrOut,
-		ResponseHeaders: respHdrOut,
-		RequestBytes:    len(reqRaw),
-		ResponseBytes:   len(respRaw),
-		StreamChunks:    st.chunks,
-	}
-	_ = ParseExchange(ev, reqRaw, respRaw, isSSE)
-	if sr.mon != nil && complete {
-		sr.mon.Record(selfmon.Event{
-			Status:     selfmon.StatusOK,
-			Stage:      selfmon.StageStream,
-			Action:     "reassemble_http2_" + string(proto),
-			PID:        cb.process.PID,
-			Comm:       cb.process.Comm,
-			DurationMs: dur,
-			Bytes:      len(reqRaw) + len(respRaw),
-			Detail:     map[string]any{"stream_id": st.streamID, "host": st.authority, "path": st.path},
+	cb.truncWarned = true
+	if sr.mon != nil {
+		sr.mon.RecordWarn(selfmon.StageStream, "buffer_truncated", fmt.Sprintf("%s exceeded %d bytes", bufName, MaxConnBufferBytes), map[string]any{
+			"conn_key":      cb.key,
+			"pid":           cb.process.PID,
+			"buffer":        bufName,
+			"original_size": origLen,
+			"truncated_to":  0,
 		})
 	}
-	if sr.onEvent != nil {
-		sr.onEvent(ev)
+}
+
+// recordUnknownProtocolWarnLocked logs an "unknown_protocol_dropped" warning to selfmon,
+// rate-limited per host (at most once per UnknownProtocolWarnInterval = 10s per host)
+// with suppressed counts/bytes aggregated to avoid disk I/O storms under high-frequency non-LLM traffic.
+// Path query parameters are redacted via RedactSensitivePath, and unknownWarnState is bounded by MaxUnknownWarnHosts (LRU).
+func (sr *StreamReassembler) recordUnknownProtocolWarnLocked(host, path string, pid, totalBytes int, ts int64) {
+	if sr.mon == nil {
+		return
+	}
+	if ts <= 0 {
+		ts = time.Now().UnixMilli()
+	}
+	hostKey := strings.ToLower(strings.TrimSpace(host))
+	if hostKey == "" {
+		hostKey = "_unknown_"
+	}
+	if sr.unknownWarnState == nil {
+		sr.unknownWarnState = make(map[string]*unknownHostWarnState)
+	}
+	st, ok := sr.unknownWarnState[hostKey]
+	if !ok {
+		if len(sr.unknownWarnState) >= MaxUnknownWarnHosts {
+			sr.evictUnknownWarnHostLocked(ts)
+		}
+		st = &unknownHostWarnState{}
+		sr.unknownWarnState[hostKey] = st
+	}
+	safePath := RedactSensitivePath(path)
+	if st.lastWarnMs == 0 || ts-st.lastWarnMs >= UnknownProtocolWarnInterval.Milliseconds() || ts < st.lastWarnMs {
+		detail := map[string]any{
+			"host":             host,
+			"path":             safePath,
+			"pid":              pid,
+			"bytes":            totalBytes,
+			"dropped":          sr.dropUnknown && len(sr.hostFilter) == 0,
+			"suppressed_count": st.suppressedCount,
+			"suppressed_bytes": st.suppressedBytes,
+		}
+		st.lastWarnMs = ts
+		st.suppressedCount = 0
+		st.suppressedBytes = 0
+		sr.mon.RecordWarn(selfmon.StageStream, "unknown_protocol_dropped", "unknown protocol traffic", detail)
+		return
+	}
+	st.suppressedCount++
+	st.suppressedBytes += totalBytes
+}
+
+func (sr *StreamReassembler) evictUnknownWarnHostLocked(nowMs int64) {
+	cutoffMs := nowMs - ConnIdleTimeout.Milliseconds()
+	for k, st := range sr.unknownWarnState {
+		if st.lastWarnMs > 0 && st.lastWarnMs < cutoffMs {
+			delete(sr.unknownWarnState, k)
+		}
+	}
+	if len(sr.unknownWarnState) < MaxUnknownWarnHosts {
+		return
+	}
+	oldestKey := ""
+	var oldestTs int64
+	for k, st := range sr.unknownWarnState {
+		if oldestKey == "" || st.lastWarnMs < oldestTs || (st.lastWarnMs == oldestTs && k < oldestKey) {
+			oldestKey = k
+			oldestTs = st.lastWarnMs
+		}
+	}
+	if oldestKey != "" {
+		delete(sr.unknownWarnState, oldestKey)
 	}
 }
 
@@ -662,59 +520,4 @@ func (sr *StreamReassembler) matchesHost(host string) bool {
 		}
 	}
 	return false
-}
-
-var httpRequestMethods = [][]byte{
-	[]byte("POST "),
-	[]byte("GET "),
-	[]byte("PUT "),
-	[]byte("DELETE "),
-	[]byte("PATCH "),
-	[]byte("OPTIONS "),
-	[]byte("HEAD "),
-}
-
-func findHTTPRequestStart(data []byte) int {
-	best := -1
-	for _, m := range httpRequestMethods {
-		if idx := bytes.Index(data, m); idx >= 0 {
-			if best < 0 || idx < best {
-				best = idx
-			}
-		}
-	}
-	return best
-}
-
-func decodeChunkedAvailable(raw []byte) ([]byte, int, bool) {
-	var out bytes.Buffer
-	pos := 0
-	for pos < len(raw) {
-		lineEnd := bytes.Index(raw[pos:], []byte("\r\n"))
-		if lineEnd < 0 {
-			return out.Bytes(), pos, false
-		}
-		sizeStr := strings.TrimSpace(string(raw[pos : pos+lineEnd]))
-		if semi := strings.IndexByte(sizeStr, ';'); semi >= 0 {
-			sizeStr = sizeStr[:semi]
-		}
-		chunkSize, err := strconv.ParseInt(sizeStr, 16, 64)
-		if err != nil {
-			return raw, pos, false
-		}
-		pos += lineEnd + 2
-		if chunkSize == 0 {
-			if pos+2 <= len(raw) && raw[pos] == '\r' && raw[pos+1] == '\n' {
-				pos += 2
-			}
-			return out.Bytes(), pos, true
-		}
-		if pos+int(chunkSize)+2 > len(raw) {
-			out.Write(raw[pos:])
-			return out.Bytes(), pos, false
-		}
-		out.Write(raw[pos : pos+int(chunkSize)])
-		pos += int(chunkSize) + 2
-	}
-	return out.Bytes(), pos, false
 }

@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuyicong/llm-tracer/internal/correlator"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
-	"github.com/liuyicong/llm-tracer/internal/store"
+	"github.com/mrlyc/llm-tracer/internal/correlator"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -80,6 +80,7 @@ func TestPolyglotLanguagesCapture(t *testing.T) {
 	require.NoError(t, err)
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
 	corr := correlator.NewCorrelator(mon)
 
 	col, err := NewCollector(dir, model.ScopeFilter{}, corr, st, mon)
@@ -484,6 +485,7 @@ func TestAgentFrameworksAndAgentCLIsScenarios(t *testing.T) {
 	require.NoError(t, err)
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
 	corr := correlator.NewCorrelator(mon)
 
 	col, err := NewCollector(dir, model.ScopeFilter{}, corr, st, mon)
@@ -821,7 +823,7 @@ post({
     "model": "codex-mini-latest",
     "stream": True,
     "previous_response_id": "resp_codex_t1",
-    "input": [{"type": "function_call_output", "call_id": "call_codex_sh1", "output": "PASS\nok github.com/liuyicong/llm-tracer"}]
+    "input": [{"type": "function_call_output", "call_id": "call_codex_sh1", "output": "PASS\nok github.com/mrlyc/llm-tracer"}]
 }, t2)
 `
 		code, err := col.LaunchCommand(ctx, []string{pyBin, "-c", script, tlsURL, certPath, keyPath})

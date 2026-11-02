@@ -8,6 +8,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -20,6 +21,11 @@ const (
 	DefaultDigits      = 6
 	DefaultWindow      = 1
 	DefaultSessionTTL  = 12 * time.Hour
+	MaxFailedAttempts  = 5
+	LockoutDuration    = 15 * time.Second
+	MaxClientBuckets   = 4096
+	ClientBucketTTL    = 10 * time.Minute
+	MaxActiveSessions  = 4096
 )
 
 var sixDigitsRegex = regexp.MustCompile(`^[0-9]{6}$`)
@@ -119,36 +125,46 @@ func hotp(key []byte, counter uint64) string {
 	return fmt.Sprintf("%06d", otp)
 }
 
-type Guard struct {
-	mu          sync.Mutex
-	enabled     bool
-	secret      string
-	window      int
+type clientFailureState struct {
 	failures    int
 	lockedUntil time.Time
-	sessions    map[string]time.Time
-	nowFunc     func() time.Time
+	lastSeen    time.Time
+}
+
+type Guard struct {
+	mu         sync.Mutex
+	enabled    bool
+	secret     string
+	window     int
+	maxBuckets int
+	clients    map[string]*clientFailureState
+	sessions   map[string]time.Time
+	nowFunc    func() time.Time
 }
 
 func NewGuard(secret string) (*Guard, error) {
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
 		return &Guard{
-			enabled:  false,
-			window:   DefaultWindow,
-			sessions: make(map[string]time.Time),
-			nowFunc:  time.Now,
+			enabled:    false,
+			window:     DefaultWindow,
+			maxBuckets: MaxClientBuckets,
+			clients:    make(map[string]*clientFailureState),
+			sessions:   make(map[string]time.Time),
+			nowFunc:    time.Now,
 		}, nil
 	}
 	if _, err := NormalizeSecret(secret); err != nil {
 		return nil, err
 	}
 	return &Guard{
-		enabled:  true,
-		secret:   secret,
-		window:   DefaultWindow,
-		sessions: make(map[string]time.Time),
-		nowFunc:  time.Now,
+		enabled:    true,
+		secret:     secret,
+		window:     DefaultWindow,
+		maxBuckets: MaxClientBuckets,
+		clients:    make(map[string]*clientFailureState),
+		sessions:   make(map[string]time.Time),
+		nowFunc:    time.Now,
 	}, nil
 }
 
@@ -156,7 +172,90 @@ func (g *Guard) Enabled() bool {
 	return g != nil && g.enabled
 }
 
-func (g *Guard) CheckTokenOrCode(tokenOrCode string) error {
+func normalizeClientKey(client string) string {
+	client = strings.TrimSpace(client)
+	if client == "" {
+		return "_default_"
+	}
+	if h, _, err := net.SplitHostPort(client); err == nil && h != "" {
+		return strings.Trim(h, "[]")
+	}
+	return strings.Trim(client, "[]")
+}
+
+func (g *Guard) getOrCreateClientLocked(key string, now time.Time) *clientFailureState {
+	if st, ok := g.clients[key]; ok {
+		return st
+	}
+	limit := g.maxBuckets
+	if limit <= 0 {
+		limit = MaxClientBuckets
+	}
+	if len(g.clients) >= limit {
+		for k, v := range g.clients {
+			lockExpired := !v.lockedUntil.IsZero() && !now.Before(v.lockedUntil)
+			idleExpired := v.lockedUntil.IsZero() && now.Sub(v.lastSeen) > ClientBucketTTL
+			if lockExpired || idleExpired {
+				delete(g.clients, k)
+			}
+		}
+	}
+	if len(g.clients) >= limit {
+		var evictKey string
+		var evictTime time.Time
+		foundUnlocked := false
+		for k, v := range g.clients {
+			isUnlocked := v.lockedUntil.IsZero() || !now.Before(v.lockedUntil)
+			if isUnlocked {
+				if !foundUnlocked || v.lastSeen.Before(evictTime) {
+					foundUnlocked = true
+					evictKey = k
+					evictTime = v.lastSeen
+				}
+			} else if !foundUnlocked {
+				if evictKey == "" || v.lastSeen.Before(evictTime) {
+					evictKey = k
+					evictTime = v.lastSeen
+				}
+			}
+		}
+		if evictKey != "" {
+			delete(g.clients, evictKey)
+		}
+	}
+	st := &clientFailureState{lastSeen: now}
+	g.clients[key] = st
+	return st
+}
+
+// CheckSession validates whether tok is an active, non-expired session token.
+// Expired or unknown session tokens never increment TOTP failure counters.
+func (g *Guard) CheckSession(tok string) bool {
+	if !g.Enabled() {
+		return false
+	}
+	val := strings.TrimSpace(tok)
+	if val == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := g.nowFunc()
+	exp, ok := g.sessions[val]
+	if !ok {
+		return false
+	}
+	if now.Before(exp) {
+		return true
+	}
+	delete(g.sessions, val)
+	return false
+}
+
+// CheckCodeFrom verifies a 6-digit TOTP code for a specific client IP/bucket.
+// Only 6-digit numeric code verification failures increment the per-client failure counter.
+func (g *Guard) CheckCodeFrom(client, code string) error {
 	if !g.Enabled() {
 		return nil
 	}
@@ -164,38 +263,58 @@ func (g *Guard) CheckTokenOrCode(tokenOrCode string) error {
 	defer g.mu.Unlock()
 
 	now := g.nowFunc()
-	if now.Before(g.lockedUntil) {
-		waitSec := int(g.lockedUntil.Sub(now).Seconds()) + 1
-		return fmt.Errorf("TOTP 验证失败次数过多，已锁定 %d 秒", waitSec)
+	key := normalizeClientKey(client)
+	if st, ok := g.clients[key]; ok {
+		if now.Before(st.lockedUntil) {
+			waitSec := int(st.lockedUntil.Sub(now).Seconds()) + 1
+			return fmt.Errorf("TOTP 验证失败次数过多，已锁定 %d 秒", waitSec)
+		}
+		if !st.lockedUntil.IsZero() {
+			st.lockedUntil = time.Time{}
+			st.failures = 0
+		}
 	}
 
-	val := strings.TrimSpace(tokenOrCode)
+	val := strings.TrimSpace(code)
 	if val == "" {
 		return fmt.Errorf("需要 TOTP 认证")
 	}
-
-	if exp, ok := g.sessions[val]; ok {
-		if now.Before(exp) {
-			return nil
-		}
-		delete(g.sessions, val)
+	if !sixDigitsRegex.MatchString(val) {
+		return fmt.Errorf("TOTP 动态码无效")
 	}
 
 	if Verify(g.secret, val, now, g.window) {
-		g.failures = 0
+		delete(g.clients, key)
 		return nil
 	}
 
-	g.failures++
-	if g.failures >= 5 {
-		g.lockedUntil = now.Add(15 * time.Second)
-		g.failures = 0
+	st := g.getOrCreateClientLocked(key, now)
+	st.failures++
+	st.lastSeen = now
+	if st.failures >= MaxFailedAttempts {
+		st.lockedUntil = now.Add(LockoutDuration)
+		st.failures = 0
 		return fmt.Errorf("TOTP 动态码错误（连续失败 5 次，锁定 15 秒）")
 	}
 	return fmt.Errorf("TOTP 动态码无效")
 }
 
+// CheckTokenOrCode is retained as a backward-compatible wrapper around CheckSession and CheckCodeFrom.
+func (g *Guard) CheckTokenOrCode(tokenOrCode string) error {
+	if !g.Enabled() {
+		return nil
+	}
+	if g.CheckSession(tokenOrCode) {
+		return nil
+	}
+	return g.CheckCodeFrom("", tokenOrCode)
+}
+
 func (g *Guard) Login(code string, ttl time.Duration) (string, time.Time, error) {
+	return g.LoginFrom("", code, ttl)
+}
+
+func (g *Guard) LoginFrom(client, code string, ttl time.Duration) (string, time.Time, error) {
 	if !g.Enabled() {
 		return "", time.Time{}, nil
 	}
@@ -203,19 +322,29 @@ func (g *Guard) Login(code string, ttl time.Duration) (string, time.Time, error)
 	defer g.mu.Unlock()
 
 	now := g.nowFunc()
-	if now.Before(g.lockedUntil) {
-		waitSec := int(g.lockedUntil.Sub(now).Seconds()) + 1
-		return "", time.Time{}, fmt.Errorf("TOTP 验证已暂时锁定，请 %d 秒后重试", waitSec)
+	key := normalizeClientKey(client)
+	if st, ok := g.clients[key]; ok {
+		if now.Before(st.lockedUntil) {
+			waitSec := int(st.lockedUntil.Sub(now).Seconds()) + 1
+			return "", time.Time{}, fmt.Errorf("TOTP 验证失败次数过多，已锁定 %d 秒", waitSec)
+		}
+		if !st.lockedUntil.IsZero() {
+			st.lockedUntil = time.Time{}
+			st.failures = 0
+		}
 	}
 	if !Verify(g.secret, code, now, g.window) {
-		g.failures++
-		if g.failures >= 5 {
-			g.lockedUntil = now.Add(15 * time.Second)
-			g.failures = 0
+		st := g.getOrCreateClientLocked(key, now)
+		st.failures++
+		st.lastSeen = now
+		if st.failures >= MaxFailedAttempts {
+			st.lockedUntil = now.Add(LockoutDuration)
+			st.failures = 0
+			return "", time.Time{}, fmt.Errorf("TOTP 动态码错误（连续失败 5 次，锁定 15 秒）")
 		}
 		return "", time.Time{}, fmt.Errorf("TOTP 动态码无效")
 	}
-	g.failures = 0
+	delete(g.clients, key)
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
@@ -226,6 +355,19 @@ func (g *Guard) Login(code string, ttl time.Duration) (string, time.Time, error)
 	for k, v := range g.sessions {
 		if now.After(v) {
 			delete(g.sessions, k)
+		}
+	}
+	if len(g.sessions) >= MaxActiveSessions {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, v := range g.sessions {
+			if oldestKey == "" || v.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = v
+			}
+		}
+		if oldestKey != "" {
+			delete(g.sessions, oldestKey)
 		}
 	}
 	g.sessions[sessToken] = exp

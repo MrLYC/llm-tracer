@@ -23,7 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/liuyicong/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
 
 // LoopbackTap is an ephemeral local HTTP + HTTPS MITM proxy used as fallback for static-pie (codex/rustls)
@@ -35,13 +36,32 @@ type LoopbackTap struct {
 	caKey         *ecdsa.PrivateKey
 	caPath        string
 	upstreamProxy string
+	insecure      bool
+	mon           *selfmon.Monitor
 	certMu        sync.Mutex
 	certMap       map[string]*tls.Certificate
 	seq           atomic.Uint64
 	onChunk       func(connID string, dir parser.Direction, data []byte)
 }
 
-func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Direction, data []byte)) (*LoopbackTap, error) {
+type LoopbackTapOption func(*LoopbackTap)
+
+// WithTapInsecure configures whether LoopbackTap skips upstream TLS certificate verification
+// for non-loopback targets (default false).
+func WithTapInsecure(insecure bool) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		t.SetInsecure(insecure)
+	}
+}
+
+// WithTapMonitor attaches a selfmon.Monitor so upstream TLS verification failures are recorded.
+func WithTapMonitor(mon *selfmon.Monitor) LoopbackTapOption {
+	return func(t *LoopbackTap) {
+		t.mon = mon
+	}
+}
+
+func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Direction, data []byte), opts ...LoopbackTapOption) (*LoopbackTap, error) {
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -81,7 +101,7 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 	}
 	combinedPEM.Write(caPEM)
 	caPath := filepath.Join(hooksDir, "llm_tracer_ca_bundle.pem")
-	if err := os.WriteFile(caPath, combinedPEM.Bytes(), 0o644); err != nil {
+	if err := writeArtifactNoFollow(caPath, combinedPEM.Bytes(), 0o644); err != nil {
 		return nil, err
 	}
 
@@ -109,8 +129,27 @@ func NewLoopbackTap(hooksDir string, onChunk func(connID string, dir parser.Dire
 		certMap:       make(map[string]*tls.Certificate),
 		onChunk:       onChunk,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(tap)
+		}
+	}
 	go tap.serve()
 	return tap, nil
+}
+
+// SetInsecure controls whether upstream TLS verification is skipped for non-loopback targets.
+func (t *LoopbackTap) SetInsecure(insecure bool) {
+	t.certMu.Lock()
+	t.insecure = insecure
+	t.certMu.Unlock()
+}
+
+// Insecure reports whether upstream TLS verification is skipped for non-loopback targets.
+func (t *LoopbackTap) Insecure() bool {
+	t.certMu.Lock()
+	defer t.certMu.Unlock()
+	return t.insecure
 }
 
 func (t *LoopbackTap) ProxyURL() string {
@@ -223,10 +262,7 @@ func (t *LoopbackTap) forwardPlainHTTP(clientConn net.Conn, req *http.Request) {
 }
 
 func (t *LoopbackTap) handleConnect(clientConn net.Conn, targetHost string) {
-	if !strings.Contains(targetHost, ":") {
-		targetHost += ":443"
-	}
-	hostOnly := strings.Split(targetHost, ":")[0]
+	targetHost, hostOnly := parseConnectAuthority(targetHost)
 	_, _ = io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
 	leafCert, err := t.getOrCreateLeafCert(hostOnly)
@@ -301,17 +337,61 @@ func (t *LoopbackTap) handleConnect(clientConn net.Conn, targetHost string) {
 	<-upDone
 }
 
+// parseConnectAuthority normalizes a CONNECT authority or host string into "host:port" (with IPv6 brackets)
+// and the bare host literal/domain without brackets or port.
+func parseConnectAuthority(rawTarget string) (targetHostPort, hostOnly string) {
+	s := strings.TrimSpace(rawTarget)
+	if h, p, err := net.SplitHostPort(s); err == nil && p != "" {
+		hostOnly = strings.Trim(h, "[]")
+		return net.JoinHostPort(hostOnly, p), hostOnly
+	}
+	hostOnly = strings.Trim(s, "[]")
+	return net.JoinHostPort(hostOnly, "443"), hostOnly
+}
+
 func isLoopbackHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
-	return h == "localhost" || h == "127.0.0.1" || h == "::1" || strings.HasPrefix(h, "127.")
+	h := strings.TrimSpace(host)
+	if sh, _, err := net.SplitHostPort(h); err == nil {
+		h = sh
+	} else {
+		h = strings.Trim(h, "[]")
+	}
+	if idx := strings.IndexByte(h, '%'); idx != -1 {
+		h = h[:idx]
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (t *LoopbackTap) shouldSkipUpstreamVerify(hostOnly string) bool {
+	if isLoopbackHost(hostOnly) {
+		return true
+	}
+	return t.Insecure()
+}
+
+func (t *LoopbackTap) upstreamTLSConfig(hostOnly string) *tls.Config {
+	_, cleanHost := parseConnectAuthority(hostOnly)
+	return &tls.Config{
+		ServerName:         cleanHost,
+		InsecureSkipVerify: t.shouldSkipUpstreamVerify(cleanHost),
+		NextProtos:         []string{"http/1.1"},
+	}
 }
 
 func (t *LoopbackTap) dialUpstreamTLS(targetHost, hostOnly string) (*tls.Conn, error) {
-	tlsCfg := &tls.Config{
-		ServerName:         hostOnly,
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"http/1.1"},
+	if _, _, err := net.SplitHostPort(strings.TrimSpace(targetHost)); err != nil {
+		targetHost, _ = parseConnectAuthority(targetHost)
 	}
+	if strings.TrimSpace(hostOnly) == "" {
+		_, hostOnly = parseConnectAuthority(targetHost)
+	} else {
+		_, hostOnly = parseConnectAuthority(hostOnly)
+	}
+	tlsCfg := t.upstreamTLSConfig(hostOnly)
 	if !isLoopbackHost(hostOnly) && t.upstreamProxy != "" {
 		if pu, err := url.Parse(t.upstreamProxy); err == nil && pu.Host != "" && pu.Host != t.addr {
 			if proxyConn, err := net.DialTimeout("tcp", pu.Host, 5*time.Second); err == nil {
@@ -329,10 +409,33 @@ func (t *LoopbackTap) dialUpstreamTLS(targetHost, hostOnly string) (*tls.Conn, e
 			}
 		}
 	}
-	return tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", targetHost, tlsCfg)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", targetHost, tlsCfg)
+	if err != nil {
+		t.recordUpstreamTLSFailure(targetHost, hostOnly, err)
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (t *LoopbackTap) recordUpstreamTLSFailure(targetHost, hostOnly string, err error) {
+	if t.mon == nil || err == nil {
+		return
+	}
+	t.mon.RecordWarn(
+		selfmon.StageProbe,
+		"loopback_tap_upstream_tls",
+		fmt.Sprintf("upstream TLS verify/dial failed for %s: %v (hint: use --tap-insecure if behind a corporate MITM proxy or self-signed gateway)", targetHost, err),
+		map[string]any{
+			"target":   targetHost,
+			"host":     hostOnly,
+			"insecure": t.Insecure(),
+			"hint":     "--tap-insecure",
+		},
+	)
 }
 
 func (t *LoopbackTap) getOrCreateLeafCert(host string) (*tls.Certificate, error) {
+	_, host = parseConnectAuthority(host)
 	t.certMu.Lock()
 	defer t.certMu.Unlock()
 	if c, ok := t.certMap[host]; ok {

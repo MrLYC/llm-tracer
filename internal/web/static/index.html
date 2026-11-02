@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="llm-tracer-token" content="" />
   <title>LLM-Tracer · eBPF 大模型通信与会话串联观测台</title>
   <style>
     :root {
@@ -764,7 +765,9 @@
 
   <script>
     let state = {
+      defaultWindowMs: 600000,
       windowMs: 600000, // Default 10 minutes
+      windowInitialized: false,
       liveFollow: true,
       minTs: Date.now() - 600000,
       maxTs: Date.now(),
@@ -777,8 +780,52 @@
     };
     let searchTimer = null;
 
+    function syncWindowPresetButtons(winMs) {
+      const buttons = document.querySelectorAll('.tl-presets .tl-preset[data-win]');
+      if (!buttons || typeof buttons.forEach !== 'function') return;
+      buttons.forEach(el => {
+        const bw = Number(el.getAttribute('data-win'));
+        if (bw === winMs) {
+          el.classList.add('active');
+        } else {
+          el.classList.remove('active');
+        }
+      });
+    }
+
+    function applyServerDefaultWindow(winMs) {
+      const parsed = Number(winMs);
+      if (!Number.isFinite(parsed) || parsed <= 0) return;
+      state.defaultWindowMs = parsed;
+      if (!state.windowInitialized) {
+        state.windowInitialized = true;
+        state.windowMs = parsed;
+        state.minTs = Date.now() - parsed;
+        syncWindowPresetButtons(parsed);
+        updateRangeLabel();
+      }
+    }
+
+    function getLocalToken() {
+      if (window.__LLM_TRACER_TOKEN__) return String(window.__LLM_TRACER_TOKEN__).trim();
+      const meta = document.querySelector('meta[name="llm-tracer-token"]');
+      return (meta && meta.getAttribute('content')) ? meta.getAttribute('content').trim() : '';
+    }
+
     async function apiFetch(url, opts = {}) {
-      const res = await fetch(url, opts);
+      const headers = new Headers(opts.headers || {});
+      const localToken = getLocalToken();
+      if (localToken && !headers.has('X-LLM-Tracer-Token')) {
+        headers.set('X-LLM-Tracer-Token', localToken);
+      }
+      if (opts.body !== undefined && !headers.has('Content-Type')) {
+        headers.set('Content-Type', 'application/json');
+      }
+      const res = await fetch(url, {
+        ...opts,
+        credentials: 'same-origin',
+        headers,
+      });
       if (res.status === 401) {
         document.getElementById('totpModal').classList.add('open');
         throw new Error('unauthorized');
@@ -787,7 +834,10 @@
     }
 
     async function initApp() {
-      const auth = await fetch('/api/auth/status').then(r => r.json());
+      const auth = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => r.json());
+      if (auth && auth.window_ms) {
+        applyServerDefaultWindow(auth.window_ms);
+      }
       if (auth.totp_enabled && !auth.authenticated) {
         document.getElementById('totpModal').classList.add('open');
         return;
@@ -802,6 +852,7 @@
       const code = document.getElementById('totpCodeInput').value.trim();
       const res = await fetch('/api/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({code})
       });
@@ -834,6 +885,9 @@
     async function loadTimeline() {
       try {
         const tl = await apiFetch('/api/timeline?buckets=40');
+        if (tl && tl.window_ms) {
+          applyServerDefaultWindow(tl.window_ms);
+        }
         state.minTs = tl.min_ts;
         state.maxTs = Math.max(tl.max_ts, Date.now());
         renderHistogram(tl.buckets || []);
@@ -855,6 +909,7 @@
     function selectWindowPreset(winMs, btn) {
       document.querySelectorAll('.tl-presets .tl-preset').forEach(el => el.classList.remove('active'));
       btn.classList.add('active');
+      state.windowInitialized = true;
       state.windowMs = winMs;
       state.liveFollow = true;
       document.getElementById('tlEndSlider').value = 1000;
@@ -875,7 +930,7 @@
     }
 
     function shiftTimeline(factor) {
-      const step = (state.windowMs || 600000) * factor;
+      const step = (state.windowMs || state.defaultWindowMs || 600000) * factor;
       const curTo = state.liveFollow ? Date.now() : state.customTo;
       const nextTo = Math.min(Date.now(), Math.max(state.minTs + 60000, curTo + step));
       state.liveFollow = nextTo >= Date.now() - 3000;
@@ -909,6 +964,9 @@
       const q = document.getElementById('keywordFilter').value.trim();
       const url = `/api/sessions?from=${r.from}&to=${r.to}&protocol=${encodeURIComponent(proto)}&pid=${encodeURIComponent(pid)}&q=${encodeURIComponent(q)}`;
       const data = await apiFetch(url);
+      if (data && data.window_ms) {
+        applyServerDefaultWindow(data.window_ms);
+      }
       state.sessions = data.sessions || [];
       document.getElementById('sessionCount').textContent = state.sessions.length;
       renderSessionList();
@@ -1298,8 +1356,13 @@
       }
     }
 
+    let sseSource = null;
     function connectSSE() {
-      const es = new EventSource('/api/stream');
+      if (sseSource) {
+        sseSource.close();
+      }
+      const es = new EventSource('/api/stream', { withCredentials: true });
+      sseSource = es;
       const pill = document.getElementById('sseStatusPill');
       es.addEventListener('trace', e => {
         if (!state.liveFollow) return;

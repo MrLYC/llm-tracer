@@ -16,8 +16,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/liuyicong/llm-tracer/internal/parser"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 	"golang.org/x/sys/unix"
 )
 
@@ -72,13 +72,13 @@ const (
 
 	bpfPseudoMapFD = 1
 
-	bpfFuncMapLookupElem      = 1
-	bpfFuncMapUpdateElem      = 2
-	bpfFuncMapDeleteElem      = 3
-	bpfFuncGetCurrentPidTgid  = 14
-	bpfFuncProbeReadUser      = 112
-	bpfFuncRingbufReserve     = 131
-	bpfFuncRingbufSubmit      = 132
+	bpfFuncMapLookupElem     = 1
+	bpfFuncMapUpdateElem     = 2
+	bpfFuncMapDeleteElem     = 3
+	bpfFuncGetCurrentPidTgid = 14
+	bpfFuncProbeReadUser     = 112
+	bpfFuncRingbufReserve    = 131
+	bpfFuncRingbufSubmit     = 132
 
 	bpfRingbufBusyBit    = 1 << 31
 	bpfRingbufDiscardBit = 1 << 30
@@ -209,17 +209,17 @@ func appendSyscallHTTPFilter(insns []BPFInsn) []BPFInsn {
 		bpfJmpImm(bpfJEQ, bpfReg0, 0x50545448, 4), // "HTTP"
 		bpfJmpImm(bpfJEQ, bpfReg0, 0x61746164, 3), // "data"
 		bpfAnd64Imm(bpfReg0, 0xff),
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x7b, 1),      // '{'
-		bpfJmpImm(bpfJGE, bpfReg9, 0, -1),        // non-HTTP syscall payload -> exit without reserving ringbuf
+		bpfJmpImm(bpfJEQ, bpfReg0, 0x7b, 1), // '{'
+		bpfJmpImm(bpfJGE, bpfReg9, 0, -1),   // non-HTTP syscall payload -> exit without reserving ringbuf
 	)
 }
 
 // BuildWriteProbeProgram constructs a verifier-safe eBPF program that reads (conn_tag, buf_ptr, len)
 // from pt_regs or tracepoint context, copies up to 4072 bytes via bpf_probe_read_user, and submits to RingBuf.
-// For x86_64:
-//   - OpenSSL uprobe (SSL_write):       connOff=112 (rdi), bufOff=104 (rsi), lenOff=96 (rdx), isSyscall=false
-//   - GoTLS uprobe (Conn.Write ABI):    connOff=80  (rax), bufOff=40  (rbx), lenOff=88 (rcx), isSyscall=false
-//   - Tracepoint sys_enter_write/sendto: connOff=16 (fd),  bufOff=24  (buf), lenOff=32 (count), isSyscall=true
+// Register offsets are supplied by archPtRegsOffsets:
+//   - OpenSSL uprobe (SSL_write):        CArg0, CArg1, CArg2 (amd64: rdi/rsi/rdx 112/104/96; arm64: x0/x1/x2 0/8/16)
+//   - GoTLS uprobe (Conn.Write ABI):     GoArg0, GoArg1, GoArg2 (amd64: rax/rbx/rcx 80/40/88; arm64: r0/r1/r2 0/8/16)
+//   - Tracepoint sys_enter_write/sendto: SyscallArg0=16 (fd), SyscallArg1=24 (buf), SyscallArg2=32 (count)
 func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isSyscall bool) []BPFInsn {
 	dirImm := int32(0) // 0 = DirWrite (uprobe)
 	if isSyscall {
@@ -536,20 +536,20 @@ func BuildWritevProbeProgram(ringbufMapFD int) []BPFInsn {
 	return patchExitJumps(insns)
 }
 
-// BuildGoTLSReadEnterProgram stashes {conn_tag (RAX), buf_ptr (RBX), 0} into activeReadMapFD
-// keyed by `(pid << 32) | uint32(R14)` (where R14 is the Go goroutine `g` pointer on linux/amd64).
+// BuildGoTLSReadEnterProgram stashes {conn_tag, buf_ptr, 0} into activeReadMapFD
+// keyed by `(pid << 32) | uint32(g)` (where `g` is R14 on linux/amd64 or R28 on linux/arm64).
 func BuildGoTLSReadEnterProgram(activeReadMapFD int) []BPFInsn {
 	var insns []BPFInsn
 	insns = append(insns,
 		bpfMov64Reg(bpfReg6, bpfReg1),
-		bpfLdXMemDW(bpfReg7, bpfReg6, 80), // RAX = c *tls.Conn
-		bpfLdXMemDW(bpfReg8, bpfReg6, 40), // RBX = b.ptr
+		bpfLdXMemDW(bpfReg7, bpfReg6, archPtRegsOffsets.GoArg0), // c *tls.Conn (RAX on amd64, R0 on arm64)
+		bpfLdXMemDW(bpfReg8, bpfReg6, archPtRegsOffsets.GoArg1), // b.ptr (RBX on amd64, R1 on arm64)
 		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
 		bpfMov64Imm(bpfReg9, 0),
 		bpfCall(bpfFuncGetCurrentPidTgid),
 		bpfRsh64Imm(bpfReg0, 32),
 		bpfLsh64Imm(bpfReg0, 32),
-		bpfLdXMemW(bpfReg1, bpfReg6, 8), // uint32(pt_regs->r14) = goroutine pointer g
+		bpfLdXMemW(bpfReg1, bpfReg6, archPtRegsOffsets.GoGoroutine), // uint32(g) (R14 on amd64, R28 on arm64)
 		bpfOr64Reg(bpfReg0, bpfReg1),
 		bpfStXMemDW(bpfReg10, bpfReg0, -8),
 		bpfStXMemDW(bpfReg10, bpfReg7, -32),
@@ -570,17 +570,18 @@ func BuildGoTLSReadEnterProgram(activeReadMapFD int) []BPFInsn {
 	return patchExitJumps(insns)
 }
 
-// BuildGoTLSReadExitProgram is attached as a regular uprobe at `ret` (0xc3) instructions inside
-// `crypto/tls.(*Conn).Read`, reading return count `n` from RAX (offset 80) and looking up the buffer by `(pid << 32) | uint32(R14)`.
+// BuildGoTLSReadExitProgram is attached as a regular uprobe at RET instructions inside
+// `crypto/tls.(*Conn).Read` (0xc3 on amd64, 0xd65f03c0 on arm64), reading return count `n`
+// from GoRet and looking up the buffer by `(pid << 32) | uint32(g)`.
 func BuildGoTLSReadExitProgram(ringbufMapFD, activeReadMapFD int) []BPFInsn {
 	var insns []BPFInsn
 	insns = append(insns,
 		bpfMov64Reg(bpfReg6, bpfReg1),
-		bpfLdXMemDW(bpfReg9, bpfReg6, 80), // RAX = n (bytes read)
+		bpfLdXMemDW(bpfReg9, bpfReg6, archPtRegsOffsets.GoRet), // n (bytes read)
 		bpfCall(bpfFuncGetCurrentPidTgid),
 		bpfRsh64Imm(bpfReg0, 32),
 		bpfLsh64Imm(bpfReg0, 32),
-		bpfLdXMemW(bpfReg1, bpfReg6, 8), // uint32(pt_regs->r14)
+		bpfLdXMemW(bpfReg1, bpfReg6, archPtRegsOffsets.GoGoroutine), // uint32(g)
 		bpfOr64Reg(bpfReg0, bpfReg1),
 		bpfStXMemDW(bpfReg10, bpfReg0, -8),
 	)
@@ -727,8 +728,20 @@ func StartEBPFEngine(
 	mon *selfmon.Monitor,
 	onEvent func(pid, tid int, connID string, dir parser.Direction, payload []byte, mode string),
 ) (*EBPFEngine, error) {
-	if runtime.GOARCH != "amd64" {
-		return nil, fmt.Errorf("ebpf engine currently targets linux/amd64")
+	if !archSupported || !archCapabilities.Supported {
+		err := validateArchEBPFSupport(archName)
+		if mon != nil {
+			mon.RecordWarn(selfmon.StageProbe, "ebpf_arch_unsupported", err.Error(), map[string]any{
+				"arch": archName,
+			})
+		}
+		return nil, err
+	}
+	if archCapabilities.DegradationNotice != "" && mon != nil {
+		mon.RecordWarn(selfmon.StageProbe, "ebpf_arch_capability_boundary", archCapabilities.DegradationNotice, map[string]any{
+			"arch":              archName,
+			"degraded_features": archCapabilities.DegradedFeatures,
+		})
 	}
 	// Raise RLIMIT_MEMLOCK for kernels < 5.11 if permitted
 	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY})
@@ -862,8 +875,17 @@ func (e *EBPFEngine) Close() {
 }
 
 func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
+	if !archCapabilities.UprobeSupported {
+		msg := fmt.Sprintf("ebpf uprobe not supported on linux/%s (%s); degrading to syscall tracepoints and userspace hooks",
+			archName, archCapabilities.DegradationNotice)
+		if e.mon != nil {
+			e.mon.RecordWarn(selfmon.StageProbe, "ebpf_uprobe_degraded", msg, map[string]any{"arch": archName})
+		}
+		return errors.New(msg)
+	}
+
 	sslWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_write",
-		BuildWriteProbeProgram(e.ringMapFD, 112, 104, 96, false))
+		BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false))
 	if err != nil {
 		return err
 	}
@@ -871,7 +893,7 @@ func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
 	e.progFDs = append(e.progFDs, sslWriteProg)
 
 	sslReadEnterProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_r_ent",
-		BuildReadEnterProgram(e.activeSSLReadFD, 112, 104, 0, false))
+		BuildReadEnterProgram(e.activeSSLReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false))
 	if err != nil {
 		return err
 	}
@@ -879,38 +901,52 @@ func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
 	e.progFDs = append(e.progFDs, sslReadEnterProg)
 
 	sslReadExEnterProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_rx_en",
-		BuildReadEnterProgram(e.activeSSLReadFD, 112, 104, 88, false))
+		BuildReadEnterProgram(e.activeSSLReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false))
 	if err != nil {
 		return err
 	}
 	e.sslReadExEnterProg = sslReadExEnterProg
 	e.progFDs = append(e.progFDs, sslReadExEnterProg)
 
-	sslReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_r_ext",
-		BuildReadExitProgram(e.ringMapFD, e.activeSSLReadFD, 80, false))
-	if err != nil {
-		return err
-	}
-	e.sslReadExitProg = sslReadExitProg
-	e.progFDs = append(e.progFDs, sslReadExitProg)
-
-	goTLSWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_w",
-		BuildWriteProbeProgram(e.ringMapFD, 80, 40, 88, false))
-	if err == nil {
-		e.goTLSWriteProg = goTLSWriteProg
-		e.progFDs = append(e.progFDs, goTLSWriteProg)
-	}
-
-	if goTLSReadEnterProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_re",
-		BuildGoTLSReadEnterProgram(e.activeSSLReadFD)); err == nil {
-		e.goTLSReadEnterProg = goTLSReadEnterProg
-		e.progFDs = append(e.progFDs, goTLSReadEnterProg)
+	if archCapabilities.UretprobeSupported {
+		sslReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_r_ext",
+			BuildReadExitProgram(e.ringMapFD, e.activeSSLReadFD, archPtRegsOffsets.CRet, false))
+		if err != nil {
+			return err
+		}
+		e.sslReadExitProg = sslReadExitProg
+		e.progFDs = append(e.progFDs, sslReadExitProg)
+	} else if e.mon != nil {
+		e.mon.RecordWarn(selfmon.StageProbe, "ebpf_uretprobe_degraded",
+			fmt.Sprintf("linux/%s does not support kernel uretprobe for OpenSSL read exit; degrading to syscall tracepoints / userspace hooks", archName),
+			map[string]any{"arch": archName})
 	}
 
-	if goTLSReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_rx",
-		BuildGoTLSReadExitProgram(e.ringMapFD, e.activeSSLReadFD)); err == nil {
-		e.goTLSReadExitProg = goTLSReadExitProg
-		e.progFDs = append(e.progFDs, goTLSReadExitProg)
+	if archCapabilities.GoTLSUprobeSupported {
+		goTLSWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_w",
+			BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false))
+		if err == nil {
+			e.goTLSWriteProg = goTLSWriteProg
+			e.progFDs = append(e.progFDs, goTLSWriteProg)
+		}
+
+		if archCapabilities.GoTLSRetScanSupported {
+			if goTLSReadEnterProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_re",
+				BuildGoTLSReadEnterProgram(e.activeSSLReadFD)); err == nil {
+				e.goTLSReadEnterProg = goTLSReadEnterProg
+				e.progFDs = append(e.progFDs, goTLSReadEnterProg)
+			}
+
+			if goTLSReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_rx",
+				BuildGoTLSReadExitProgram(e.ringMapFD, e.activeSSLReadFD)); err == nil {
+				e.goTLSReadExitProg = goTLSReadExitProg
+				e.progFDs = append(e.progFDs, goTLSReadExitProg)
+			}
+		} else if e.mon != nil {
+			e.mon.RecordWarn(selfmon.StageProbe, "ebpf_gotls_read_degraded",
+				fmt.Sprintf("linux/%s GoTLS Read RET-offset uprobe disabled (kernel uretprobe unsafe on Go goroutine stacks); degrading GoTLS Read to loopback tap", archName),
+				map[string]any{"arch": archName})
+		}
 	}
 
 	e.AttachTargets(targets)
@@ -963,9 +999,17 @@ func (e *EBPFEngine) AttachTargets(targets []ProbeTarget) int {
 				tryAttach(t.BinaryPath, off, false, e.goTLSWriteProg)
 			}
 			if off, ok := t.Symbols["crypto/tls.(*Conn).Read"]; ok && off > 0 {
-				tryAttach(t.BinaryPath, off, false, e.goTLSReadEnterProg)
-				for _, retOff := range t.GoTLSReadRetOffsets {
-					tryAttach(t.BinaryPath, retOff, false, e.goTLSReadExitProg)
+				if len(t.GoTLSReadRetOffsets) == 0 {
+					if e.mon != nil {
+						e.mon.RecordWarn(selfmon.StageProbe, "ebpf_gotls_read_ret_degraded",
+							fmt.Sprintf("linux/%s GoTLS Read on %s has no resolved RET instruction offsets and kernel uretprobe is unsafe on Go stacks; degrading GoTLS Read capture to loopback tap", archName, filepath.Base(t.BinaryPath)),
+							map[string]any{"arch": archName, "binary": t.BinaryPath})
+					}
+				} else {
+					tryAttach(t.BinaryPath, off, false, e.goTLSReadEnterProg)
+					for _, retOff := range t.GoTLSReadRetOffsets {
+						tryAttach(t.BinaryPath, retOff, false, e.goTLSReadExitProg)
+					}
 				}
 			}
 		}
@@ -980,13 +1024,13 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 		insns    []BPFInsn
 		required bool
 	}{
-		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, 16, 24, 32, true), true},
-		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, 16, 24, 32, true), false},
+		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true), true},
+		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true), false},
 		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD), false},
-		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, 16, 24, 0, true), true},
-		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, 16, 24, 0, true), false},
-		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, 16, true), true},
-		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, 16, true), false},
+		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true), true},
+		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true), false},
+		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, archPtRegsOffsets.SyscallRet, true), true},
+		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, archPtRegsOffsets.SyscallRet, true), false},
 	}
 
 	for _, sp := range specs {

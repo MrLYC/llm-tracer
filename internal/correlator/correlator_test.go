@@ -3,8 +3,8 @@ package correlator
 import (
 	"testing"
 
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 	"github.com/stretchr/testify/require"
 )
 

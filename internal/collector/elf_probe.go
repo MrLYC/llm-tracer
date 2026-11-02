@@ -8,13 +8,16 @@ import (
 	"debug/gosym"
 	"debug/macho"
 	"debug/pe"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
 
 type ProbeTarget struct {
@@ -36,6 +39,191 @@ type BinaryProfile struct {
 	GoVersion      string            `json:"go_version,omitempty"`
 	RequiresPtrace bool              `json:"requires_ptrace"`
 	Symbols        map[string]uint64 `json:"symbols,omitempty"`
+}
+
+// ebpfPtRegsOffsets defines byte offsets within the Linux kernel's struct pt_regs (amd64)
+// or struct user_pt_regs (arm64: regs[0..30], sp, pc, pstate) for uprobe/uretprobe and tracepoint contexts.
+type ebpfPtRegsOffsets struct {
+	Regs   [31]int16
+	SP     int16
+	PC     int16
+	PState int16
+
+	// C ABI (System V AMD64 / AAPCS64) parameter & return offsets for OpenSSL uprobes/uretprobes
+	CArg0 int16
+	CArg1 int16
+	CArg2 int16
+	CArg3 int16
+	CRet  int16
+
+	// Go ABIInternal register offsets for GoTLS (crypto/tls.(*Conn).Write / Read)
+	GoArg0      int16
+	GoArg1      int16
+	GoArg2      int16
+	GoRet       int16
+	GoGoroutine int16
+
+	// Syscall tracepoint offsets (trace_event_raw_sys_enter / trace_event_raw_sys_exit)
+	SyscallArg0 int16
+	SyscallArg1 int16
+	SyscallArg2 int16
+	SyscallRet  int16
+}
+
+// ebpfArchCapabilities describes architecture-level eBPF uprobe/uretprobe/tracepoint support and degradation boundaries.
+type ebpfArchCapabilities struct {
+	Arch                        string
+	Supported                   bool
+	UprobeSupported             bool
+	UretprobeSupported          bool // Kernel uretprobe feasibility for C ABI (OpenSSL SSL_read/SSL_read_ex)
+	GoTLSUprobeSupported        bool // Go ABIInternal uprobe feasibility for GoTLS Write/Read entry
+	GoTLSUretprobeSupported     bool // Kernel uretprobe feasibility on Go functions (false due to movable goroutine stacks)
+	GoTLSRetScanSupported       bool // RET instruction offset scanning for GoTLS Read exit uprobes
+	SyscallTracepointsSupported bool
+	PtraceUserspaceSupported    bool
+	DegradedFeatures            []string
+	DegradationNotice           string
+	UnsupportedReason           string
+}
+
+// ARM64 A64 return instruction encodings (little-endian 32-bit words).
+const (
+	arm64InsnRet     uint32 = 0xd65f03c0 // RET (X30)
+	arm64InsnRetMask uint32 = 0xfffffc1f // Mask for RET Xn (1101011001011111000000nnnnn00000)
+	arm64InsnRetBase uint32 = 0xd65f0000 // Base opcode for RET Xn
+	arm64InsnRetAA   uint32 = 0xd65f0bff // RETAA (Pointer Authentication)
+	arm64InsnRetAB   uint32 = 0xd65f0fff // RETAB (Pointer Authentication)
+)
+
+var amd64PtRegsOffsets = ebpfPtRegsOffsets{
+	// Linux x86_64 struct pt_regs: r15=0, r14=8, r13=16, r12=24, rbp=32, rbx=40, r11=48, r10=56,
+	// r9=64, r8=72, rax=80, rcx=88, rdx=96, rsi=104, rdi=112, orig_rax=120, rip=128, cs=136, eflags=144, rsp=152, ss=160
+	Regs: [31]int16{
+		0, 8, 16, 24, 32, 40, 48, 56,
+		64, 72, 80, 88, 96, 104, 112, 120,
+	},
+	SP:          152,
+	PC:          128,
+	PState:      144,
+	CArg0:       112, // rdi
+	CArg1:       104, // rsi
+	CArg2:       96,  // rdx
+	CArg3:       88,  // rcx
+	CRet:        80,  // rax
+	GoArg0:      80,  // rax (c *tls.Conn)
+	GoArg1:      40,  // rbx (b.ptr)
+	GoArg2:      88,  // rcx (b.len)
+	GoRet:       80,  // rax (n int)
+	GoGoroutine: 8,   // r14 (g)
+	SyscallArg0: 16,
+	SyscallArg1: 24,
+	SyscallArg2: 32,
+	SyscallRet:  16,
+}
+
+var arm64PtRegsOffsets = ebpfPtRegsOffsets{
+	// Linux arm64 struct user_pt_regs (arch/arm64/include/uapi/asm/ptrace.h):
+	// __u64 regs[31] (offsets 0..240), __u64 sp (offset 248), __u64 pc (offset 256), __u64 pstate (offset 264)
+	Regs: [31]int16{
+		0, 8, 16, 24, 32, 40, 48, 56,
+		64, 72, 80, 88, 96, 104, 112, 120,
+		128, 136, 144, 152, 160, 168, 176, 184,
+		192, 200, 208, 216, 224, 232, 240,
+	},
+	SP:          248, // offsetof(user_pt_regs, sp) = 31 * 8
+	PC:          256, // offsetof(user_pt_regs, pc) = 32 * 8
+	PState:      264, // offsetof(user_pt_regs, pstate) = 33 * 8
+	CArg0:       0,   // regs[0] (X0)
+	CArg1:       8,   // regs[1] (X1)
+	CArg2:       16,  // regs[2] (X2)
+	CArg3:       24,  // regs[3] (X3)
+	CRet:        0,   // regs[0] (X0)
+	GoArg0:      0,   // regs[0] (R0 = c *tls.Conn)
+	GoArg1:      8,   // regs[1] (R1 = b.ptr)
+	GoArg2:      16,  // regs[2] (R2 = b.len)
+	GoRet:       0,   // regs[0] (R0 = n int)
+	GoGoroutine: 224, // regs[28] (R28 = g on Go arm64 ABIInternal)
+	SyscallArg0: 16,
+	SyscallArg1: 24,
+	SyscallArg2: 32,
+	SyscallRet:  16,
+}
+
+var amd64ArchCapabilities = ebpfArchCapabilities{
+	Arch:                        "amd64",
+	Supported:                   true,
+	UprobeSupported:             true,
+	UretprobeSupported:          true,
+	GoTLSUprobeSupported:        true,
+	GoTLSUretprobeSupported:     false, // Go growable stacks cannot use kernel uretprobe; uses RET-offset uprobes
+	GoTLSRetScanSupported:       true,
+	SyscallTracepointsSupported: true,
+	PtraceUserspaceSupported:    true,
+}
+
+var arm64ArchCapabilities = ebpfArchCapabilities{
+	Arch:                        "arm64",
+	Supported:                   true,
+	UprobeSupported:             true,
+	UretprobeSupported:          true,
+	GoTLSUprobeSupported:        true,
+	GoTLSUretprobeSupported:     false, // Kernel uretprobe replaces X30/LR and breaks Go stack growth/unwinding
+	GoTLSRetScanSupported:       true,
+	SyscallTracepointsSupported: true,
+	PtraceUserspaceSupported:    false,
+	DegradedFeatures: []string{
+		"gotls_native_uretprobe",
+		"arm64_pac_bti_uretprobe",
+		"ptrace_userspace_inject",
+	},
+	DegradationNotice: "linux/arm64 eBPF running with capability boundaries: kernel uretprobe is disabled on GoTLS (using RET 0xd65f03c0 instruction uprobes via user_pt_regs X0/X1/X2/X28); if GoTLS RET offsets are unavailable or PAC/BTI blocks uretprobe, capture degrades to syscall tracepoints / userspace hooks",
+}
+
+var archCapabilityTable = map[string]ebpfArchCapabilities{
+	"amd64": amd64ArchCapabilities,
+	"arm64": arm64ArchCapabilities,
+}
+
+var (
+	archCapabilitiesOverride *ebpfArchCapabilities
+	lastCollectorMonitor     atomic.Pointer[selfmon.Monitor]
+)
+
+// currentArchCapabilities returns the active architecture capability entry, honoring any test override.
+func currentArchCapabilities() ebpfArchCapabilities {
+	if archCapabilitiesOverride != nil {
+		return *archCapabilitiesOverride
+	}
+	if archCapabilities.Arch != "" {
+		return archCapabilities
+	}
+	return lookupArchCapabilities(runtime.GOARCH)
+}
+
+// lookupArchCapabilities returns the capability entry for goarch, or an explicit unsupported descriptor.
+func lookupArchCapabilities(goarch string) ebpfArchCapabilities {
+	if capSpec, ok := archCapabilityTable[goarch]; ok {
+		return capSpec
+	}
+	return ebpfArchCapabilities{
+		Arch:              goarch,
+		Supported:         false,
+		DegradedFeatures:  []string{"ebpf_uprobe", "ebpf_uretprobe", "ebpf_gotls", "ebpf_tracepoint"},
+		DegradationNotice: fmt.Sprintf("linux/%s is not in the eBPF capability table; degrading all capture to userspace hooks / loopback tap", goarch),
+		UnsupportedReason: fmt.Sprintf("ebpf engine unsupported on linux/%s (supported architectures: amd64, arm64; missing pt_regs ABI mapping and RET instruction scanner): falling back to userspace hooks / loopback tap", goarch),
+	}
+}
+
+// validateArchEBPFSupport checks whether goarch is supported by the eBPF engine capability table.
+func validateArchEBPFSupport(goarch string) error {
+	capSpec := lookupArchCapabilities(goarch)
+	if !capSpec.Supported {
+		if capSpec.UnsupportedReason != "" {
+			return fmt.Errorf("%s", capSpec.UnsupportedReason)
+		}
+		return fmt.Errorf("ebpf engine unsupported on linux/%s (supported architectures: amd64, arm64)", goarch)
+	}
+	return nil
 }
 
 // DiscoverOpenSSLTargets finds system libssl.so AND static OpenSSL embedded in target executables (e.g. uv python3.14, node).
@@ -348,72 +536,64 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	}
 	defer rawFile.Close()
 
-		syms := make(map[string]uint64)
-		var readRetOffsets []uint64
-		if f, err := elf.Open(realPath); err == nil {
-			defer f.Close()
-			processGoFunc := func(name string, vaddr, fnSize uint64) {
-				switch name {
-				case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
-					if vaddr == 0 {
-						return
-					}
-					baseOff := vaddrToFileOffset(f, vaddr)
-					entryOff := baseOff
-					if f.Machine == elf.EM_X86_64 && fnSize > 16 {
-						code := make([]byte, fnSize)
-						if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
-							// Advance past Go's stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
-							// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so uprobe fires after any stack growth.
-							prologueWindow := code
-							if len(prologueWindow) > 32 {
-								prologueWindow = prologueWindow[:32]
-							}
-							if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
-								entryOff = baseOff + uint64(idx)
-							}
-							if name == "crypto/tls.(*Conn).Read" && len(readRetOffsets) == 0 {
-								readRetOffsets = findGoX8664RetOffsets(baseOff, code)
-							}
+	syms := make(map[string]uint64)
+	var readRetOffsets []uint64
+	if f, err := elf.Open(realPath); err == nil {
+		defer f.Close()
+		processGoFunc := func(name string, vaddr, fnSize uint64) {
+			switch name {
+			case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
+				if vaddr == 0 {
+					return
+				}
+				baseOff := vaddrToFileOffset(f, vaddr)
+				entryOff := baseOff
+				if (f.Machine == elf.EM_X86_64 || f.Machine == elf.EM_AARCH64) && fnSize > 16 {
+					code := make([]byte, fnSize)
+					if _, err := rawFile.ReadAt(code, int64(baseOff)); err == nil {
+						entryOff = baseOff + scanGoPrologueOffsetForMachine(f.Machine, code)
+						if name == "crypto/tls.(*Conn).Read" && len(readRetOffsets) == 0 {
+							readRetOffsets = findGoRetOffsetsForMachine(f.Machine, baseOff, code)
 						}
 					}
-					syms[name] = entryOff
+				}
+				syms[name] = entryOff
+			}
+		}
+		if elfSyms, err := f.Symbols(); err == nil {
+			for _, s := range elfSyms {
+				processGoFunc(s.Name, s.Value, s.Size)
+			}
+		}
+		// Fallback for stripped Go binaries (`go build -ldflags="-s -w"`): recover symbols from .gopclntab
+		if len(syms) == 0 {
+			var pclnSec *elf.Section
+			for _, secName := range []string{".gopclntab", ".data.rel.ro.gopclntab"} {
+				if s := f.Section(secName); s != nil {
+					pclnSec = s
+					break
 				}
 			}
-			if elfSyms, err := f.Symbols(); err == nil {
-				for _, s := range elfSyms {
-					processGoFunc(s.Name, s.Value, s.Size)
-				}
-			}
-			// Fallback for stripped Go binaries (`go build -ldflags="-s -w"`): recover symbols from .gopclntab
-			if len(syms) == 0 {
-				var pclnSec *elf.Section
-				for _, secName := range []string{".gopclntab", ".data.rel.ro.gopclntab"} {
-					if s := f.Section(secName); s != nil {
-						pclnSec = s
-						break
+			if pclnSec != nil {
+				if pclnData, err := pclnSec.Data(); err == nil && len(pclnData) > 16 {
+					var textStart uint64
+					if txtSec := f.Section(".text"); txtSec != nil {
+						textStart = txtSec.Addr
 					}
-				}
-				if pclnSec != nil {
-					if pclnData, err := pclnSec.Data(); err == nil && len(pclnData) > 16 {
-						var textStart uint64
-						if txtSec := f.Section(".text"); txtSec != nil {
-							textStart = txtSec.Addr
-						}
-						lt := gosym.NewLineTable(pclnData, textStart)
-						if tab, err := gosym.NewTable(nil, lt); err == nil && tab != nil {
-							for _, fn := range tab.Funcs {
-								var sz uint64
-								if fn.End > fn.Entry {
-									sz = fn.End - fn.Entry
-								}
-								processGoFunc(fn.Name, fn.Entry, sz)
+					lt := gosym.NewLineTable(pclnData, textStart)
+					if tab, err := gosym.NewTable(nil, lt); err == nil && tab != nil {
+						for _, fn := range tab.Funcs {
+							var sz uint64
+							if fn.End > fn.Entry {
+								sz = fn.End - fn.Entry
 							}
+							processGoFunc(fn.Name, fn.Entry, sz)
 						}
 					}
 				}
 			}
-		} else if mf, err := macho.Open(realPath); err == nil {
+		}
+	} else if mf, err := macho.Open(realPath); err == nil {
 		defer mf.Close()
 		if mf.Symtab != nil {
 			for _, s := range mf.Symtab.Syms {
@@ -447,10 +627,63 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	}, nil
 }
 
-// findGoX8664RetOffsets scans a Go amd64 function body for frame epilogues (`add $imm, %rsp; pop %rbp; ret`)
-// and returns the file offsets of the `ret` (0xc3) instructions so regular uprobes can capture return values
-// without installing kernel uretprobe trampolines on Go's growable goroutine stacks.
-func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
+// scanAMD64GoPrologueOffset advances past Go's x86_64 stack-split prologue (`cmp 0x10(%r14),%rsp; jbe morestack`)
+// to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so the uprobe fires after any goroutine stack growth.
+func scanAMD64GoPrologueOffset(code []byte) uint64 {
+	prologueWindow := code
+	if len(prologueWindow) > 32 {
+		prologueWindow = prologueWindow[:32]
+	}
+	if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
+		return uint64(idx)
+	}
+	return 0
+}
+
+// scanARM64GoPrologueOffset advances past Go's arm64 stack-split prologue (`MOVD 16(R28), R16; CMP R16, RSP; BLS morestack`)
+// to the frame setup (`MOVD R29, -8(RSP); SUB $8, RSP, R29` or `MOV R29, RSP`) so the uprobe fires after stack growth.
+func scanARM64GoPrologueOffset(code []byte) uint64 {
+	prologueWindow := code
+	if len(prologueWindow) > 36 {
+		prologueWindow = prologueWindow[:36]
+	}
+	// Go 1.20+ arm64 frame pointer setup: MOVD R29, -8(RSP) (0xf81f83fd); SUB $8, RSP, R29 (0xd10023fd)
+	for i := 0; i+8 <= len(prologueWindow); i += 4 {
+		w0 := binary.LittleEndian.Uint32(prologueWindow[i : i+4])
+		w1 := binary.LittleEndian.Uint32(prologueWindow[i+4 : i+8])
+		if w0 == 0xf81f83fd && w1 == 0xd10023fd {
+			return uint64(i)
+		}
+	}
+	// Alternative arm64 frame pointer setup: MOV R29, RSP (0x910003fd)
+	for i := 0; i+4 <= len(prologueWindow); i += 4 {
+		if binary.LittleEndian.Uint32(prologueWindow[i:i+4]) == 0x910003fd {
+			return uint64(i)
+		}
+	}
+	return 0
+}
+
+func scanGoPrologueOffsetForMachine(machine elf.Machine, code []byte) uint64 {
+	switch machine {
+	case elf.EM_X86_64:
+		if archName == "amd64" {
+			return scanGoPrologueOffset(code)
+		}
+		return scanAMD64GoPrologueOffset(code)
+	case elf.EM_AARCH64:
+		if archName == "arm64" {
+			return scanGoPrologueOffset(code)
+		}
+		return scanARM64GoPrologueOffset(code)
+	default:
+		return 0
+	}
+}
+
+// scanAMD64ReturnOffsets scans an x86_64 Go function body for frame epilogues (`add $imm, %rsp; pop %rbp; ret`)
+// and returns the relative byte offsets of the `ret` (0xc3) instructions.
+func scanAMD64ReturnOffsets(code []byte) []uint64 {
 	var out []uint64
 	for i := 0; i+1 < len(code); i++ {
 		if code[i] != 0x5d || code[i+1] != 0xc3 {
@@ -459,13 +692,77 @@ func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
 		isAddRspImm8 := i >= 4 && code[i-4] == 0x48 && code[i-3] == 0x83 && code[i-2] == 0xc4
 		isAddRspImm32 := i >= 7 && code[i-7] == 0x48 && code[i-6] == 0x81 && code[i-5] == 0xc4
 		if isAddRspImm8 || isAddRspImm32 {
-			out = append(out, baseOff+uint64(i)+1)
+			out = append(out, uint64(i)+1)
 		}
 	}
 	return out
 }
 
+// isARM64ReturnInsn reports whether a 32-bit little-endian A64 instruction word is RET (0xd65f03c0),
+// RET Xn ((insn & 0xfffffc1f) == 0xd65f0000), RETAA (0xd65f0bff), or RETAB (0xd65f0fff).
+func isARM64ReturnInsn(insn uint32) bool {
+	return insn == arm64InsnRet ||
+		(insn&arm64InsnRetMask) == arm64InsnRetBase ||
+		insn == arm64InsnRetAA ||
+		insn == arm64InsnRetAB
+}
+
+// scanARM64ReturnOffsets scans a 4-byte aligned arm64 Go function body for RET (0xd65f03c0) / RETAA / RETAB instructions
+// and returns their relative byte offsets within code.
+func scanARM64ReturnOffsets(code []byte) []uint64 {
+	var out []uint64
+	for i := 0; i+4 <= len(code); i += 4 {
+		insn := binary.LittleEndian.Uint32(code[i : i+4])
+		if isARM64ReturnInsn(insn) {
+			out = append(out, uint64(i))
+		}
+	}
+	return out
+}
+
+// findGoX8664RetOffsets scans a Go amd64 function body for frame epilogues (`add $imm, %rsp; pop %rbp; ret`)
+// and returns the file offsets of the `ret` (0xc3) instructions so regular uprobes can capture return values
+// without installing kernel uretprobe trampolines on Go's growable goroutine stacks.
+func findGoX8664RetOffsets(baseOff uint64, code []byte) []uint64 {
+	rel := scanAMD64ReturnOffsets(code)
+	if archName == "amd64" {
+		rel = scanReturnOffsets(code)
+	}
+	out := make([]uint64, len(rel))
+	for i, off := range rel {
+		out[i] = baseOff + off
+	}
+	return out
+}
+
+// findGoARM64RetOffsets scans a Go arm64 function body for RET (0xd65f03c0) instructions and returns file offsets.
+func findGoARM64RetOffsets(baseOff uint64, code []byte) []uint64 {
+	rel := scanARM64ReturnOffsets(code)
+	if archName == "arm64" {
+		rel = scanReturnOffsets(code)
+	}
+	out := make([]uint64, len(rel))
+	for i, off := range rel {
+		out[i] = baseOff + off
+	}
+	return out
+}
+
+func findGoRetOffsetsForMachine(machine elf.Machine, baseOff uint64, code []byte) []uint64 {
+	switch machine {
+	case elf.EM_X86_64:
+		return findGoX8664RetOffsets(baseOff, code)
+	case elf.EM_AARCH64:
+		return findGoARM64RetOffsets(baseOff, code)
+	default:
+		return nil
+	}
+}
+
 func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []ProbeTarget {
+	if mon != nil {
+		lastCollectorMonitor.Store(mon)
+	}
 	var results []ProbeTarget
 	resolvedExes := make([]string, 0, len(exes))
 	for _, e := range exes {
@@ -508,38 +805,38 @@ func ProbeAndRecordTargets(pids []int, exes []string, mon *selfmon.Monitor) []Pr
 				})
 			}
 		}
-			results = append(results, t)
-		}
+		results = append(results, t)
+	}
 
-		allExes := append([]string(nil), resolvedExes...)
-		for _, pid := range pids {
-			if exeLink, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeLink != "" {
-				allExes = append(allExes, exeLink)
-			}
+	allExes := append([]string(nil), resolvedExes...)
+	for _, pid := range pids {
+		if exeLink, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && exeLink != "" {
+			allExes = append(allExes, exeLink)
 		}
-		seenExe := make(map[string]bool)
-		for _, exePath := range allExes {
-			if exePath == "" {
-				continue
-			}
-			realExe, err := filepath.EvalSymlinks(exePath)
-			if err != nil {
-				realExe = exePath
-			}
-			if seenExe[realExe] {
-				continue
-			}
-			seenExe[realExe] = true
-			if gt, err := InspectGoTLSTarget(exePath); err == nil && gt != nil {
-				if len(gt.Symbols) > 0 {
-					for _, off := range gt.Symbols {
-						if fd, err := TryAttachKernelUprobe(gt.BinaryPath, off); err == nil && fd >= 0 {
-							closeKernelFD(fd)
-							gt.Attached = true
-						}
-						break
+	}
+	seenExe := make(map[string]bool)
+	for _, exePath := range allExes {
+		if exePath == "" {
+			continue
+		}
+		realExe, err := filepath.EvalSymlinks(exePath)
+		if err != nil {
+			realExe = exePath
+		}
+		if seenExe[realExe] {
+			continue
+		}
+		seenExe[realExe] = true
+		if gt, err := InspectGoTLSTarget(exePath); err == nil && gt != nil {
+			if len(gt.Symbols) > 0 {
+				for _, off := range gt.Symbols {
+					if fd, err := TryAttachKernelUprobe(gt.BinaryPath, off); err == nil && fd >= 0 {
+						closeKernelFD(fd)
+						gt.Attached = true
 					}
-					gt.Note = fmt.Sprintf("GoTLS (%s) symbols resolved", gt.GoVersion)
+					break
+				}
+				gt.Note = fmt.Sprintf("GoTLS (%s) symbols resolved", gt.GoVersion)
 				if mon != nil {
 					mon.RecordOK(selfmon.StageProbe, "resolve_gotls_symbols", map[string]any{
 						"binary":     gt.BinaryPath,

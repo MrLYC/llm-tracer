@@ -10,7 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuyicong/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
 
 func InspectProcess(pid int) model.ProcessInfo {
@@ -30,7 +31,7 @@ func InspectProcess(pid int) model.ProcessInfo {
 				strs = append(strs, string(p))
 			}
 		}
-		info.Cmdline = strings.Join(strs, " ")
+		info.Cmdline = selfmon.RedactCmdArgs(strs)
 	}
 	if exe, err := os.Readlink(filepath.Join(procDir, "exe")); err == nil {
 		info.Exe = strings.TrimSuffix(exe, " (deleted)")
@@ -43,21 +44,24 @@ func InspectProcess(pid int) model.ProcessInfo {
 }
 
 func readPPID(pid int) int {
+	ppid, _ := readStatPPIDAndStartTime(pid)
+	return ppid
+}
+
+func readProcessStartTime(pid int) uint64 {
+	_, startTime := readStatPPIDAndStartTime(pid)
+	return startTime
+}
+
+func readStatPPIDAndStartTime(pid int) (int, uint64) {
+	if pid <= 0 {
+		return 0, 0
+	}
 	statBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	s := string(statBytes)
-	closeParen := strings.LastIndexByte(s, ')')
-	if closeParen < 0 || closeParen+2 >= len(s) {
-		return 0
-	}
-	fields := strings.Fields(s[closeParen+2:])
-	if len(fields) < 2 {
-		return 0
-	}
-	ppid, _ := strconv.Atoi(fields[1])
-	return ppid
+	return parseProcStatPPIDAndStartTime(string(statBytes))
 }
 
 func readTaskChildren(pid int) []int {

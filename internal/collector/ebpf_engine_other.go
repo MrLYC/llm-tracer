@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/liuyicong/llm-tracer/internal/parser"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
 
 // EBPFEngine is a no-op stub on non-Linux platforms (darwin, windows) where user-space runtime hooks

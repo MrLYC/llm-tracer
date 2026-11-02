@@ -4,7 +4,8 @@ project_name: llm-tracer
 
 before:
   hooks:
-    - go mod tidy
+    # 使用 -diff 而不是 go mod tidy：发布流程不应修改工作区文件，不一致时直接失败
+    - go mod tidy -diff
 
 builds:
   - id: llm-tracer
@@ -20,7 +21,7 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
 
 archives:
   - id: default
@@ -32,6 +33,7 @@ archives:
           - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
+      - LICENSE
       - README.md
       - docs/*
 

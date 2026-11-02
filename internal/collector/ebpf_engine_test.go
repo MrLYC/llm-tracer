@@ -19,28 +19,28 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/liuyicong/llm-tracer/internal/correlator"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/parser"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
-	"github.com/liuyicong/llm-tracer/internal/store"
+	"github.com/mrlyc/llm-tracer/internal/correlator"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/store"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
 func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 	programs := map[string][]BPFInsn{
-		"uprobe_ssl_write":         BuildWriteProbeProgram(3, 112, 104, 96, false),
-		"uprobe_gotls_write":       BuildWriteProbeProgram(3, 80, 40, 88, false),
+		"uprobe_ssl_write":         BuildWriteProbeProgram(3, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false),
+		"uprobe_gotls_write":       BuildWriteProbeProgram(3, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false),
 		"uprobe_gotls_read_enter":  BuildGoTLSReadEnterProgram(4),
 		"uprobe_gotls_read_exit":   BuildGoTLSReadExitProgram(3, 4),
-		"tp_sys_enter_write":       BuildWriteProbeProgram(3, 16, 24, 32, true),
+		"tp_sys_enter_write":       BuildWriteProbeProgram(3, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true),
 		"tp_sys_enter_writev":      BuildWritevProbeProgram(3),
-		"uprobe_ssl_read_enter":    BuildReadEnterProgram(4, 112, 104, 0, false),
-		"uprobe_ssl_read_ex_enter": BuildReadEnterProgram(4, 112, 104, 88, false),
-		"tp_sys_enter_read":        BuildReadEnterProgram(4, 16, 24, 0, true),
-		"uretprobe_ssl_read":       BuildReadExitProgram(3, 4, 80, false),
-		"tp_sys_exit_read":         BuildReadExitProgram(3, 4, 16, true),
+		"uprobe_ssl_read_enter":    BuildReadEnterProgram(4, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false),
+		"uprobe_ssl_read_ex_enter": BuildReadEnterProgram(4, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false),
+		"tp_sys_enter_read":        BuildReadEnterProgram(4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true),
+		"uretprobe_ssl_read":       BuildReadExitProgram(3, 4, archPtRegsOffsets.CRet, false),
+		"tp_sys_exit_read":         BuildReadExitProgram(3, 4, archPtRegsOffsets.SyscallRet, true),
 	}
 
 	for name, insns := range programs {
@@ -153,10 +153,10 @@ func TestEBPFRingBufConsumerAndRecordDispatch(t *testing.T) {
 }
 
 // TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot runs when UID == 0 (root) and verifies:
-// 1. Kernel BPF_MAP_CREATE (RINGBUF + HASH) and BPF_PROG_LOAD pass the Linux kernel eBPF verifier;
-// 2. perf_event_open + PERF_EVENT_IOC_SET_BPF attaches uprobes/uretprobes on libssl.so.3 and syscall tracepoints;
-// 3. An unhooked child process (NO LD_PRELOAD, NO PYTHONPATH, NO ptrace) making a real OpenSSL TLS 1.3
-//    exchange is captured purely via kernel eBPF uprobe -> RingBuf -> StreamReassembler -> Store!
+//  1. Kernel BPF_MAP_CREATE (RINGBUF + HASH) and BPF_PROG_LOAD pass the Linux kernel eBPF verifier;
+//  2. perf_event_open + PERF_EVENT_IOC_SET_BPF attaches uprobes/uretprobes on libssl.so.3 and syscall tracepoints;
+//  3. An unhooked child process (NO LD_PRELOAD, NO PYTHONPATH, NO ptrace) making a real OpenSSL TLS 1.3
+//     exchange is captured purely via kernel eBPF uprobe -> RingBuf -> StreamReassembler -> Store!
 func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("skipping real kernel eBPF load/attach test: requires root (UID 0)")
@@ -167,6 +167,7 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 	require.NoError(t, err)
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
 	corr := correlator.NewCorrelator(mon)
 
 	col, err := NewCollector(dir, model.ScopeFilter{}, corr, st, mon)
@@ -193,17 +194,17 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 		name     string
 		insns    []BPFInsn
 	}{
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_w", BuildWriteProbeProgram(ringFD, 112, 104, 96, false)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_w", BuildWriteProbeProgram(ringFD, 80, 40, 88, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_re", BuildGoTLSReadEnterProgram(sslReadFD)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_rx", BuildGoTLSReadExitProgram(ringFD, sslReadFD)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_re", BuildReadEnterProgram(sslReadFD, 112, 104, 0, false)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rxe", BuildReadEnterProgram(sslReadFD, 112, 104, 88, false)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rx", BuildReadExitProgram(ringFD, sslReadFD, 80, false)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w", BuildWriteProbeProgram(ringFD, 16, 24, 32, true)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_re", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rxe", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rx", BuildReadExitProgram(ringFD, sslReadFD, archPtRegsOffsets.CRet, false)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true)},
 		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_wv", BuildWritevProbeProgram(ringFD)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_re", BuildReadEnterProgram(sysReadFD, 16, 24, 0, true)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rx", BuildReadExitProgram(ringFD, sysReadFD, 16, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_re", BuildReadEnterProgram(sysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rx", BuildReadExitProgram(ringFD, sysReadFD, archPtRegsOffsets.SyscallRet, true)},
 	} {
 		pfd, vlog, err := bpfLoadProgram(tc.progType, tc.name, tc.insns)
 		require.NoError(t, err, "verifier log for %s:\n%s", tc.name, vlog)
@@ -400,7 +401,7 @@ int main(void) {
 	t.Run("EBPF_Scenario4_NodeJS_StaticEmbeddedOpenSSL_UnhookedHTTPS", func(t *testing.T) {
 		nodeBin, err := findNodeExecutable()
 		if err != nil {
-			t.Skip("node not found")
+			t.Fatalf("node not found in root eBPF environment: %v", err)
 		}
 		targets := col.AttachBinaryTargets(nodeBin)
 		hasNodeOpenSSLSyms := false
@@ -411,7 +412,7 @@ int main(void) {
 			}
 		}
 		if !hasNodeOpenSSLSyms {
-			t.Skip("node binary has stripped symbols and no dynamic libssl")
+			t.Fatal("node binary has stripped symbols and no dynamic libssl in root eBPF environment")
 		}
 
 		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -419,6 +420,9 @@ int main(void) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"chatcmpl-node","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"node static openssl ebpf ok"},"finish_reason":"stop"}]}`))
 		}))
+		if ts == nil {
+			t.Fatal("loopback TLS server is nil in root eBPF environment")
+		}
 		defer ts.Close()
 
 		jsCode := fmt.Sprintf(`
@@ -598,13 +602,16 @@ int main(void) {
 	t.Run("EBPF_Scenario8_UnhookedSystemCurl_HTTPS_GeminiGenerateContent", func(t *testing.T) {
 		curlBin, err := exec.LookPath("curl")
 		if err != nil {
-			t.Skip("curl not installed")
+			t.Fatalf("curl not installed in root eBPF environment: %v", err)
 		}
 		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.ReadAll(r.Body)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"curl gemini ebpf uprobe ok"}]},"finishReason":"STOP"}],"modelVersion":"gemini-2.5-pro"}`))
 		}))
+		if ts == nil {
+			t.Fatal("loopback TLS server is nil in root eBPF environment")
+		}
 		defer ts.Close()
 
 		pid := runUnhooked(t, curlBin, "-s", "-k", "--http1.1",
@@ -847,7 +854,7 @@ p.wait()
 
 		curlBin, err := exec.LookPath("curl")
 		if err != nil {
-			t.Skip("curl not installed")
+			t.Fatalf("curl not installed in root eBPF environment: %v", err)
 		}
 		// First with RecordHeaders=false (default): headers should be omitted/redacted
 		col.UpdateScope(model.ScopeFilter{RecordHeaders: false})
@@ -877,7 +884,7 @@ p.wait()
 	t.Run("EBPF_Scenario13_ScopeFilters_Exe_Cwd_Cmd_And_HostFilter", func(t *testing.T) {
 		curlBin, err := exec.LookPath("curl")
 		if err != nil {
-			t.Skip("curl not installed")
+			t.Fatalf("curl not installed in root eBPF environment: %v", err)
 		}
 		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
@@ -974,7 +981,7 @@ time.sleep(0.12)
 
 		curlBin, err := exec.LookPath("curl")
 		if err != nil {
-			t.Skip("curl not installed")
+			t.Fatalf("curl not installed in root eBPF environment: %v", err)
 		}
 		pids := make([]int, 4)
 		doneCh := make(chan int, 4)
@@ -1012,7 +1019,7 @@ time.sleep(0.12)
 		scriptPath := filepath.Join(dir, "launch_wrapper.sh")
 		curlBin, err := exec.LookPath("curl")
 		if err != nil {
-			t.Skip("curl not installed")
+			t.Fatalf("curl not installed in root eBPF environment: %v", err)
 		}
 		scriptContent := fmt.Sprintf("#!/usr/bin/env bash\n%s -s -k --http1.1 -X POST %s/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"gpt-4.1\",\"messages\":[{\"role\":\"user\",\"content\":\"via launch_command wrapper\"}]}'\n", curlBin, ts.URL)
 		require.NoError(t, os.WriteFile(scriptPath, []byte(scriptContent), 0o755))
@@ -1041,4 +1048,41 @@ time.sleep(0.12)
 		stats := mon.Stats()
 		require.GreaterOrEqual(t, stats.TotalOK, int64(15), "selfmon must record OK events across all 15 scenarios")
 	})
+}
+
+func TestEBPFGoTLSReadMissingRetOffsetsRecordsDegradationWarn(t *testing.T) {
+	dir := t.TempDir()
+	mon, err := selfmon.NewMonitor(dir)
+	require.NoError(t, err)
+	defer func() { _ = mon.Close() }()
+
+	eng := &EBPFEngine{
+		ringMapFD:          -1,
+		activeSSLReadFD:    -1,
+		activeSysReadFD:    -1,
+		sslWriteProg:       -1,
+		sslReadEnterProg:   -1,
+		sslReadExEnterProg: -1,
+		sslReadExitProg:    -1,
+		goTLSWriteProg:     -1,
+		goTLSReadEnterProg: -1,
+		goTLSReadExitProg:  -1,
+		attachedKeys:       make(map[string]bool),
+		stopCh:             make(chan struct{}),
+		mon:                mon,
+	}
+
+	added := eng.AttachTargets([]ProbeTarget{
+		{
+			BinaryPath: "/usr/local/bin/stripped_go_agent",
+			Type:       "gotls",
+			Symbols: map[string]uint64{
+				"crypto/tls.(*Conn).Write": 0x1000,
+				"crypto/tls.(*Conn).Read":  0x2000,
+			},
+			GoTLSReadRetOffsets: nil,
+		},
+	})
+	require.Equal(t, 0, added)
+	require.GreaterOrEqual(t, mon.Stats().TotalWarn, int64(1), "missing GoTLS Read RET offsets must emit selfmon degradation warning instead of silently degrading")
 }

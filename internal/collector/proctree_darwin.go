@@ -9,7 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/liuyicong/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,9 +42,9 @@ func InspectProcess(pid int) model.ProcessInfo {
 				info.Comm = filepath.Base(fields[1])
 			}
 			if len(fields) >= 3 {
-				info.Cmdline = strings.Join(fields[2:], " ")
+				info.Cmdline = selfmon.RedactCmdArgs(fields[2:])
 			} else {
-				info.Cmdline = fields[1]
+				info.Cmdline = selfmon.RedactCmdline(fields[1])
 			}
 		}
 	}
@@ -74,9 +75,10 @@ func InspectProcess(pid int) model.ProcessInfo {
 			}
 		}
 		if info.Cmdline == "" {
-			info.Cmdline = strings.Join(os.Args, " ")
+			info.Cmdline = selfmon.RedactCmdArgs(os.Args)
 		}
 	}
+	info.Cmdline = selfmon.RedactCmdline(info.Cmdline)
 	return info
 }
 
@@ -88,6 +90,24 @@ func readPPID(pid int) int {
 		return int(kp.Eproc.Ppid)
 	}
 	return 0
+}
+
+func readProcessStartTime(pid int) uint64 {
+	if pid <= 0 {
+		return 0
+	}
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || kp == nil {
+		return 0
+	}
+	// Conservative fallback: if p_starttime is zero/unavailable, return 0 so caller
+	// never reuses stale cache across process generations and evicts on RefreshSubtree.
+	sec := kp.Proc.P_starttime.Sec
+	usec := kp.Proc.P_starttime.Usec
+	if sec <= 0 && usec <= 0 {
+		return 0
+	}
+	return uint64(sec)*1_000_000 + uint64(uint32(usec))
 }
 
 func readTaskChildren(_ int) []int {

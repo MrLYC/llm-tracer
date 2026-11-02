@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
 
 type sessionTrack struct {
@@ -143,13 +143,13 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 		}
 	}
 
-		// L3: Process Tree + Active Time Window (e.g. JEV step calling helper LLM for TYPE_TEXT)
-		if matched == nil && len(explicitKeys) == 0 && parentRespID == "" {
-			matched, parentID, corrReason = c.matchProcessTreeLocked(ev)
-			if matched != nil {
-				corrLevel = "L3_proctree"
-			}
+	// L3: Process Tree + Active Time Window (e.g. JEV step calling helper LLM for TYPE_TEXT)
+	if matched == nil && len(explicitKeys) == 0 && parentRespID == "" {
+		matched, parentID, corrReason = c.matchProcessTreeLocked(ev)
+		if matched != nil {
+			corrLevel = "L3_proctree"
 		}
+	}
 
 	// Create new session if no correlation matched
 	if matched == nil {
@@ -237,24 +237,24 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 	matched.eventStateByID[ev.ID] = slot
 	c.eventToSess[ev.ID] = slot
 
-		if c.mon != nil {
-			c.mon.Record(selfmon.Event{
-				Status:    selfmon.StatusOK,
-				Stage:     selfmon.StageCorrelator,
-				Action:    "correlate_" + corrLevel,
-				PID:       ev.Process.PID,
-				Comm:      ev.Process.Comm,
-				SessionID: ev.SessionID,
-				Detail: map[string]any{
-					"event_id":  ev.ID,
-					"protocol":  ev.Protocol,
-					"reason":    corrReason,
-					"step":      ev.StepIndex,
-					"turn":      ev.TurnIndex,
-					"parent_id": ev.ParentEventID,
-				},
-			})
-		}
+	if c.mon != nil {
+		c.mon.Record(selfmon.Event{
+			Status:    selfmon.StatusOK,
+			Stage:     selfmon.StageCorrelator,
+			Action:    "correlate_" + corrLevel,
+			PID:       ev.Process.PID,
+			Comm:      ev.Process.Comm,
+			SessionID: ev.SessionID,
+			Detail: map[string]any{
+				"event_id":  ev.ID,
+				"protocol":  ev.Protocol,
+				"reason":    corrReason,
+				"step":      ev.StepIndex,
+				"turn":      ev.TurnIndex,
+				"parent_id": ev.ParentEventID,
+			},
+		})
+	}
 }
 
 func (c *Correlator) pruneStaleLocked(nowMs int64) {

@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,12 +17,159 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
 )
+
+const (
+	injectBackoffInitial = 1 * time.Second
+	injectBackoffMax     = 5 * time.Minute
+)
+
+// ErrPIDOutOfScope is returned when InjectRunningPID is called for a PID outside the active capture scope.
+var ErrPIDOutOfScope = errors.New("pid is outside the configured capture scope")
+
+type pidInjectBackoffState struct {
+	failures    int
+	lastBackoff time.Duration
+	nextRetryAt time.Time
+	lastError   string
+}
+
+var (
+	injectBackoffMu          sync.Mutex
+	injectBackoffByCol       = make(map[*Collector]map[int]*pidInjectBackoffState)
+	injectBackoffCancelByCol = make(map[*Collector]chan struct{})
+)
+
+func isCollectorStopped(c *Collector) bool {
+	if c == nil || c.stopCh == nil {
+		return false
+	}
+	select {
+	case <-c.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func deleteInjectBackoffLocked(c *Collector) {
+	if cancel, ok := injectBackoffCancelByCol[c]; ok {
+		close(cancel)
+		delete(injectBackoffCancelByCol, c)
+	}
+	delete(injectBackoffByCol, c)
+}
+
+func pruneStoppedCollectorsLocked() {
+	for col := range injectBackoffByCol {
+		if isCollectorStopped(col) {
+			deleteInjectBackoffLocked(col)
+		}
+	}
+}
+
+func checkInjectBackoff(c *Collector, pid int, now time.Time) (pidInjectBackoffState, bool) {
+	injectBackoffMu.Lock()
+	defer injectBackoffMu.Unlock()
+	pruneStoppedCollectorsLocked()
+	if c != nil && isCollectorStopped(c) {
+		deleteInjectBackoffLocked(c)
+		return pidInjectBackoffState{}, false
+	}
+	byPID := injectBackoffByCol[c]
+	if byPID == nil {
+		return pidInjectBackoffState{}, false
+	}
+	st, ok := byPID[pid]
+	if !ok || st == nil {
+		return pidInjectBackoffState{}, false
+	}
+	if now.Before(st.nextRetryAt) {
+		return *st, true
+	}
+	return *st, false
+}
+
+func recordInjectFailure(c *Collector, pid int, now time.Time, injectErr error) pidInjectBackoffState {
+	injectBackoffMu.Lock()
+	defer injectBackoffMu.Unlock()
+	pruneStoppedCollectorsLocked()
+	if c != nil && isCollectorStopped(c) {
+		deleteInjectBackoffLocked(c)
+		return pidInjectBackoffState{}
+	}
+	byPID := injectBackoffByCol[c]
+	if byPID == nil {
+		byPID = make(map[int]*pidInjectBackoffState)
+		injectBackoffByCol[c] = byPID
+		if c != nil && c.stopCh != nil {
+			cancel := make(chan struct{})
+			injectBackoffCancelByCol[c] = cancel
+			go func(col *Collector, stopCh, cancelCh <-chan struct{}) {
+				select {
+				case <-stopCh:
+					ResetInjectBackoff(col)
+				case <-cancelCh:
+				}
+			}(c, c.stopCh, cancel)
+		}
+	}
+	st := byPID[pid]
+	if st == nil {
+		st = &pidInjectBackoffState{}
+		byPID[pid] = st
+	}
+	st.failures++
+	shift := st.failures - 1
+	if shift < 0 {
+		shift = 0
+	} else if shift > 9 {
+		shift = 9
+	}
+	backoff := injectBackoffInitial << shift
+	if backoff > injectBackoffMax {
+		backoff = injectBackoffMax
+	}
+	st.lastBackoff = backoff
+	st.nextRetryAt = now.Add(backoff)
+	if injectErr != nil {
+		st.lastError = injectErr.Error()
+	}
+	return *st
+}
+
+func clearInjectBackoff(c *Collector, pid int) {
+	injectBackoffMu.Lock()
+	defer injectBackoffMu.Unlock()
+	if byPID := injectBackoffByCol[c]; byPID != nil {
+		delete(byPID, pid)
+		if len(byPID) == 0 {
+			deleteInjectBackoffLocked(c)
+		}
+	}
+}
+
+// ResetInjectBackoff clears any recorded live-injection failure backoff state for c.
+func ResetInjectBackoff(c *Collector) {
+	injectBackoffMu.Lock()
+	defer injectBackoffMu.Unlock()
+	deleteInjectBackoffLocked(c)
+}
+
+// InjectBackoffEntryCount returns the number of active PID backoff entries tracked for c.
+func InjectBackoffEntryCount(c *Collector) int {
+	injectBackoffMu.Lock()
+	defer injectBackoffMu.Unlock()
+	pruneStoppedCollectorsLocked()
+	return len(injectBackoffByCol[c])
+}
 
 // PIDAttachPlan describes the automatic runtime/TLS detection result for an already-running PID,
 // whether non-intrusive eBPF succeeded, and what intrusive live-attach option is available if eBPF is insufficient.
@@ -39,27 +188,8 @@ type PIDAttachPlan struct {
 	IntrusiveCommandHint string            `json:"intrusive_command_hint,omitempty"`
 	Injected             bool              `json:"injected"`
 	InjectError          string            `json:"inject_error,omitempty"`
+	DegradationNotices   []string          `json:"degradation_notices,omitempty"`
 	Symbols              map[string]uint64 `json:"symbols,omitempty"`
-}
-
-// LaunchAttachPlan describes the automatic pre-launch inspection of a directly launched child command (`-- <cmd>`),
-// whether non-intrusive eBPF Uprobes can cover it directly, and what intrusive CLI arguments, wrapper parameters,
-// and environment parameters were automatically completed when non-intrusive mode cannot be used.
-type LaunchAttachPlan struct {
-	OriginalCmd            []string          `json:"original_cmd"`
-	BinaryPath             string            `json:"binary_path"`
-	ResolvedELF            string            `json:"resolved_elf,omitempty"`
-	DetectedStack          string            `json:"detected_stack"`                  // dynamic-libssl | static-openssl | gotls | jvm-jsse | nodejs | bun-boringssl | python | stripped-embedded-tls | static-pie
-	EBPFActive             bool              `json:"ebpf_active"`                     // true if kernel eBPF engine is active
-	NonIntrusiveOK         bool              `json:"non_intrusive_ok"`                // true if non-intrusive eBPF Uprobes alone can capture TLS for this binary
-	NonIntrusiveReason     string            `json:"non_intrusive_reason"`            // why non-intrusive eBPF succeeded or why it cannot cover this target
-	AutoIntrusiveTriggered bool              `json:"auto_intrusive_triggered"`        // true when non-intrusive mode cannot be used and intrusive parameters were auto-completed
-	IntrusiveMethods       []string          `json:"intrusive_methods,omitempty"`     // e.g. cli_arg:-javaagent, cli_arg:--require, ptrace_wrapper, preload:libssl_hook, env:HTTPS_PROXY
-	InjectedArgs           []string          `json:"injected_args,omitempty"`         // CLI arguments automatically prepended to the child command
-	InjectedEnv            map[string]string `json:"injected_env,omitempty"`          // Key environment parameters automatically injected for the child
-	PtraceWrapped          bool              `json:"ptrace_wrapped,omitempty"`        // true if wrapped via llm_tracer_ptrace <bin> <args...>
-	ExecBin                string            `json:"exec_bin"`                        // Final executable path invoked
-	ExecArgs               []string          `json:"exec_args"`                       // Final argument vector passed to exec.CommandContext
 }
 
 // SetAutoIntrusive configures whether LaunchCommand (`-- <cmd>`) automatically completes intrusive CLI/env parameters
@@ -92,6 +222,16 @@ func (c *Collector) AutoInjectLive() bool {
 	return c.autoInjectLive
 }
 
+// SetRuntimeHooks overrides the runtime hook paths used for live attach (such as PtraceBin).
+func (c *Collector) SetRuntimeHooks(rt *RuntimeHookPaths) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.runtimeHooks = rt
+	c.mu.Unlock()
+}
+
 // LastLaunchPlan returns the most recent LaunchAttachPlan created by PlanLaunchCommand / LaunchCommand.
 func (c *Collector) LastLaunchPlan() *LaunchAttachPlan {
 	c.mu.RLock()
@@ -107,361 +247,13 @@ func (c *Collector) LastLaunchPlan() *LaunchAttachPlan {
 // can cover it directly, and if non-intrusive mode cannot be used, automatically completes the intrusive scheme
 // via CLI arguments (`InjectedArgs`), ptrace wrapper (`PtraceWrapped`), and environment parameters (`InjectedEnv`).
 func (c *Collector) PlanLaunchCommand(cmdArgs []string) (*LaunchAttachPlan, []string, error) {
-	if len(cmdArgs) == 0 {
-		return nil, nil, fmt.Errorf("empty command")
-	}
-	binPath, err := exec.LookPath(cmdArgs[0])
+	in, err := c.inspectLaunchTarget(cmdArgs)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	prof, _ := InspectBinaryProfile(binPath)
-	if prof != nil {
-		extraProbes := ProbeAndRecordTargets(nil, []string{prof.ResolvedELF}, c.mon)
-		if len(extraProbes) > 0 {
-			c.mu.RLock()
-			ebpf := c.ebpfEngine
-			c.mu.RUnlock()
-			if ebpf != nil {
-				ebpf.AttachTargets(extraProbes)
-			}
-			c.mu.Lock()
-			c.probes = append(c.probes, extraProbes...)
-			c.mu.Unlock()
-		}
-	}
-
-	gt, _ := InspectGoTLSTarget(binPath)
-	if gt != nil {
-		c.mu.RLock()
-		ebpf := c.ebpfEngine
-		c.mu.RUnlock()
-		if ebpf != nil {
-			ebpf.AttachTargets([]ProbeTarget{*gt})
-		}
-		c.mu.Lock()
-		c.probes = append(c.probes, *gt)
-		c.mu.Unlock()
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "inspect_launched_go_binary", map[string]any{
-				"binary": binPath, "go_version": gt.GoVersion, "symbols": gt.Symbols,
-			})
-		}
-	}
-
-	c.mu.RLock()
-	ebpf := c.ebpfEngine
-	ebpfActive := ebpf != nil && ebpf.Active()
-	autoIntrusive := c.autoIntrusive
-	sockPath := c.sockPath
-	pipePath := c.pipePath
-	preloadPath := c.preloadPath
-	rtHooks := c.runtimeHooks
-	tap := c.loopbackTap
-	c.mu.RUnlock()
-
-	resolvedELF := binPath
-	if prof != nil && prof.ResolvedELF != "" {
-		resolvedELF = prof.ResolvedELF
-	}
-	baseBin := strings.ToLower(filepath.Base(binPath))
-	baseResolved := strings.ToLower(filepath.Base(resolvedELF))
-
-	isJVM := isJavaBinary(binPath) || isJavaBinary(resolvedELF)
-	isNode := baseBin == "node" || baseBin == "nodejs" || baseBin == "node.exe" ||
-		baseResolved == "node" || baseResolved == "nodejs" || strings.HasPrefix(baseResolved, "node")
-	isBun := baseBin == "bun" || baseBin == "bunx" || baseBin == "bun.exe" || baseResolved == "bun"
-	isPython := strings.HasPrefix(baseBin, "python") || strings.HasPrefix(baseResolved, "python") || baseBin == "uv"
-	isGo := gt != nil && len(gt.Symbols) > 0
-
-	plan := &LaunchAttachPlan{
-		OriginalCmd: append([]string(nil), cmdArgs...),
-		BinaryPath:  binPath,
-		ResolvedELF: resolvedELF,
-		EBPFActive:  ebpfActive,
-		InjectedEnv: make(map[string]string),
-	}
-
-	switch {
-	case isJVM:
-		plan.DetectedStack = "jvm-jsse"
-		plan.NonIntrusiveOK = false
-		plan.NonIntrusiveReason = "Java/JVM 使用 JSSE 纯字节码/JIT 执行 TLS 加解密，无固定 ELF 函数偏移，非侵入式 eBPF Uprobe 无法直接解密"
-	case isBun:
-		plan.DetectedStack = "bun-boringssl"
-		plan.NonIntrusiveOK = false
-		plan.NonIntrusiveReason = "Bun 静态内嵌并 strip 了 BoringSSL 符号表，非侵入式 eBPF Uprobe 无可挂载符号"
-	case isPython:
-		plan.DetectedStack = "python"
-		plan.NonIntrusiveOK = false
-		plan.NonIntrusiveReason = "Python LLM SDK (httpx/aiohttp/uv) 普遍使用 ssl.SSLObject (MemoryBIO/SSL_write_ex) 或静态 strip OpenSSL，仅靠非侵入式 SSL_write Uprobe 无法完整覆盖"
-	case isNode:
-		plan.DetectedStack = "nodejs"
-		plan.NonIntrusiveOK = false
-		if ebpfActive {
-			plan.NonIntrusiveReason = "Node.js (undici/fetch/TLSSocket) 使用 BIO 流与内置根证书束，仅靠非侵入式 eBPF Uprobe 无法完整覆盖，自动通过参数完成 Runtime Hook 注入"
-		} else {
-			plan.NonIntrusiveReason = "当前未启用内核 eBPF Uprobe，自动通过 CLI 参数 (--require) 与环境变量完成 Node.js Runtime Hook 注入"
-		}
-	case isGo:
-		plan.DetectedStack = "gotls"
-		if ebpfActive {
-			plan.NonIntrusiveOK = true
-			plan.NonIntrusiveReason = fmt.Sprintf("已自动解析 GoTLS (%s) 函数偏移 (含 .gopclntab 恢复) 并挂载非侵入式内核 eBPF Uprobe", gt.GoVersion)
-		} else {
-			plan.NonIntrusiveOK = false
-			plan.NonIntrusiveReason = fmt.Sprintf("已解析 GoTLS (%s) 符号偏移，但当前无内核 eBPF 权限，自动通过参数完成代理/证书与 ptrace 侵入式方案", gt.GoVersion)
-		}
-	case prof != nil && (prof.TLSStack == "dynamic-libssl" || prof.TLSStack == "static-openssl"):
-		plan.DetectedStack = prof.TLSStack
-		if ebpfActive {
-			plan.NonIntrusiveOK = true
-			plan.NonIntrusiveReason = fmt.Sprintf("已识别 %s 并挂载非侵入式内核 eBPF Uprobe (SSL_write/SSL_read)", prof.TLSStack)
-		} else {
-			plan.NonIntrusiveOK = false
-			plan.NonIntrusiveReason = fmt.Sprintf("已识别 %s，但当前未启用内核 eBPF 引擎，自动通过参数完成 LD_PRELOAD/DYLD_INSERT_LIBRARIES 与代理注入", prof.TLSStack)
-		}
-	case prof != nil && prof.RequiresPtrace:
-		plan.DetectedStack = "static-pie"
-		plan.NonIntrusiveOK = false
-		plan.NonIntrusiveReason = "目标程序为无 PT_INTERP 的静态链接二进制且无 OpenSSL/GoTLS 符号，非侵入式 eBPF Uprobe 无法解密，自动通过参数完成 ptrace + 代理注入"
-	default:
-		plan.DetectedStack = "stripped-embedded-tls"
-		plan.NonIntrusiveOK = false
-		plan.NonIntrusiveReason = "目标程序使用内嵌/strip TLS 栈 (如 rustls/BoringSSL)，无导出 TLS 符号可供非侵入式 eBPF Uprobe 挂载，自动通过参数完成代理证书与 Hook 注入"
-	}
-
-	userArgs := cmdArgs[1:]
-	if autoIntrusive && !plan.NonIntrusiveOK {
-		plan.AutoIntrusiveTriggered = true
-		if isJVM && rtHooks != nil && rtHooks.JavaAgentJar != "" && !hasArgPrefix(userArgs, "-javaagent:") && !isVersionOrHelpArgs(userArgs) {
-			if tap != nil {
-				pHost, pPort := tap.HostPort()
-				plan.InjectedArgs = []string{
-					"-javaagent:" + rtHooks.JavaAgentJar + "=" + tap.ProxyURL(),
-					"-Dhttp.proxyHost=" + pHost,
-					"-Dhttp.proxyPort=" + pPort,
-					"-Dhttps.proxyHost=" + pHost,
-					"-Dhttps.proxyPort=" + pPort,
-					"-Djdk.internal.httpclient.disableHostnameVerification=true",
-				}
-				plan.IntrusiveMethods = append(plan.IntrusiveMethods, "cli_arg:-javaagent", "cli_arg:-Dhttps.proxyHost")
-			} else {
-				plan.InjectedArgs = []string{"-javaagent:" + rtHooks.JavaAgentJar}
-				plan.IntrusiveMethods = append(plan.IntrusiveMethods, "cli_arg:-javaagent")
-			}
-		} else if isNode && rtHooks != nil && rtHooks.NodeHookJS != "" && !hasArgPrefix(userArgs, "--require") && !hasArgExact(userArgs, "-r") && !isVersionOrHelpArgs(userArgs) {
-			nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
-			plan.InjectedArgs = []string{"--require", nodeHookSlash}
-			plan.IntrusiveMethods = append(plan.IntrusiveMethods, "cli_arg:--require")
-		} else if isBun && rtHooks != nil && rtHooks.NodeHookJS != "" && !hasArgPrefix(userArgs, "--preload") && !isVersionOrHelpArgs(userArgs) {
-			nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
-			plan.InjectedArgs = []string{"--preload", nodeHookSlash}
-			plan.IntrusiveMethods = append(plan.IntrusiveMethods, "cli_arg:--preload")
-		}
-	}
-
-	childArgs := append(append([]string(nil), plan.InjectedArgs...), userArgs...)
-	execBin := binPath
-	execArgs := childArgs
-
-	if autoIntrusive && prof != nil && prof.RequiresPtrace && rtHooks != nil && rtHooks.PtraceBin != "" {
-		execBin = rtHooks.PtraceBin
-		execArgs = append([]string{binPath}, childArgs...)
-		plan.PtraceWrapped = true
-		plan.IntrusiveMethods = append(plan.IntrusiveMethods, "ptrace_wrapper")
-		if c.mon != nil {
-			c.mon.RecordOK(selfmon.StageProbe, "enable_ptrace_syscall_hook", map[string]any{
-				"target":    prof.ResolvedELF,
-				"link_mode": prof.LinkMode,
-				"tls_stack": prof.TLSStack,
-			})
-		}
-	}
-	plan.ExecBin = execBin
-	plan.ExecArgs = execArgs
-
-	env := os.Environ()
-	setAndTrackEnv := func(k, v string) {
-		env = setEnvVar(env, k, v)
-		plan.InjectedEnv[k] = v
-	}
-
-	if sockPath != "" {
-		setAndTrackEnv("LLM_TRACER_SOCK", sockPath)
-	}
-	if pipePath != "" {
-		setAndTrackEnv("LLM_TRACER_PIPE", pipePath)
-	}
-
-	if autoIntrusive {
-		if preloadPath != "" {
-			if runtime.GOOS == "darwin" {
-				if !isJVM {
-					existingDyld := os.Getenv("DYLD_INSERT_LIBRARIES")
-					if existingDyld != "" {
-						setAndTrackEnv("DYLD_INSERT_LIBRARIES", preloadPath+":"+existingDyld)
-					} else {
-						setAndTrackEnv("DYLD_INSERT_LIBRARIES", preloadPath)
-					}
-					if prof != nil && prof.TLSStack == "dynamic-libssl" {
-						setAndTrackEnv("DYLD_FORCE_FLAT_NAMESPACE", "1")
-					}
-					plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "preload:dyld_insert_libraries")
-				}
-			} else if runtime.GOOS == "linux" && !isJVM {
-				existingPreload := os.Getenv("LD_PRELOAD")
-				if existingPreload != "" {
-					setAndTrackEnv("LD_PRELOAD", preloadPath+":"+existingPreload)
-				} else {
-					setAndTrackEnv("LD_PRELOAD", preloadPath)
-				}
-				plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "preload:ld_preload")
-			}
-		}
-		if rtHooks != nil {
-			if rtHooks.PyHookDir != "" {
-				existingPyPath := os.Getenv("PYTHONPATH")
-				sep := string(os.PathListSeparator)
-				if existingPyPath != "" {
-					setAndTrackEnv("PYTHONPATH", rtHooks.PyHookDir+sep+existingPyPath)
-				} else {
-					setAndTrackEnv("PYTHONPATH", rtHooks.PyHookDir)
-				}
-				if isPython {
-					plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:PYTHONPATH(sitecustomize)")
-				}
-			}
-			if rtHooks.NodeHookJS != "" {
-				nodeHookSlash := filepath.ToSlash(rtHooks.NodeHookJS)
-				reqOpt := "--require " + nodeHookSlash
-				if existingNodeOpts := os.Getenv("NODE_OPTIONS"); existingNodeOpts != "" {
-					setAndTrackEnv("NODE_OPTIONS", existingNodeOpts+" "+reqOpt)
-				} else {
-					setAndTrackEnv("NODE_OPTIONS", reqOpt)
-				}
-				preloadOpt := "--preload " + nodeHookSlash
-				if existingBunOpts := os.Getenv("BUN_OPTIONS"); existingBunOpts != "" {
-					setAndTrackEnv("BUN_OPTIONS", existingBunOpts+" "+preloadOpt)
-				} else {
-					setAndTrackEnv("BUN_OPTIONS", preloadOpt)
-				}
-				if isNode {
-					plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:NODE_OPTIONS")
-				}
-				if isBun {
-					plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:BUN_OPTIONS")
-				}
-			}
-			if rtHooks.JavaAgentJar != "" {
-				javaOpt := "-javaagent:" + rtHooks.JavaAgentJar
-				if existingJavaOpts := os.Getenv("JAVA_TOOL_OPTIONS"); existingJavaOpts != "" {
-					setAndTrackEnv("JAVA_TOOL_OPTIONS", existingJavaOpts+" "+javaOpt)
-				} else {
-					setAndTrackEnv("JAVA_TOOL_OPTIONS", javaOpt)
-				}
-				if isJVM {
-					plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:JAVA_TOOL_OPTIONS")
-				}
-			}
-		}
-		if tap != nil {
-			pHost, pPort := tap.HostPort()
-			setAndTrackEnv("LLM_TRACER_PROXY_HOST", pHost)
-			setAndTrackEnv("LLM_TRACER_PROXY_PORT", pPort)
-			setAndTrackEnv("SSL_CERT_FILE", tap.CABundlePath())
-			setAndTrackEnv("CURL_CA_BUNDLE", tap.CABundlePath())
-			setAndTrackEnv("REQUESTS_CA_BUNDLE", tap.CABundlePath())
-			setAndTrackEnv("NODE_EXTRA_CA_CERTS", tap.CABundlePath())
-			setAndTrackEnv("CARGO_HTTP_CAINFO", tap.CABundlePath())
-
-			isRuntime := isShellOrRuntimeBinary(binPath) || isShellOrRuntimeBinary(resolvedELF)
-			needsProxyEnv := !isRuntime &&
-				(runtime.GOOS != "linux" || (prof != nil && (prof.RequiresPtrace || prof.TLSStack == "stripped-embedded-tls")))
-			env = unsetEnvVar(env, "ALL_PROXY")
-			env = unsetEnvVar(env, "all_proxy")
-			env = unsetEnvVar(env, "NO_PROXY")
-			env = unsetEnvVar(env, "no_proxy")
-			if needsProxyEnv {
-				setAndTrackEnv("HTTPS_PROXY", tap.ProxyURL())
-				setAndTrackEnv("https_proxy", tap.ProxyURL())
-				plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "env:HTTPS_PROXY", "env:SSL_CERT_FILE", "loopback_tap")
-				if !CanUsePtrace() || (prof != nil && prof.TLSStack == "stripped-embedded-tls") {
-					setAndTrackEnv("HTTP_PROXY", tap.ProxyURL())
-					setAndTrackEnv("http_proxy", tap.ProxyURL())
-				}
-			} else {
-				env = unsetEnvVar(env, "HTTPS_PROXY")
-				env = unsetEnvVar(env, "https_proxy")
-				env = unsetEnvVar(env, "HTTP_PROXY")
-				env = unsetEnvVar(env, "http_proxy")
-			}
-			if isJVM {
-				plan.IntrusiveMethods = appendUniqueStr(plan.IntrusiveMethods, "loopback_tap")
-			}
-		}
-	}
-
-	c.mu.Lock()
-	c.lastLaunchPlan = plan
-	c.mu.Unlock()
-
-	if c.mon != nil {
-		c.mon.RecordOK(selfmon.StageProbe, "plan_launch_command", map[string]any{
-			"binary":                  plan.BinaryPath,
-			"detected_stack":          plan.DetectedStack,
-			"non_intrusive_ok":        plan.NonIntrusiveOK,
-			"auto_intrusive_triggered": plan.AutoIntrusiveTriggered,
-			"intrusive_methods":       plan.IntrusiveMethods,
-			"injected_args":           plan.InjectedArgs,
-			"ptrace_wrapped":          plan.PtraceWrapped,
-		})
-	}
+	plan := planLaunch(in)
+	env := applyLaunchPlan(c, in, plan, os.Environ())
 	return plan, env, nil
-}
-
-func hasArgPrefix(args []string, prefix string) bool {
-	for _, a := range args {
-		if strings.HasPrefix(a, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasArgExact(args []string, target string) bool {
-	for _, a := range args {
-		if a == target {
-			return true
-		}
-	}
-	return false
-}
-
-func isVersionOrHelpArgs(args []string) bool {
-	if len(args) == 1 {
-		switch args[0] {
-		case "-v", "--version", "-version", "-h", "--help", "-help":
-			return true
-		}
-	}
-	return false
-}
-
-func appendUniqueStr(slice []string, items ...string) []string {
-	for _, item := range items {
-		exists := false
-		for _, s := range slice {
-			if s == item {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			slice = append(slice, item)
-		}
-	}
-	return slice
 }
 
 // AnalyzePIDPlans inspects all running processes matched by any active ScopeFilter selector
@@ -568,6 +360,10 @@ func (c *Collector) PIDPlans() []PIDAttachPlan {
 }
 
 func (c *Collector) inspectSinglePIDPlan(pid int, ebpfActive bool) PIDAttachPlan {
+	if c != nil && c.mon != nil {
+		lastCollectorMonitor.Store(c.mon)
+	}
+	archCap := currentArchCapabilities()
 	info := InspectProcess(pid)
 	exePath := info.Exe
 	if exePath == "" {
@@ -638,9 +434,13 @@ func (c *Collector) inspectSinglePIDPlan(pid int, ebpfActive bool) PIDAttachPlan
 			plan.ActiveMode = "pending_confirmation"
 			plan.IntrusiveNeeded = true
 			plan.EBPFReason = fmt.Sprintf("已解析 GoTLS (%s) 函数偏移，但当前进程无 root/CAP_BPF 权限，无法加载内核 eBPF Uprobe", gt.GoVersion)
-			plan.RecommendedIntrusive = "ptrace_seize"
-			plan.IntrusiveDescription = "通过 PTRACE_SEIZE 热挂载运行中进程系统调用（仅能捕获明文 HTTP/Socket I/O），或以 sudo/CAP_BPF 重新运行 llm-tracer 启用零侵入 GoTLS eBPF Uprobe"
-			plan.IntrusiveCommandHint = fmt.Sprintf("sudo llm-tracer capture --pid %d", pid)
+			c.applyPtraceLiveFallback(
+				pid,
+				archCap,
+				&plan,
+				"通过 PTRACE_SEIZE 热挂载运行中进程系统调用（仅能捕获明文 HTTP/Socket I/O），或以 sudo/CAP_BPF 重新运行 llm-tracer 启用零侵入 GoTLS eBPF Uprobe",
+				fmt.Sprintf("sudo llm-tracer capture --pid %d", pid),
+			)
 			return plan
 		}
 	}
@@ -701,9 +501,13 @@ func (c *Collector) inspectSinglePIDPlan(pid int, ebpfActive bool) PIDAttachPlan
 			plan.IntrusiveDescription = "向运行中 Node.js 进程发送 SIGUSR1 临时开启 V8 Inspector 端口，通过 Runtime.evaluate 动态注入 TLSSocket/Socket Hook 后立即关闭调试端口，免重启生效"
 			plan.IntrusiveCommandHint = fmt.Sprintf("llm-tracer capture --pid %d --inject-live", pid)
 		} else {
-			plan.RecommendedIntrusive = "ptrace_seize"
-			plan.IntrusiveDescription = "通过 PTRACE_SEIZE 热挂载运行中进程系统调用（退出时自动 PTRACE_DETACH），或使用 sudo 运行以启用 eBPF Uprobe"
-			plan.IntrusiveCommandHint = fmt.Sprintf("llm-tracer capture --pid %d --inject-live", pid)
+			c.applyPtraceLiveFallback(
+				pid,
+				archCap,
+				&plan,
+				"通过 PTRACE_SEIZE 热挂载运行中进程系统调用（退出时自动 PTRACE_DETACH），或使用 sudo 运行以启用 eBPF Uprobe",
+				fmt.Sprintf("llm-tracer capture --pid %d --inject-live", pid),
+			)
 		}
 		return plan
 	}
@@ -742,22 +546,87 @@ func (c *Collector) inspectSinglePIDPlan(pid int, ebpfActive bool) PIDAttachPlan
 		plan.EBPFReason = "当前未启用内核 eBPF 引擎，且目标进程已在运行中"
 	}
 	plan.IntrusiveNeeded = true
-	plan.RecommendedIntrusive = "ptrace_seize"
-	plan.IntrusiveDescription = "通过 PTRACE_SEIZE 热挂载运行中进程系统调用（退出时自动 PTRACE_DETACH 不中断目标进程）"
-	plan.IntrusiveCommandHint = fmt.Sprintf("llm-tracer capture --pid %d --inject-live", pid)
+	c.applyPtraceLiveFallback(
+		pid,
+		archCap,
+		&plan,
+		"通过 PTRACE_SEIZE 热挂载运行中进程系统调用（退出时自动 PTRACE_DETACH 不中断目标进程）",
+		fmt.Sprintf("llm-tracer capture --pid %d --inject-live", pid),
+	)
 	return plan
+}
+
+func (c *Collector) applyPtraceLiveFallback(
+	pid int,
+	archCap ebpfArchCapabilities,
+	plan *PIDAttachPlan,
+	defaultDesc string,
+	defaultHint string,
+) {
+	if archCap.PtraceUserspaceSupported {
+		plan.RecommendedIntrusive = "ptrace_seize"
+		plan.IntrusiveDescription = defaultDesc
+		plan.IntrusiveCommandHint = defaultHint
+		return
+	}
+	notice := fmt.Sprintf("linux/%s 能力表 PtraceUserspaceSupported=false（内置用户态 ptrace 注入器仅支持 x86_64），已跳过 ptrace_seize 热注入方案", archCap.Arch)
+	if archCap.DegradationNotice != "" {
+		notice = fmt.Sprintf("%s [%s]", notice, archCap.DegradationNotice)
+	}
+	plan.RecommendedIntrusive = ""
+	plan.DegradationNotices = appendUniqueStr(plan.DegradationNotices, notice)
+	plan.IntrusiveDescription = notice
+	plan.IntrusiveCommandHint = fmt.Sprintf("sudo llm-tracer capture --pid %d", pid)
+	if c != nil && c.mon != nil {
+		c.mon.RecordWarn(selfmon.StageProbe, "ptrace_arch_unsupported", notice, map[string]any{
+			"pid":              pid,
+			"arch":             archCap.Arch,
+			"detected_stack":   plan.DetectedStack,
+			"ptrace_supported": archCap.PtraceUserspaceSupported,
+		})
+	}
 }
 
 // InjectRunningPID executes the recommended live intrusive attachment for an already-running PID without restarting it.
 func (c *Collector) InjectRunningPID(pid int) (*PIDAttachPlan, error) {
+	if c == nil || c.tracker == nil || !c.tracker.IsInScope(pid) {
+		err := fmt.Errorf("%w: pid %d", ErrPIDOutOfScope, pid)
+		if c != nil && c.mon != nil {
+			c.mon.RecordWarn(selfmon.StageProbe, "pid_inject_out_of_scope_blocked", err.Error(), map[string]any{
+				"pid": pid,
+			})
+		}
+		return &PIDAttachPlan{
+			PID:         pid,
+			InjectError: err.Error(),
+		}, err
+	}
 	c.mu.RLock()
 	ebpf := c.ebpfEngine
 	ebpfActive := ebpf != nil && ebpf.Active()
 	c.mu.RUnlock()
 
+	c.ensureHookChannelPermissions([]int{pid})
+
 	plan := c.inspectSinglePIDPlan(pid, ebpfActive)
 	if !plan.IntrusiveNeeded && plan.EBPFStatus == "attached" {
 		return &plan, nil
+	}
+
+	now := time.Now()
+	if st, backedOff := checkInjectBackoff(c, pid, now); backedOff {
+		plan.InjectError = st.lastError
+		if c != nil && c.mon != nil {
+			c.mon.RecordWarn(selfmon.StageProbe, "inject_backoff", st.lastError, map[string]any{
+				"pid":         pid,
+				"method":      plan.RecommendedIntrusive,
+				"stack":       plan.DetectedStack,
+				"failures":    st.failures,
+				"backoff_ms":  st.lastBackoff.Milliseconds(),
+				"retry_in_ms": st.nextRetryAt.Sub(now).Milliseconds(),
+			})
+		}
+		return &plan, fmt.Errorf("inject pid %d backed off after %d failures: %s", pid, st.failures, st.lastError)
 	}
 
 	var err error
@@ -769,21 +638,37 @@ func (c *Collector) InjectRunningPID(pid int) (*PIDAttachPlan, error) {
 	case "ptrace_seize":
 		err = c.injectRunningPtrace(pid)
 	default:
-		err = fmt.Errorf("no live injector available for stack %s", plan.DetectedStack)
+		if len(plan.DegradationNotices) > 0 {
+			err = fmt.Errorf("no live injector available for stack %s: %s", plan.DetectedStack, strings.Join(plan.DegradationNotices, "; "))
+		} else {
+			err = fmt.Errorf("no live injector available for stack %s", plan.DetectedStack)
+		}
 	}
 
 	if err != nil {
+		st := recordInjectFailure(c, pid, time.Now(), err)
 		plan.InjectError = err.Error()
 		if c.mon != nil {
 			c.mon.RecordError(selfmon.StageProbe, "inject_running_pid", err, map[string]any{
-				"pid":    pid,
-				"method": plan.RecommendedIntrusive,
-				"stack":  plan.DetectedStack,
+				"pid":        pid,
+				"method":     plan.RecommendedIntrusive,
+				"stack":      plan.DetectedStack,
+				"failures":   st.failures,
+				"backoff_ms": st.lastBackoff.Milliseconds(),
+			})
+			c.mon.RecordWarn(selfmon.StageProbe, "inject_backoff", err.Error(), map[string]any{
+				"pid":         pid,
+				"method":      plan.RecommendedIntrusive,
+				"stack":       plan.DetectedStack,
+				"failures":    st.failures,
+				"backoff_ms":  st.lastBackoff.Milliseconds(),
+				"retry_in_ms": st.lastBackoff.Milliseconds(),
 			})
 		}
 		return &plan, err
 	}
 
+	clearInjectBackoff(c, pid)
 	plan.Injected = true
 	plan.IntrusiveNeeded = false
 	plan.ActiveMode = plan.RecommendedIntrusive
@@ -824,20 +709,42 @@ func (c *Collector) injectRunningJVM(pid int) error {
 		return fmt.Errorf("loopback tap not active")
 	}
 
-	// Copy the agent JAR to a world-readable path in /tmp so the target JVM process can always read it.
-	sharedJar := filepath.Join(os.TempDir(), fmt.Sprintf("llm_tracer_agent_%d.jar", os.Getpid()))
 	rawJar, err := os.ReadFile(rtHooks.JavaAgentJar)
 	if err != nil {
 		return fmt.Errorf("read java agent jar: %w", err)
 	}
-	if err := os.WriteFile(sharedJar, rawJar, 0o644); err != nil {
+	// Stage the agent JAR via os.CreateTemp (O_EXCL) to prevent symlink hijacking in /tmp,
+	// then chmod 0o644 so the target JVM process can read it during Dynamic Attach.
+	tmpJar, err := os.CreateTemp(os.TempDir(), fmt.Sprintf("llm_tracer_agent_%d_*.jar", pid))
+	if err != nil {
+		return fmt.Errorf("create temp java agent jar: %w", err)
+	}
+	sharedJar := tmpJar.Name()
+	if _, err := tmpJar.Write(rawJar); err != nil {
+		_ = tmpJar.Close()
+		_ = os.Remove(sharedJar)
 		return fmt.Errorf("stage shared java agent jar: %w", err)
 	}
-	_ = os.Chmod(sharedJar, 0o644)
+	if err := tmpJar.Chmod(0o644); err != nil {
+		_ = tmpJar.Close()
+		_ = os.Remove(sharedJar)
+		return fmt.Errorf("chmod shared java agent jar: %w", err)
+	}
+	if err := tmpJar.Close(); err != nil {
+		_ = os.Remove(sharedJar)
+		return fmt.Errorf("close shared java agent jar: %w", err)
+	}
 
 	c.mu.Lock()
 	c.activeTapPID = pid
+	c.stagedAgentJars = append(c.stagedAgentJars, sharedJar)
 	c.mu.Unlock()
+	if c.mon != nil {
+		c.mon.RecordOK(selfmon.StageProbe, "stage_jvm_agent_jar", map[string]any{
+			"pid":      pid,
+			"jar_path": sharedJar,
+		})
+	}
 
 	proxyURL := tap.ProxyURL()
 
@@ -868,11 +775,20 @@ func (c *Collector) injectRunningJVM(pid int) error {
 			fmt.Sprintf("/proc/%d/cwd/.attach_pid%d", pid, pid),
 			filepath.Join(os.TempDir(), fmt.Sprintf(".attach_pid%d", pid)),
 		}
+		// HotSpot AttachListener::is_init_trigger only calls stat() on .attach_pid<pid> to check trigger
+		// existence and owner UID (st_uid == geteuid() or root); the JVM never writes to this file.
+		// Open with O_NOFOLLOW and apply f.Chmod() on the open file descriptor (fchmod semantics) via
+		// initPipeFileNoFollow before Close to eliminate path-based chmod TOCTOU symlink races while
+		// preserving the minimum permissions required by HotSpot (0o600 for same-UID, 0o644 across UIDs).
+		attachPerm := os.FileMode(0o600)
+		if isCrossUIDProcess(pid) {
+			attachPerm = 0o644
+		}
 		for _, af := range attachFiles {
-			if f, err := os.Create(af); err == nil {
-				_ = f.Close()
-				_ = os.Chmod(af, 0o666)
-				defer os.Remove(af)
+			if err := createJVMAttachTriggerFile(af, attachPerm); err == nil {
+				defer func(p string) {
+					_ = removeSocketNoFollow(p)
+				}(af)
 			}
 		}
 		_ = sendSignalByName(pid, "QUIT")
@@ -914,8 +830,507 @@ func (c *Collector) injectRunningJVM(pid int) error {
 	return nil
 }
 
-// injectRunningNodeJS sends SIGUSR1 to a running Node.js process to activate the V8 Inspector on 127.0.0.1:9229,
-// evaluates a runtime expression that sets LLM_TRACER_PIPE and requires node_hook.cjs, and immediately closes the inspector.
+// createJVMAttachTriggerFile safely creates a HotSpot .attach_pid<pid> trigger file using O_NOFOLLOW
+// and fchmod on the open file descriptor (via initPipeFileNoFollow) to prevent symlink TOCTOU attacks.
+func createJVMAttachTriggerFile(path string, perm os.FileMode) error {
+	_ = removeSocketNoFollow(path)
+	return initPipeFileNoFollow(path, perm, -1)
+}
+
+// nodeInspectorTarget represents a single target entry returned by V8 Inspector GET /json.
+type nodeInspectorTarget struct {
+	ID                   string `json:"id"`
+	Title                string `json:"title"`
+	Type                 string `json:"type"`
+	Description          string `json:"description"`
+	URL                  string `json:"url"`
+	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	PID                  int    `json:"pid,omitempty"`
+}
+
+type procListeningSocket struct {
+	Endpoint string
+	Port     int
+	Inode    string
+}
+
+var (
+	nodeInspectorProcRoot    = "/proc"
+	nodeInspectorPollTimeout = 2500 * time.Millisecond
+	nodeInspectorLookupHook  func(pid int, cmdline string) (string, error)
+)
+
+func parseSocketInodeLink(linkTarget string) string {
+	linkTarget = strings.TrimSpace(linkTarget)
+	if strings.HasPrefix(linkTarget, "socket:[") && strings.HasSuffix(linkTarget, "]") {
+		return strings.TrimSuffix(strings.TrimPrefix(linkTarget, "socket:["), "]")
+	}
+	if strings.HasPrefix(linkTarget, "[0000]:") {
+		return strings.TrimPrefix(linkTarget, "[0000]:")
+	}
+	return ""
+}
+
+func collectPIDSocketInodes(procRoot string, pid int) (map[string]bool, bool) {
+	fdDir := filepath.Join(procRoot, strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil, false
+	}
+	inodes := make(map[string]bool)
+	for _, ent := range entries {
+		link, err := os.Readlink(filepath.Join(fdDir, ent.Name()))
+		if err != nil {
+			continue
+		}
+		if inode := parseSocketInodeLink(link); inode != "" && inode != "0" {
+			inodes[inode] = true
+		}
+	}
+	return inodes, true
+}
+
+func parseProcNetTCPAddr(localAddr string, isIPv6 bool) (endpoint string, port int, ok bool) {
+	parts := strings.Split(strings.TrimSpace(localAddr), ":")
+	if len(parts) != 2 {
+		return "", 0, false
+	}
+	portVal, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil || portVal == 0 {
+		return "", 0, false
+	}
+	port = int(portVal)
+	ipHex := strings.ToUpper(strings.TrimSpace(parts[0]))
+
+	if !isIPv6 {
+		if len(ipHex) != 8 {
+			return "", 0, false
+		}
+		raw, err := hex.DecodeString(ipHex)
+		if err != nil || len(raw) != 4 {
+			return "", 0, false
+		}
+		// Linux /proc/net/tcp stores IPv4 in host (little-endian) byte order: 0100007F -> 127.0.0.1.
+		// Also accept 7F000001 for hand-written test fixtures.
+		ipLE := net.IPv4(raw[3], raw[2], raw[1], raw[0])
+		ipBE := net.IPv4(raw[0], raw[1], raw[2], raw[3])
+		switch {
+		case ipLE.IsUnspecified():
+			return fmt.Sprintf("127.0.0.1:%d", port), port, true
+		case ipLE.IsLoopback():
+			return fmt.Sprintf("%s:%d", ipLE.String(), port), port, true
+		case ipBE.IsLoopback():
+			return fmt.Sprintf("%s:%d", ipBE.String(), port), port, true
+		default:
+			return "", 0, false
+		}
+	}
+
+	if len(ipHex) != 32 {
+		return "", 0, false
+	}
+	switch ipHex {
+	case "00000000000000000000000000000000",
+		"00000000000000000000000001000000",
+		"00000000000000000000000000000001",
+		"0000000000000000FFFF00000100007F",
+		"00000000000000000000FFFF0100007F",
+		"00000000000000000000FFFF7F000001":
+		return fmt.Sprintf("127.0.0.1:%d", port), port, true
+	default:
+		return "", 0, false
+	}
+}
+
+func parseProcNetTCPFile(path string, isIPv6 bool) ([]procListeningSocket, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []procListeningSocket
+	sc := bufio.NewScanner(f)
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if lineNo == 1 && (strings.EqualFold(fields[0], "sl") || strings.Contains(strings.ToLower(line), "local_address")) {
+			continue
+		}
+		if len(fields) < 10 {
+			continue
+		}
+		// st == 0A is TCP_LISTEN
+		if !strings.EqualFold(fields[3], "0A") {
+			continue
+		}
+		ep, port, ok := parseProcNetTCPAddr(fields[1], isIPv6)
+		if !ok {
+			continue
+		}
+		out = append(out, procListeningSocket{
+			Endpoint: ep,
+			Port:     port,
+			Inode:    fields[9],
+		})
+	}
+	return out, sc.Err()
+}
+
+func sortInspectorSockets(sockets []procListeningSocket) []string {
+	sort.SliceStable(sockets, func(i, j int) bool {
+		pi, pj := sockets[i].Port, sockets[j].Port
+		rankPort := func(p int) int {
+			switch {
+			case p == 9229:
+				return 0
+			case p >= 9230 && p <= 9299:
+				return 1
+			default:
+				return 2
+			}
+		}
+		ri, rj := rankPort(pi), rankPort(pj)
+		if ri != rj {
+			return ri < rj
+		}
+		return pi < pj
+	})
+	var endpoints []string
+	seen := make(map[string]bool, len(sockets))
+	for _, s := range sockets {
+		if !seen[s.Endpoint] {
+			seen[s.Endpoint] = true
+			endpoints = append(endpoints, s.Endpoint)
+		}
+	}
+	return endpoints
+}
+
+// discoverPIDInspectorEndpoints locates loopback TCP listening endpoints for pid using
+// <procRoot>/<pid>/fd socket inodes and <procRoot>/<pid>/net/tcp{,6}.
+func discoverPIDInspectorEndpoints(procRoot string, pid int) ([]string, bool, error) {
+	if procRoot == "" {
+		procRoot = nodeInspectorProcRoot
+	}
+	if pid <= 0 {
+		return nil, false, fmt.Errorf("invalid pid %d", pid)
+	}
+	pidDir := filepath.Join(procRoot, strconv.Itoa(pid))
+	tcpSockets, err4 := parseProcNetTCPFile(filepath.Join(pidDir, "net", "tcp"), false)
+	tcp6Sockets, err6 := parseProcNetTCPFile(filepath.Join(pidDir, "net", "tcp6"), true)
+	if err4 != nil && err6 != nil {
+		return nil, false, fmt.Errorf("read %s/net/tcp: %w", pidDir, err4)
+	}
+	allListen := append(tcpSockets, tcp6Sockets...)
+
+	pidInodes, hasFDDir := collectPIDSocketInodes(procRoot, pid)
+	if hasFDDir {
+		var owned []procListeningSocket
+		for _, s := range allListen {
+			if s.Inode != "" && s.Inode != "0" && pidInodes[s.Inode] {
+				owned = append(owned, s)
+			}
+		}
+		return sortInspectorSockets(owned), true, nil
+	}
+
+	// Fallback when <procRoot>/<pid>/fd is absent (e.g. minimal synthetic /proc/<pid>/net/tcp test fixture):
+	// single listening endpoint is treated as authoritative for that per-PID table; multiple endpoints require /json disambiguation.
+	var nonZero []procListeningSocket
+	for _, s := range allListen {
+		if s.Inode != "0" {
+			nonZero = append(nonZero, s)
+		}
+	}
+	endpoints := sortInspectorSockets(nonZero)
+	return endpoints, len(endpoints) == 1, nil
+}
+
+func extractPIDFromInspectorText(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	// 1. Match bracketed PID such as "node[12345]" or "process[12345]"
+	for rest := s; ; {
+		openIdx := strings.IndexByte(rest, '[')
+		if openIdx < 0 {
+			break
+		}
+		closeIdx := strings.IndexByte(rest[openIdx+1:], ']')
+		if closeIdx < 0 {
+			break
+		}
+		inside := strings.TrimSpace(rest[openIdx+1 : openIdx+1+closeIdx])
+		if pid, err := strconv.Atoi(inside); err == nil && pid > 0 {
+			return pid
+		}
+		rest = rest[openIdx+1+closeIdx+1:]
+	}
+	// 2. Match "pid:12345", "pid=12345", "pid 12345"
+	lower := strings.ToLower(s)
+	for idx := 0; idx < len(lower); {
+		pos := strings.Index(lower[idx:], "pid")
+		if pos < 0 {
+			break
+		}
+		absPos := idx + pos
+		if absPos > 0 {
+			prev := lower[absPos-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') {
+				idx = absPos + 3
+				continue
+			}
+		}
+		after := lower[absPos+3:]
+		after = strings.TrimLeft(after, " :=\t")
+		var digits strings.Builder
+		for i := 0; i < len(after); i++ {
+			if after[i] >= '0' && after[i] <= '9' {
+				digits.WriteByte(after[i])
+			} else {
+				break
+			}
+		}
+		if digits.Len() > 0 {
+			if pid, err := strconv.Atoi(digits.String()); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		idx = absPos + 3
+	}
+	return 0
+}
+
+func extractTargetExplicitPID(t nodeInspectorTarget) int {
+	if t.PID > 0 {
+		return t.PID
+	}
+	if pid := extractPIDFromInspectorText(t.Title); pid > 0 {
+		return pid
+	}
+	if pid := extractPIDFromInspectorText(t.Description); pid > 0 {
+		return pid
+	}
+	return 0
+}
+
+func matchesNodeCmdline(cmdline string, t nodeInspectorTarget) bool {
+	cmdline = strings.TrimSpace(cmdline)
+	if cmdline == "" {
+		return false
+	}
+	fields := strings.Fields(cmdline)
+	var scriptTokens []string
+	for i, tok := range fields {
+		if i == 0 {
+			base := strings.ToLower(filepath.Base(tok))
+			if base == "node" || base == "nodejs" || base == "node.exe" || strings.HasPrefix(base, "node") {
+				continue
+			}
+		}
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		cleaned := filepath.ToSlash(strings.TrimSpace(tok))
+		if cleaned == "" {
+			continue
+		}
+		base := filepath.Base(cleaned)
+		if len(base) >= 3 && base != "node" && base != "nodejs" {
+			scriptTokens = append(scriptTokens, cleaned, base)
+		}
+	}
+	if len(scriptTokens) == 0 {
+		return false
+	}
+	haystack := strings.ToLower(filepath.ToSlash(t.URL + " " + t.Title + " " + t.Description))
+	for _, st := range scriptTokens {
+		if strings.Contains(haystack, strings.ToLower(st)) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateInspectorWSURL(wsURL, expectedEndpoint string) error {
+	u, err := url.Parse(strings.TrimSpace(wsURL))
+	if err != nil {
+		return fmt.Errorf("invalid webSocketDebuggerUrl %q: %w", wsURL, err)
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return fmt.Errorf("unexpected scheme in webSocketDebuggerUrl %q", wsURL)
+	}
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return fmt.Errorf("non-loopback host in webSocketDebuggerUrl %q", wsURL)
+	}
+	if expectedEndpoint != "" {
+		_, expPort, err := net.SplitHostPort(expectedEndpoint)
+		if err == nil && expPort != "" && u.Port() != "" && u.Port() != expPort {
+			return fmt.Errorf("webSocketDebuggerUrl port %s does not match queried inspector port %s", u.Port(), expPort)
+		}
+	}
+	return nil
+}
+
+// selectNodeInspectorTarget chooses and validates a V8 Inspector target for pid from GET /json results.
+// When socketOwnedByPID is false, it requires an explicit PID or cmdline script match and refuses blind selection.
+func selectNodeInspectorTarget(
+	pid int,
+	cmdline string,
+	endpoint string,
+	targets []nodeInspectorTarget,
+	socketOwnedByPID bool,
+) (string, error) {
+	var valid []nodeInspectorTarget
+	for _, t := range targets {
+		if strings.TrimSpace(t.WebSocketDebuggerURL) == "" {
+			continue
+		}
+		if err := validateInspectorWSURL(t.WebSocketDebuggerURL, endpoint); err != nil {
+			continue
+		}
+		valid = append(valid, t)
+	}
+	if len(valid) == 0 {
+		return "", fmt.Errorf("no valid V8 inspector targets with webSocketDebuggerUrl on %s", endpoint)
+	}
+
+	var (
+		pidMatched     []nodeInspectorTarget
+		cmdlineMatched []nodeInspectorTarget
+		untagged       []nodeInspectorTarget
+		mismatchedPID  int
+	)
+	for _, t := range valid {
+		tPID := extractTargetExplicitPID(t)
+		switch {
+		case tPID == pid:
+			pidMatched = append(pidMatched, t)
+		case tPID > 0 && tPID != pid:
+			mismatchedPID = tPID
+		default:
+			if matchesNodeCmdline(cmdline, t) {
+				cmdlineMatched = append(cmdlineMatched, t)
+			} else {
+				untagged = append(untagged, t)
+			}
+		}
+	}
+
+	if len(pidMatched) == 1 {
+		return pidMatched[0].WebSocketDebuggerURL, nil
+	}
+	if len(pidMatched) > 1 {
+		for _, t := range pidMatched {
+			if matchesNodeCmdline(cmdline, t) {
+				return t.WebSocketDebuggerURL, nil
+			}
+		}
+		return pidMatched[0].WebSocketDebuggerURL, nil
+	}
+
+	if mismatchedPID > 0 && len(cmdlineMatched) == 0 && len(untagged) == 0 {
+		return "", fmt.Errorf("V8 inspector on %s belongs to pid %d, not target pid %d; refusing injection", endpoint, mismatchedPID, pid)
+	}
+
+	if len(cmdlineMatched) == 1 && mismatchedPID == 0 {
+		return cmdlineMatched[0].WebSocketDebuggerURL, nil
+	}
+	if len(cmdlineMatched) > 1 {
+		return "", fmt.Errorf("ambiguous V8 inspector targets (%d matched cmdline) on %s for pid %d; refusing blind injection", len(cmdlineMatched), endpoint, pid)
+	}
+
+	if socketOwnedByPID && mismatchedPID == 0 {
+		if len(untagged) == 1 {
+			return untagged[0].WebSocketDebuggerURL, nil
+		}
+		return "", fmt.Errorf("ambiguous V8 inspector targets (%d candidates) on %s for pid %d; refusing blind injection", len(untagged), endpoint, pid)
+	}
+
+	return "", fmt.Errorf("cannot verify that V8 inspector on %s belongs to pid %d (no /proc socket match and no PID/script match in /json); refusing blind injection", endpoint, pid)
+}
+
+func fetchInspectorTargets(client *http.Client, endpoint string) ([]nodeInspectorTarget, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 300 * time.Millisecond}
+	}
+	resp, err := client.Get("http://" + endpoint + "/json")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET http://%s/json returned status %d", endpoint, resp.StatusCode)
+	}
+	var targets []nodeInspectorTarget
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return nil, fmt.Errorf("decode http://%s/json: %w", endpoint, err)
+	}
+	return targets, nil
+}
+
+// resolveNodeInspectorWSURL resolves and validates the V8 Inspector WebSocket URL for pid.
+// It prioritizes /proc/<pid>/fd + /proc/<pid>/net/tcp{,6} to find the exact port bound by pid,
+// and validates /json targets against pid/cmdline before returning.
+func resolveNodeInspectorWSURL(procRoot string, pid int, cmdline string, client *http.Client) (string, error) {
+	if nodeInspectorLookupHook != nil {
+		return nodeInspectorLookupHook(pid, cmdline)
+	}
+	endpoints, authoritative, procErr := discoverPIDInspectorEndpoints(procRoot, pid)
+	if procErr == nil {
+		if len(endpoints) == 0 {
+			return "", fmt.Errorf("pid %d has no listening V8 inspector socket in %s/%d", pid, procRoot, pid)
+		}
+		var (
+			matchedWS []string
+			lastErr   error
+		)
+		for _, ep := range endpoints {
+			targets, err := fetchInspectorTargets(client, ep)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			wsURL, err := selectNodeInspectorTarget(pid, cmdline, ep, targets, authoritative)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			matchedWS = append(matchedWS, wsURL)
+		}
+		if len(matchedWS) == 1 {
+			return matchedWS[0], nil
+		}
+		if len(matchedWS) > 1 {
+			return "", fmt.Errorf("ambiguous V8 inspector endpoints (%d matched) for pid %d; refusing blind injection", len(matchedWS), pid)
+		}
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", fmt.Errorf("no valid V8 inspector endpoint for pid %d among %v", pid, endpoints)
+	}
+
+	// When /proc is unavailable (e.g. non-Linux), probe 127.0.0.1:9229 ONLY with socketOwnedByPID=false,
+	// which requires explicit PID or cmdline script verification in /json and refuses blind targets[0] selection.
+	const fallbackEndpoint = "127.0.0.1:9229"
+	targets, err := fetchInspectorTargets(client, fallbackEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("procfs unavailable (%v) and %s unreachable: %w", procErr, fallbackEndpoint, err)
+	}
+	return selectNodeInspectorTarget(pid, cmdline, fallbackEndpoint, targets, false)
+}
+
+// injectRunningNodeJS sends SIGUSR1 to a running Node.js process to activate the V8 Inspector,
+// locates the inspector endpoint belonging to pid, evaluates a runtime expression that sets
+// LLM_TRACER_PIPE and requires node_hook.cjs, and immediately closes the inspector.
 func (c *Collector) injectRunningNodeJS(pid int) error {
 	c.mu.RLock()
 	rtHooks := c.runtimeHooks
@@ -929,31 +1344,44 @@ func (c *Collector) injectRunningNodeJS(pid int) error {
 		return fmt.Errorf("collector pipe path not initialized")
 	}
 
+	cmdline := InspectProcess(pid).Cmdline
+	if cmdline == "" && nodeInspectorProcRoot != "" {
+		if raw, err := os.ReadFile(filepath.Join(nodeInspectorProcRoot, strconv.Itoa(pid), "cmdline")); err == nil {
+			cmdline = strings.TrimSpace(strings.ReplaceAll(string(raw), "\x00", " "))
+		}
+	}
+
 	if err := sendSignalByName(pid, "USR1"); err != nil {
 		return fmt.Errorf("send SIGUSR1 to node pid %d: %w", pid, err)
 	}
 
-	// Poll http://127.0.0.1:9229/json for V8 Inspector WebSocket URL
-	var wsURL string
+	var (
+		wsURL   string
+		lastErr error
+	)
 	client := &http.Client{Timeout: 300 * time.Millisecond}
-	deadline := time.Now().Add(2500 * time.Millisecond)
+	deadline := time.Now().Add(nodeInspectorPollTimeout)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get("http://127.0.0.1:9229/json")
-		if err == nil {
-			var targets []struct {
-				WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-			}
-			_ = json.NewDecoder(resp.Body).Decode(&targets)
-			_ = resp.Body.Close()
-			if len(targets) > 0 && targets[0].WebSocketDebuggerURL != "" {
-				wsURL = targets[0].WebSocketDebuggerURL
-				break
-			}
+		resolved, err := resolveNodeInspectorWSURL(nodeInspectorProcRoot, pid, cmdline, client)
+		if err == nil && resolved != "" {
+			wsURL = resolved
+			break
 		}
+		lastErr = err
 		time.Sleep(30 * time.Millisecond)
 	}
 	if wsURL == "" {
-		return fmt.Errorf("V8 inspector did not open on 127.0.0.1:9229 after SIGUSR1 for pid %d", pid)
+		if lastErr == nil {
+			lastErr = fmt.Errorf("V8 inspector did not open for pid %d after SIGUSR1", pid)
+		} else {
+			lastErr = fmt.Errorf("select V8 inspector target for pid %d: %w", pid, lastErr)
+		}
+		if c != nil && c.mon != nil {
+			c.mon.RecordWarn(selfmon.StageProbe, "node_inspector_target_rejected", lastErr.Error(), map[string]any{
+				"pid": pid,
+			})
+		}
+		return lastErr
 	}
 
 	hookJSPath := filepath.ToSlash(rtHooks.NodeHookJS)
@@ -978,6 +1406,18 @@ func (c *Collector) injectRunningPtrace(pid int) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("ptrace live attach is only supported on Linux")
 	}
+	archCap := currentArchCapabilities()
+	if !archCap.PtraceUserspaceSupported {
+		msg := fmt.Sprintf("ptrace live attach skipped for pid %d: architecture %s has PtraceUserspaceSupported=false", pid, archCap.Arch)
+		if c != nil && c.mon != nil {
+			c.mon.RecordWarn(selfmon.StageProbe, "ptrace_arch_unsupported", msg, map[string]any{
+				"pid":              pid,
+				"arch":             archCap.Arch,
+				"ptrace_supported": archCap.PtraceUserspaceSupported,
+			})
+		}
+		return fmt.Errorf("%s", msg)
+	}
 	c.mu.RLock()
 	rtHooks := c.runtimeHooks
 	pipePath := c.pipePath
@@ -987,7 +1427,7 @@ func (c *Collector) injectRunningPtrace(pid int) error {
 		return fmt.Errorf("ptrace helper binary not available")
 	}
 	cmd := exec.Command(rtHooks.PtraceBin, "-p", strconv.Itoa(pid))
-	cmd.Env = append(os.Environ(), "LLM_TRACER_PIPE="+pipePath)
+	cmd.Env = append(StripSensitiveEnvKeys(os.Environ()), "LLM_TRACER_PIPE="+pipePath)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start ptrace -p %d: %w", pid, err)
 	}

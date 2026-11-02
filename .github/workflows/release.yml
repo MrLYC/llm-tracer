@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Release Multi-Platform Binaries via GoReleaser
+  verify:
+    name: Verify (gofmt / vet / test / race / cross-compile)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: '1.26.5'
           check-latest: true
 
       - name: Set up Python 3
@@ -35,8 +35,50 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run test suite before release
+      - name: Quality gate (gofmt / go vet / arm64 vet)
+        run: |
+          UNFORMATTED="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "以下文件未通过 gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+          go vet ./...
+          GOARCH=arm64 go vet ./...
+
+      - name: Verify go.mod / go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Run full test suite
         run: go test -count=1 ./...
+
+      - name: Run race detector on the full module
+        run: go test -race -count=1 ./...
+
+      - name: Cross-compile all release targets
+        run: |
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              echo "building $os/$arch"
+              GOOS="$os" GOARCH="$arch" go build -o /dev/null ./cmd/llm-tracer
+            done
+          done
+
+  release:
+    name: Release Multi-Platform Binaries via GoReleaser
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          check-latest: true
 
       - name: Run GoReleaser (Tag Release)
         if: startsWith(github.ref, 'refs/tags/v')

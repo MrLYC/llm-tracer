@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuyicong/llm-tracer/internal/correlator"
-	"github.com/liuyicong/llm-tracer/internal/model"
-	"github.com/liuyicong/llm-tracer/internal/parser"
-	"github.com/liuyicong/llm-tracer/internal/selfmon"
-	"github.com/liuyicong/llm-tracer/internal/store"
+	"github.com/mrlyc/llm-tracer/internal/correlator"
+	"github.com/mrlyc/llm-tracer/internal/model"
+	"github.com/mrlyc/llm-tracer/internal/parser"
+	"github.com/mrlyc/llm-tracer/internal/selfmon"
+	"github.com/mrlyc/llm-tracer/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,6 +30,7 @@ func TestCompatibilityMatrixAllRuntimeScenarios(t *testing.T) {
 	require.NoError(t, err)
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
 	corr := correlator.NewCorrelator(mon)
 
 	col, err := NewCollector(dir, model.ScopeFilter{}, corr, st, mon)
