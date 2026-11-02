@@ -23,6 +23,7 @@ type activeH1Exchange struct {
 	path             string
 	httpVersion      string
 	reqHeaders       map[string]string
+	correlationHints []string
 	reqBody          []byte
 	respHeaderParsed bool
 	httpStatus       int
@@ -106,14 +107,15 @@ func (sr *StreamReassembler) tryParseH1RequestLocked(cb *connBuffer, ts int64) b
 	}
 
 	cb.activeH1 = &activeH1Exchange{
-		eventID:     "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
-		startedAt:   ts,
-		method:      req.Method,
-		host:        req.Host,
-		path:        req.URL.RequestURI(),
-		httpVersion: req.Proto,
-		reqHeaders:  reqHeaders,
-		reqBody:     decodedReq,
+		eventID:          "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
+		startedAt:        ts,
+		method:           req.Method,
+		host:             req.Host,
+		path:             req.URL.RequestURI(),
+		httpVersion:      req.Proto,
+		reqHeaders:       reqHeaders,
+		correlationHints: extractCorrelationHintsFromHeader(req.Header.Get),
+		reqBody:          decodedReq,
 	}
 	if cb.respBuf.Len() > 0 {
 		sr.tryParseH1ResponseLocked(cb, ts)
@@ -155,14 +157,15 @@ func (sr *StreamReassembler) extractPartialH1RequestLocked(cb *connBuffer, raw [
 		}
 	}
 	return &activeH1Exchange{
-		eventID:     "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
-		startedAt:   ts,
-		method:      req.Method,
-		host:        req.Host,
-		path:        req.URL.RequestURI(),
-		httpVersion: req.Proto,
-		reqHeaders:  reqHeaders,
-		reqBody:     decodedReq,
+		eventID:          "ev_" + strings.ReplaceAll(uuid.NewString()[:12], "-", ""),
+		startedAt:        ts,
+		method:           req.Method,
+		host:             req.Host,
+		path:             req.URL.RequestURI(),
+		httpVersion:      req.Proto,
+		reqHeaders:       reqHeaders,
+		correlationHints: extractCorrelationHintsFromHeader(req.Header.Get),
+		reqBody:          decodedReq,
 	}
 }
 
@@ -400,25 +403,27 @@ func (sr *StreamReassembler) emitH1WithStatusLocked(cb *connBuffer, ex *activeH1
 		dur = 0
 	}
 	ev := &model.TraceEvent{
-		ID:              ex.eventID,
-		Timestamp:       ex.startedAt,
-		DurationMs:      dur,
-		Status:          status,
-		HTTPStatus:      ex.httpStatus,
-		HTTPVersion:     ex.httpVersion,
-		Method:          ex.method,
-		Host:            ex.host,
-		Path:            ex.path,
-		URL:             fmt.Sprintf("https://%s%s", ex.host, ex.path),
-		Protocol:        proto,
-		Process:         cb.process,
-		HeadersRecorded: sr.recordHeaders,
-		RequestHeaders:  ex.reqHeaders,
-		ResponseHeaders: ex.respHeaders,
-		RequestBytes:    len(ex.reqBody),
-		ResponseBytes:   len(decodedResp),
-		StreamChunks:    ex.streamChunks,
-		Error:           errReason,
+		ID:               ex.eventID,
+		Timestamp:        ex.startedAt,
+		DurationMs:       dur,
+		Status:           status,
+		HTTPStatus:       ex.httpStatus,
+		HTTPVersion:      ex.httpVersion,
+		Method:           ex.method,
+		Host:             ex.host,
+		Path:             ex.path,
+		URL:              fmt.Sprintf("https://%s%s", ex.host, ex.path),
+		Protocol:         proto,
+		Process:          cb.process,
+		ConnKey:          cb.key,
+		CorrelationHints: ex.correlationHints,
+		HeadersRecorded:  sr.recordHeaders,
+		RequestHeaders:   ex.reqHeaders,
+		ResponseHeaders:  ex.respHeaders,
+		RequestBytes:     len(ex.reqBody),
+		ResponseBytes:    len(decodedResp),
+		StreamChunks:     ex.streamChunks,
+		Error:            errReason,
 	}
 	if err := ParseExchange(ev, ex.reqBody, decodedResp, ex.isSSE); err != nil {
 		if sr.mon != nil && isTerminal {

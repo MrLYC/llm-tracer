@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -540,6 +541,23 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 	var readRetOffsets []uint64
 	if f, err := elf.Open(realPath); err == nil {
 		defer f.Close()
+		goarch := ""
+		switch f.Machine {
+		case elf.EM_X86_64:
+			goarch = "amd64"
+		case elf.EM_AARCH64:
+			goarch = "arm64"
+		}
+		if goarch != "" && !SupportsGoRegisterABI(bi.GoVersion, goarch) {
+			return &ProbeTarget{
+				BinaryPath:          realPath,
+				Type:                "gotls",
+				GoVersion:           bi.GoVersion,
+				Symbols:             make(map[string]uint64),
+				GoTLSReadRetOffsets: nil,
+				Note:                "Go version " + bi.GoVersion + " uses stack ABI; register-based GoTLS uprobe disabled",
+			}, nil
+		}
 		processGoFunc := func(name string, vaddr, fnSize uint64) {
 			switch name {
 			case "crypto/tls.(*Conn).Write", "crypto/tls.(*Conn).Read", "crypto/tls.(*Conn).HandshakeContext":
@@ -564,6 +582,12 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 			for _, s := range elfSyms {
 				processGoFunc(s.Name, s.Value, s.Size)
 			}
+		}
+		// DWARF is the second recovery channel: -s strips .symtab but can
+		// leave .debug_info intact, and it also supplies exact function sizes.
+		dwarfFuncs := extractGoDWARFFuncs(f)
+		for name, fn := range dwarfFuncs {
+			processGoFunc(name, fn.Addr, fn.Size)
 		}
 		// Fallback for stripped Go binaries (`go build -ldflags="-s -w"`): recover symbols from .gopclntab
 		if len(syms) == 0 {
@@ -631,11 +655,22 @@ func InspectGoTLSTarget(binaryPath string) (*ProbeTarget, error) {
 // to `push %rbp; mov %rsp, %rbp` (`55 48 89 e5`) so the uprobe fires after any goroutine stack growth.
 func scanAMD64GoPrologueOffset(code []byte) uint64 {
 	prologueWindow := code
-	if len(prologueWindow) > 32 {
-		prologueWindow = prologueWindow[:32]
+	if len(prologueWindow) > 48 {
+		prologueWindow = prologueWindow[:48]
 	}
 	if idx := bytes.Index(prologueWindow, []byte{0x55, 0x48, 0x89, 0xe5}); idx >= 0 {
 		return uint64(idx)
+	}
+	// Large Go frames may save rbp at an offset after subtracting stack space:
+	// sub $imm, %rsp; mov %rbp, imm8(%rsp).
+	if idx := bytes.Index(prologueWindow, []byte{0x48, 0x89, 0x6c, 0x24}); idx >= 4 {
+		isImm8Sub := prologueWindow[idx-4] == 0x48 && prologueWindow[idx-3] == 0x83 &&
+			prologueWindow[idx-2] == 0xec
+		isImm32Sub := idx >= 7 && prologueWindow[idx-7] == 0x48 &&
+			prologueWindow[idx-6] == 0x81 && prologueWindow[idx-5] == 0xec
+		if isImm8Sub || isImm32Sub {
+			return uint64(idx)
+		}
 	}
 	return 0
 }
@@ -644,8 +679,8 @@ func scanAMD64GoPrologueOffset(code []byte) uint64 {
 // to the frame setup (`MOVD R29, -8(RSP); SUB $8, RSP, R29` or `MOV R29, RSP`) so the uprobe fires after stack growth.
 func scanARM64GoPrologueOffset(code []byte) uint64 {
 	prologueWindow := code
-	if len(prologueWindow) > 36 {
-		prologueWindow = prologueWindow[:36]
+	if len(prologueWindow) > 48 {
+		prologueWindow = prologueWindow[:48]
 	}
 	// Go 1.20+ arm64 frame pointer setup: MOVD R29, -8(RSP) (0xf81f83fd); SUB $8, RSP, R29 (0xd10023fd)
 	for i := 0; i+8 <= len(prologueWindow); i += 4 {
@@ -658,6 +693,20 @@ func scanARM64GoPrologueOffset(code []byte) uint64 {
 	// Alternative arm64 frame pointer setup: MOV R29, RSP (0x910003fd)
 	for i := 0; i+4 <= len(prologueWindow); i += 4 {
 		if binary.LittleEndian.Uint32(prologueWindow[i:i+4]) == 0x910003fd {
+			return uint64(i)
+		}
+	}
+	// STP X29, X30, [SP, #-imm]! establishes a full frame in one instruction.
+	for i := 0; i+4 <= len(prologueWindow); i += 4 {
+		w0 := binary.LittleEndian.Uint32(prologueWindow[i : i+4])
+		if (w0 & 0xffc07fff) == 0xa9807bfd {
+			return uint64(i)
+		}
+	}
+	// STR X30, [SP, #-imm]! is used by frames that save only the link register.
+	for i := 0; i+4 <= len(prologueWindow); i += 4 {
+		w0 := binary.LittleEndian.Uint32(prologueWindow[i : i+4])
+		if (w0 & 0xffe0ffff) == 0xf81f0ffe {
 			return uint64(i)
 		}
 	}
@@ -685,17 +734,60 @@ func scanGoPrologueOffsetForMachine(machine elf.Machine, code []byte) uint64 {
 // and returns the relative byte offsets of the `ret` (0xc3) instructions.
 func scanAMD64ReturnOffsets(code []byte) []uint64 {
 	var out []uint64
-	for i := 0; i+1 < len(code); i++ {
-		if code[i] != 0x5d || code[i+1] != 0xc3 {
+	for i := 0; i < len(code); i++ {
+		if code[i] != 0xc3 {
 			continue
 		}
-		isAddRspImm8 := i >= 4 && code[i-4] == 0x48 && code[i-3] == 0x83 && code[i-2] == 0xc4
-		isAddRspImm32 := i >= 7 && code[i-7] == 0x48 && code[i-6] == 0x81 && code[i-5] == 0xc4
-		if isAddRspImm8 || isAddRspImm32 {
-			out = append(out, uint64(i)+1)
+		// add $imm8, %rsp; pop %rbp; ret
+		if i >= 5 && code[i-5] == 0x48 && code[i-4] == 0x83 && code[i-3] == 0xc4 &&
+			code[i-1] == 0x5d {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// add $imm32, %rsp; pop %rbp; ret
+		if i >= 8 && code[i-8] == 0x48 && code[i-7] == 0x81 && code[i-6] == 0xc4 &&
+			code[i-1] == 0x5d {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// pop %rbp; add $imm8, %rsp; ret
+		if i >= 5 && code[i-5] == 0x5d && code[i-4] == 0x48 && code[i-3] == 0x83 &&
+			code[i-2] == 0xc4 {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// pop %rbp; add $imm32, %rsp; ret
+		if i >= 8 && code[i-8] == 0x5d && code[i-7] == 0x48 && code[i-6] == 0x81 &&
+			code[i-5] == 0xc4 {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// leave; ret
+		if i >= 1 && code[i-1] == 0xc9 {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// add $imm8, %rsp; ret (frame-pointer omitted)
+		if i >= 4 && code[i-4] == 0x48 && code[i-3] == 0x83 && code[i-2] == 0xc4 {
+			out = appendUniqueOffset(out, uint64(i))
+			continue
+		}
+		// add $imm32, %rsp; ret (frame-pointer omitted)
+		if i >= 7 && code[i-7] == 0x48 && code[i-6] == 0x81 && code[i-5] == 0xc4 {
+			out = appendUniqueOffset(out, uint64(i))
 		}
 	}
+	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
 	return out
+}
+
+func appendUniqueOffset(offsets []uint64, offset uint64) []uint64 {
+	for _, existing := range offsets {
+		if existing == offset {
+			return offsets
+		}
+	}
+	return append(offsets, offset)
 }
 
 // isARM64ReturnInsn reports whether a 32-bit little-endian A64 instruction word is RET (0xd65f03c0),

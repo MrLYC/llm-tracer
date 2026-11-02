@@ -64,19 +64,20 @@
 在无状态 HTTP 通信中，客户端往往不会在每次请求中携带统一的 Session ID。`Correlator.Correlate(ev)` 通过三级递进策略自动将多轮请求串联为完整会话（新会话 ID 格式为 `"sess_" + 12位UUID前缀`）：
 
 ### 1. 第一级：显式会话键匹配 (`L1_explicit`)
-- `extractExplicitSessionKeys` 提取请求头（`x-session-id`、`x-conversation-id`、`x-thread-id`、`openai-conversation-id`、`mcp-session-id`、`x-claude-session-id`、`x-codex-session-id`、`x-agent-session-id`、`x-langsmith-trace-id`）与请求体中的显式会话标识（`session_id`、`conversation_id`、`thread_id`、`metadata.session_id`、`prompt_cache_key`）并索引至 `explicitIdx`；
+- **脱敏前只读串联指纹 (`CorrelationHints`)**：即便在默认 `RecordHeaders = false` 不落盘任何明文头的安全模式下，HTTP/1.1 与 HTTP/2 解析层也会在丢弃请求头前只读提取 W3C `traceparent`（提取 `trace_id`）及常见会话头（`x-session-id`、`x-conversation-id`、`x-thread-id`、`openai-conversation-id`、`mcp-session-id`、`x-claude-session-id`、`x-codex-session-id`、`x-agent-session-id`、`x-langsmith-trace-id`、`x-request-session-id`、`anthropic-beta-session-id`），经 SHA-256 单向哈希后写入 `TraceEvent.CorrelationHints` 供 `L1_explicit` 精确串联；
+- `extractExplicitSessionKeys` 同时提取 `CorrelationHints`、请求头与请求体中的显式会话标识（`session_id`、`conversation_id`、`thread_id`、`metadata.session_id`、`prompt_cache_key`）并索引至 `explicitIdx`；
 - OpenAI Responses API 的链式响应 ID：第 $N$ 轮响应通过 `extractResponseObjectID` 提取 `id = "resp_abc"` 注册至 `explicitIdx["resp:resp_abc"] = sessionID`，第 $N+1$ 轮请求携带 `previous_response_id: "resp_abc"` 时直接精确命中同一会话。
 
 ### 2. 第二级：上下文前缀指纹与状态步进匹配 (`L2_context`)
 - **多轮对话协议 (`matchChatPrefixLocked` `messages` 前缀指纹，活跃窗口 `activeWindow = 15m`)**：
   - 对话每推进一轮，`messages` 数组会在上一轮历史消息（User + Assistant + Tool）基础上追加新消息。
-  - `recordChatSnapshotLocked` 为每轮对话计算每条消息的 SHA-256 前 8 字节哈希序列（`reqHashes` 与追加了助手回复的 `fullHashes`，单会话最多保留 64 条 `msgSnapshot`）；下一轮请求到来时，`matchChatPrefixLocked` 通过 `hasPrefixHashes` 在活跃会话中查找最长匹配前缀。
+  - `recordChatSnapshotLocked` 为每轮对话计算每条消息的 SHA-256 前 8 字节哈希序列（`reqHashes` 与追加了助手回复的 `fullHashes`，单会话最多保留 64 条 `msgSnapshot`）；下一轮请求到来时，`matchChatPrefixLocked` 优先通过 `hasPrefixHashes` 查找严格最长前缀，若因 Agent 自动摘要/裁剪早期历史导致前缀变化，则自动回退至 `matchSlidingSnapshot` 匹配历史尾部连续子序列锚点。
   - 命中后自动设置 `ev.Chat.PrefixCount = prefixCount`（前端默认折叠展示为“已折叠 N 条历史上下文”），并将 `ev.Chat.NewMessages = ev.Chat.Messages[prefixCount:]` 提取为本轮新增输入，彻底消除多轮抓包中满屏重复历史消息的噪音。
 - **`systemone` (TypeSafe JEV) 目标步进匹配 (`matchSystemOneLocked`)**：
   - 在 `activeWindow (15m)` 内按相同 `Goal` 匹配最近活跃会话，将单步浏览器 DOM 决策串联为连续的动作轨迹（`StepIndex` 递增）。
 
 ### 3. 第三级：同进程树活跃时间窗跨协议关联 (`L3_proctree`)
-- 当未携带显式会话键的请求在 **5 分钟 (`5 * time.Minute`)** 活跃时间窗内满足同进程（`same_pid`）、父子进程（`child_of_pid`：`st.pids[ev.Process.PPID]` 或 `st.rootPID == ev.Process.PPID`）或同工作目录活跃步进（`same_cwd` 且 `st.stepCount > 0`）时，`matchProcessTreeLocked` 自动将不同协议的调用（如 JEV `systemone` 决策后调用 `openai_chat` 辅助生成填写文本，或主 Agent 调用 `mcp` 工具）归入同一个逻辑会话时间线中展示。
+- 当未携带显式会话键的请求在 **5 分钟 (`5 * time.Minute`)** 活跃时间窗内到达时，`matchProcessTreeLocked` 按四级亲和度优先级评分归并：`same_conn`（同 Keep-Alive 连接 `ConnKey`，Score 4）> `same_tid`（同进程+线程 `PID+TID`，Score 3）> `same_pid`（同进程，Score 2）> `child_of_pid` / `same_cwd`（父子进程或同工作目录活跃步进，Score 1），避免并发子任务串台。
 
 ---
 

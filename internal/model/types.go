@@ -131,6 +131,8 @@ type TraceEvent struct {
 	URL               string                `json:"url"`
 	Protocol          ProtocolType          `json:"protocol"`
 	Process           ProcessInfo           `json:"process"`
+	ConnKey           string                `json:"conn_key,omitempty"`
+	CorrelationHints  []string              `json:"correlation_hints,omitempty"`
 	HeadersRecorded   bool                  `json:"headers_recorded"`
 	RequestHeaders    map[string]string     `json:"request_headers,omitempty"`
 	ResponseHeaders   map[string]string     `json:"response_headers,omitempty"`

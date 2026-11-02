@@ -28,8 +28,8 @@
    - 共挂载 **19 个内核探针**：
      - OpenSSL Uprobes/Uretprobes：`SSL_write`、`SSL_write_ex`、`SSL_read` (entry + ret)、`SSL_read_ex` (entry + ret + `size_t *readbytes` 二次解引用)；
      - Python MemoryBIO Uprobes：`_ssl_MemoryBIO_write`、`_ssl_MemoryBIO_read`；
-     - GoTLS Uprobes：`crypto/tls.(*Conn).Write`（跳过 `morestack` 栈检查序言后读取 Go 寄存器 ABI 参数：`amd64` 下 `RAX=conn, RBX=ptr, RCX=len`；`arm64` 下 `X0=conn, X1=ptr, X2=len`）、`crypto/tls.(*Conn).Read`（入口以 `(pid<<32)|uint32(g)` 复合键保存 Goroutine `g` 指针上下文，`amd64` 读 `R14`、`arm64` 读 `R28`；并在函数所有 `RET` 指令偏移处挂载 Uprobe 读取返回字节数）；
-     - Syscall Tracepoints：`sys_enter_write`、`sys_enter_writev`（内核态展开 `iov[0..1]`）、`sys_enter_sendto`、`sys_enter_read`、`sys_exit_read`、`sys_enter_recvfrom`、`sys_exit_recvfrom`。
+     - GoTLS Uprobes（含 OBI 风格三级符号恢复与 ABI 门禁）：校验目标二进制 `buildinfo.GoVersion`（`amd64 >= go1.17`、`arm64 >= go1.18` 才启用寄存器 ABI），通过 `.symtab` + DWARF `.debug_info` + `.gopclntab` 三级通道解析 `crypto/tls.(*Conn).Write` 与 `crypto/tls.(*Conn).Read`，并支持大栈帧序言（`sub %rsp; mov %rbp, off(%rsp)` / ARM64 `STP X29, X30`）与多种尾声（`add %rsp; pop %rbp; ret`、`pop %rbp; add %rsp; ret`、`leave; ret`、无帧指针 `add %rsp; ret`）的偏移扫描；
+     - Syscall Tracepoints：`sys_enter_write`、`sys_enter_writev`（内核态展开 `iov[0..1]`）、`sys_enter_sendto`、`sys_enter_read`、`sys_exit_read`、`sys_enter_recvfrom`、`sys_exit_recvfrom`（启动时通过 `ResolveSyscallTracepointOffsets` 自动读取 `/sys/kernel/tracing/events/syscalls/*/format` 动态解析内核字段偏移，无权限时回退架构默认值）。
 2. **三 Map 隔离架构与 16 MiB RingBuf (`internal/collector/ebpf_engine_linux.go` `StartEBPFEngine`)**：
    - `ringbuf` (`BPF_MAP_TYPE_RINGBUF`, **`16 MiB` = `16 << 20` 字节**)：采用双倍虚拟内存镜像 `mmap` 零拷贝消费，避免高并发 SSE 流式输出或大上下文 Prompt 突发写入导致 RingBuf 丢包；单次提交帧载荷上限 `ebpfMaxPayload = 4072` 字节，连同 24 字节头共 `ebpfEventSize = 4096` 字节对齐；
    - `active_ssl_read` (`BPF_MAP_TYPE_LRU_HASH`, `maxEntries = 16384`, Key `8B`, Value `24B`)：供 OpenSSL `SSL_read` / `SSL_read_ex`（以 `pid_tgid` 为 Key）与 GoTLS `crypto/tls.(*Conn).Read`（以 `(pid<<32)|uint32(g)` 为 Key）保存读缓冲区指针 `(conn_tag, buf_ptr, len_ptr)`；LRU 自动淘汰异常未闭合条目，彻底消除 Map 泄漏；

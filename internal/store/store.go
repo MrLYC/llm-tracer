@@ -1828,6 +1828,9 @@ func cloneEventForHot(ev *model.TraceEvent) *model.TraceEvent {
 	if ev.ResponseHeaders != nil {
 		cp.ResponseHeaders = cloneStringMap(ev.ResponseHeaders)
 	}
+	if ev.CorrelationHints != nil {
+		cp.CorrelationHints = append([]string(nil), ev.CorrelationHints...)
+	}
 	if ev.Chat != nil {
 		chatCopy := *ev.Chat
 		if ev.Chat.Messages != nil {

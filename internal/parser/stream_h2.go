@@ -17,21 +17,22 @@ import (
 const http2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 type h2StreamState struct {
-	streamID    uint32
-	startedAt   int64
-	method      string
-	scheme      string
-	authority   string
-	path        string
-	reqHeaders  map[string]string
-	respHeaders map[string]string
-	status      int
-	reqBody     bytes.Buffer
-	respBody    bytes.Buffer
-	reqEnded    bool
-	respEnded   bool
-	eventID     string
-	chunks      int
+	streamID         uint32
+	startedAt        int64
+	method           string
+	scheme           string
+	authority        string
+	path             string
+	reqHeaders       map[string]string
+	correlationHints []string
+	respHeaders      map[string]string
+	status           int
+	reqBody          bytes.Buffer
+	respBody         bytes.Buffer
+	reqEnded         bool
+	respEnded        bool
+	eventID          string
+	chunks           int
 }
 
 // HTTP/2 frame reassembly using golang.org/x/net/http2/hpack
@@ -195,7 +196,8 @@ func (sr *StreamReassembler) decodeH2HeadersLocked(cb *connBuffer, st *h2StreamS
 		}
 		_, _ = cb.reqDecoder.Write(frag)
 		for _, f := range fields {
-			switch f.Name {
+			name := strings.ToLower(f.Name)
+			switch name {
 			case ":method":
 				st.method = f.Value
 			case ":authority":
@@ -206,6 +208,15 @@ func (sr *StreamReassembler) decodeH2HeadersLocked(cb *connBuffer, st *h2StreamS
 				st.scheme = f.Value
 			default:
 				st.reqHeaders[f.Name] = f.Value
+				// Hash immediately; plaintext header values are never retained.
+				for _, hint := range extractCorrelationHintsFromHeader(func(key string) string {
+					if strings.EqualFold(f.Name, key) {
+						return f.Value
+					}
+					return ""
+				}) {
+					st.correlationHints = append(st.correlationHints, hint)
+				}
 			}
 		}
 	} else {
@@ -271,25 +282,27 @@ func (sr *StreamReassembler) emitH2WithStatusLocked(cb *connBuffer, st *h2Stream
 		respHdrOut = st.respHeaders
 	}
 	ev := &model.TraceEvent{
-		ID:              st.eventID,
-		Timestamp:       st.startedAt,
-		DurationMs:      dur,
-		Status:          status,
-		HTTPStatus:      st.status,
-		HTTPVersion:     "HTTP/2.0",
-		Method:          st.method,
-		Host:            st.authority,
-		Path:            st.path,
-		URL:             fmt.Sprintf("https://%s%s", st.authority, st.path),
-		Protocol:        proto,
-		Process:         cb.process,
-		HeadersRecorded: sr.recordHeaders,
-		RequestHeaders:  reqHdrOut,
-		ResponseHeaders: respHdrOut,
-		RequestBytes:    len(reqRaw),
-		ResponseBytes:   len(respRaw),
-		StreamChunks:    st.chunks,
-		Error:           errReason,
+		ID:               st.eventID,
+		Timestamp:        st.startedAt,
+		DurationMs:       dur,
+		Status:           status,
+		HTTPStatus:       st.status,
+		HTTPVersion:      "HTTP/2.0",
+		Method:           st.method,
+		Host:             st.authority,
+		Path:             st.path,
+		URL:              fmt.Sprintf("https://%s%s", st.authority, st.path),
+		Protocol:         proto,
+		Process:          cb.process,
+		ConnKey:          cb.key,
+		CorrelationHints: st.correlationHints,
+		HeadersRecorded:  sr.recordHeaders,
+		RequestHeaders:   reqHdrOut,
+		ResponseHeaders:  respHdrOut,
+		RequestBytes:     len(reqRaw),
+		ResponseBytes:    len(respRaw),
+		StreamChunks:     st.chunks,
+		Error:            errReason,
 	}
 	_ = ParseExchange(ev, reqRaw, respRaw, isSSE)
 	if sr.mon != nil && isTerminal {

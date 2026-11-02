@@ -20,6 +20,8 @@ type sessionTrack struct {
 	goal            string
 	rootPID         int
 	pids            map[int]bool
+	connKeys        map[string]bool
+	tids            map[int]bool
 	cwd             string
 	lastEventID     string
 	lastStepEventID string
@@ -41,10 +43,13 @@ type eventSlot struct {
 }
 
 type msgSnapshot struct {
-	eventID    string
-	turnIndex  int
-	reqHashes  []string
-	fullHashes []string // reqHashes + assistant response hash
+	eventID           string
+	turnIndex         int
+	reqHashes         []string
+	fullHashes        []string // reqHashes + assistant response hash
+	leadingSystem     int
+	nonSystemMessages int
+	lastMessageLength int
 }
 
 type Correlator struct {
@@ -94,6 +99,7 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 		}
 		if st, ok := c.sessions[slot.sessionID]; ok {
 			st.lastUpdatedAt = ev.Timestamp
+			c.recordSessionMembershipLocked(st, ev)
 			if respID := extractResponseObjectID(ev.ResponseRaw); respID != "" {
 				c.explicitIdx["resp:"+respID] = st.sessionID
 			}
@@ -105,6 +111,7 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 	}
 
 	explicitKeys, parentRespID := extractExplicitSessionKeys(ev)
+	explicitKeys = append(explicitKeys, ev.CorrelationHints...)
 	var matched *sessionTrack
 	var corrLevel, corrReason, parentID string
 	var prefixCount int
@@ -159,6 +166,8 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 			explicitKeys:   make(map[string]bool),
 			rootPID:        ev.Process.PID,
 			pids:           make(map[int]bool),
+			connKeys:       make(map[string]bool),
+			tids:           make(map[int]bool),
 			cwd:            ev.Process.Cwd,
 			lastUpdatedAt:  ev.Timestamp,
 			eventStateByID: make(map[string]eventSlot),
@@ -179,9 +188,7 @@ func (c *Correlator) Correlate(ev *model.TraceEvent) {
 	if respID := extractResponseObjectID(ev.ResponseRaw); respID != "" {
 		c.explicitIdx["resp:"+respID] = matched.sessionID
 	}
-	if ev.Process.PID > 0 {
-		matched.pids[ev.Process.PID] = true
-	}
+	c.recordSessionMembershipLocked(matched, ev)
 	if matched.cwd == "" && ev.Process.Cwd != "" {
 		matched.cwd = ev.Process.Cwd
 	}
@@ -309,6 +316,9 @@ func (c *Correlator) matchChatPrefixLocked(ev *model.TraceEvent) (*sessionTrack,
 	var bestSess *sessionTrack
 	bestParent := ""
 	bestPrefixLen := 0
+	var bestSlidingSess *sessionTrack
+	bestSlidingParent := ""
+	bestSlidingPrefix := 0
 
 	for _, st := range c.sessions {
 		if st.lastUpdatedAt < cutoff {
@@ -324,11 +334,21 @@ func (c *Correlator) matchChatPrefixLocked(ev *model.TraceEvent) (*sessionTrack,
 				bestSess = st
 				bestParent = snap.eventID
 				bestPrefixLen = len(snap.reqHashes)
+			} else {
+				if prefix, eventID, ok := matchSlidingSnapshot(reqHashes, snap); ok && prefix > bestSlidingPrefix {
+					bestSlidingSess = st
+					bestSlidingParent = eventID
+					bestSlidingPrefix = prefix
+				}
 			}
 		}
 	}
 	if bestSess != nil {
 		return bestSess, bestParent, bestPrefixLen, fmt.Sprintf("messages_prefix_hash(matched=%d/%d)", bestPrefixLen, len(reqHashes))
+	}
+	if bestSlidingSess != nil {
+		return bestSlidingSess, bestSlidingParent, bestSlidingPrefix,
+			fmt.Sprintf("messages_sliding_window(matched=%d/%d)", bestSlidingPrefix, len(reqHashes))
 	}
 	return nil, "", 0, ""
 }
@@ -336,30 +356,29 @@ func (c *Correlator) matchChatPrefixLocked(ev *model.TraceEvent) (*sessionTrack,
 func (c *Correlator) matchProcessTreeLocked(ev *model.TraceEvent) (*sessionTrack, string, string) {
 	cutoff := ev.Timestamp - (5 * time.Minute).Milliseconds()
 	var best *sessionTrack
-	reason := ""
+	bestScore := 0
+	bestReason := ""
 	for _, st := range c.sessions {
 		if st.lastUpdatedAt < cutoff {
 			continue
 		}
-		if ev.Process.PID > 0 && st.pids[ev.Process.PID] {
-			if best == nil || st.lastUpdatedAt > best.lastUpdatedAt {
-				best = st
-				reason = fmt.Sprintf("same_pid(%d)", ev.Process.PID)
-			}
-			continue
+		score, reason := 0, ""
+		switch {
+		case ev.ConnKey != "" && st.connKeys[ev.ConnKey] && (ev.Process.PID == 0 || sameProcessTree(ev, st)):
+			score, reason = 4, fmt.Sprintf("same_conn(%s)", ev.ConnKey)
+		case ev.Process.PID > 0 && ev.Process.TID > 0 && st.pids[ev.Process.PID] && st.tids[ev.Process.TID]:
+			score, reason = 3, fmt.Sprintf("same_tid(pid=%d,tid=%d)", ev.Process.PID, ev.Process.TID)
+		case ev.Process.PID > 0 && st.pids[ev.Process.PID]:
+			score, reason = 2, fmt.Sprintf("same_pid(%d)", ev.Process.PID)
+		case ev.Process.PPID > 0 && (st.pids[ev.Process.PPID] || st.rootPID == ev.Process.PPID):
+			score, reason = 1, fmt.Sprintf("child_of_pid(%d->%d)", ev.Process.PPID, ev.Process.PID)
+		case ev.Process.Cwd != "" && st.cwd == ev.Process.Cwd && st.stepCount > 0:
+			score, reason = 1, fmt.Sprintf("same_cwd(%s)", ev.Process.Cwd)
 		}
-		if ev.Process.PPID > 0 && (st.pids[ev.Process.PPID] || st.rootPID == ev.Process.PPID) {
-			if best == nil || st.lastUpdatedAt > best.lastUpdatedAt {
-				best = st
-				reason = fmt.Sprintf("child_of_pid(%d->%d)", ev.Process.PPID, ev.Process.PID)
-			}
-			continue
-		}
-		if ev.Process.Cwd != "" && st.cwd == ev.Process.Cwd && st.stepCount > 0 {
-			if best == nil || st.lastUpdatedAt > best.lastUpdatedAt {
-				best = st
-				reason = fmt.Sprintf("same_cwd(%s)", ev.Process.Cwd)
-			}
+		if score > bestScore || (score > 0 && score == bestScore && st.lastUpdatedAt > best.lastUpdatedAt) {
+			best = st
+			bestScore = score
+			bestReason = reason
 		}
 	}
 	if best != nil {
@@ -367,9 +386,66 @@ func (c *Correlator) matchProcessTreeLocked(ev *model.TraceEvent) (*sessionTrack
 		if parent == "" {
 			parent = best.lastEventID
 		}
-		return best, parent, reason
+		return best, parent, bestReason
 	}
 	return nil, "", ""
+}
+
+func sameProcessTree(ev *model.TraceEvent, st *sessionTrack) bool {
+	if ev.Process.PID > 0 && (st.pids[ev.Process.PID] || st.rootPID == ev.Process.PID) {
+		return true
+	}
+	if ev.Process.PPID > 0 && (st.pids[ev.Process.PPID] || st.rootPID == ev.Process.PPID) {
+		return true
+	}
+	return false
+}
+
+func (c *Correlator) recordSessionMembershipLocked(st *sessionTrack, ev *model.TraceEvent) {
+	if ev.Process.PID > 0 {
+		if st.pids == nil {
+			st.pids = make(map[int]bool)
+		}
+		st.pids[ev.Process.PID] = true
+	}
+	if ev.Process.TID > 0 {
+		if st.tids == nil {
+			st.tids = make(map[int]bool)
+		}
+		st.tids[ev.Process.TID] = true
+	}
+	if ev.ConnKey != "" {
+		if st.connKeys == nil {
+			st.connKeys = make(map[string]bool)
+		}
+		st.connKeys[ev.ConnKey] = true
+	}
+}
+
+func matchSlidingSnapshot(reqHashes []string, snap msgSnapshot) (int, string, bool) {
+	for _, hist := range [][]string{snap.fullHashes, snap.reqHashes} {
+		if len(hist) == 0 || len(reqHashes) <= 1 {
+			continue
+		}
+		maxK := len(hist) - snap.leadingSystem
+		if maxK >= len(reqHashes) {
+			maxK = len(reqHashes) - 1
+		}
+		minK := 2
+		if snap.nonSystemMessages == 1 && snap.lastMessageLength >= 64 {
+			minK = 1
+		}
+		for k := maxK; k >= minK; k-- {
+			tail := hist[len(hist)-k:]
+			for start := 0; start+k < len(reqHashes); start++ {
+				end := start + k
+				if hasPrefixHashes(reqHashes[start:end], tail) {
+					return end, snap.eventID, true
+				}
+			}
+		}
+	}
+	return 0, "", false
 }
 
 func (c *Correlator) recordChatSnapshotLocked(st *sessionTrack, ev *model.TraceEvent) {
@@ -387,14 +463,29 @@ func (c *Correlator) recordChatSnapshotLocked(st *sessionTrack, ev *model.TraceE
 		fullHashes = append(fullHashes, hashSingleMessage(assistantMsg))
 	}
 	st.msgSnapshots = append(st.msgSnapshots, msgSnapshot{
-		eventID:    ev.ID,
-		turnIndex:  ev.TurnIndex,
-		reqHashes:  reqHashes,
-		fullHashes: fullHashes,
+		eventID:           ev.ID,
+		turnIndex:         ev.TurnIndex,
+		reqHashes:         reqHashes,
+		fullHashes:        fullHashes,
+		leadingSystem:     leadingSystemMessageCount(ev.Chat.Messages),
+		nonSystemMessages: len(ev.Chat.Messages) - leadingSystemMessageCount(ev.Chat.Messages),
+		lastMessageLength: len([]rune(strings.TrimSpace(ev.Chat.Messages[len(ev.Chat.Messages)-1].Content))),
 	})
 	if len(st.msgSnapshots) > 64 {
 		st.msgSnapshots = st.msgSnapshots[len(st.msgSnapshots)-64:]
 	}
+}
+
+func leadingSystemMessageCount(msgs []model.ChatMessage) int {
+	count := 0
+	for _, msg := range msgs {
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "system") {
+			count++
+			continue
+		}
+		break
+	}
+	return count
 }
 
 func hashMessages(msgs []model.ChatMessage) []string {

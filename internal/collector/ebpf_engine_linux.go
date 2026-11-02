@@ -443,7 +443,11 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 
 // BuildWritevProbeProgram constructs a verifier-safe eBPF tracepoint program for `syscalls/sys_enter_writev(fd, vec, vlen)`
 // that unrolls and captures up to 2 scatter-gather `struct iovec { void *base; size_t len; }` segments (e.g. HTTP Header + Body in Bun/uSockets).
-func BuildWritevProbeProgram(ringbufMapFD int) []BPFInsn {
+func BuildWritevProbeProgram(ringbufMapFD int, customOffsets ...ebpfPtRegsOffsets) []BPFInsn {
+	off := archPtRegsOffsets
+	if len(customOffsets) > 0 {
+		off = customOffsets[0]
+	}
 	selfPID := int32(os.Getpid())
 	var insns []BPFInsn
 	// R6 = R1 (tracepoint ctx); filter out selfPID in kernel space
@@ -452,13 +456,13 @@ func BuildWritevProbeProgram(ringbufMapFD int) []BPFInsn {
 		bpfCall(bpfFuncGetCurrentPidTgid),
 		bpfRsh64Imm(bpfReg0, 32),
 		bpfJmpImm(bpfJEQ, bpfReg0, selfPID, -1),
-		bpfLdXMemDW(bpfReg7, bpfReg6, 16), // fd
+		bpfLdXMemDW(bpfReg7, bpfReg6, off.SyscallArg0), // fd
 		bpfJmpImm(bpfJSLE, bpfReg7, 2, -1),
 		bpfAnd64Imm(bpfReg7, 0xffff),
 		bpfOr64Imm(bpfReg7, -0x80000000),
-		bpfLdXMemDW(bpfReg8, bpfReg6, 24), // const struct iovec *vec
+		bpfLdXMemDW(bpfReg8, bpfReg6, off.SyscallArg1), // const struct iovec *vec
 		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
-		bpfLdXMemDW(bpfReg9, bpfReg6, 32), // vlen
+		bpfLdXMemDW(bpfReg9, bpfReg6, off.SyscallArg2), // vlen
 		bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
 		// Zero-init 32 bytes on stack [fp-32 .. fp-1] for iov[0] and iov[1]
 		bpfStMemW(bpfReg10, -32, 0),
@@ -1018,19 +1022,20 @@ func (e *EBPFEngine) AttachTargets(targets []ProbeTarget) int {
 }
 
 func (e *EBPFEngine) attachSyscallTracepoints() error {
+	tpOffsets := ResolveSyscallTracepointOffsets(archPtRegsOffsets)
 	specs := []struct {
 		tpName   string
 		progName string
 		insns    []BPFInsn
 		required bool
 	}{
-		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true), true},
-		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true), false},
-		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD), false},
-		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true), true},
-		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true), false},
-		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, archPtRegsOffsets.SyscallRet, true), true},
-		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, archPtRegsOffsets.SyscallRet, true), false},
+		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), true},
+		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), false},
+		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD, tpOffsets), false},
+		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), true},
+		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), false},
+		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, tpOffsets.SyscallRet, true), true},
+		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, tpOffsets.SyscallRet, true), false},
 	}
 
 	for _, sp := range specs {

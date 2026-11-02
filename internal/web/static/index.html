@@ -1008,14 +1008,18 @@
       const r = getActiveTimeRange();
       const data = await apiFetch(`/api/sessions/${encodeURIComponent(id)}?from=${r.from}&to=${r.to}`);
       const sess = data.session;
-      state.activeEvents = data.events || [];
+      state.activeEvents = [...(data.events || [])].sort((a, b) => {
+        if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+        if ((b.step_index || 0) !== (a.step_index || 0)) return (b.step_index || 0) - (a.step_index || 0);
+        return (b.turn_index || 0) - (a.turn_index || 0);
+      });
       document.getElementById('activeSessionHeader').textContent = `${sess.title || sess.id}`;
       document.getElementById('activeSessionStats').textContent =
         `PID ${sess.root_pid} (${sess.root_comm || '-'}) · ${state.activeEvents.length} 事件 · 耗时 ${sess.total_duration_ms}ms`;
       renderTimelineEvents();
       if (!keepSelectedEvent || !state.selectedEventId) {
         if (state.activeEvents.length > 0) {
-          inspectEvent(state.activeEvents[state.activeEvents.length - 1].id);
+          inspectEvent(state.activeEvents[0].id);
         }
       } else {
         inspectEvent(state.selectedEventId);
@@ -1028,7 +1032,12 @@
         box.innerHTML = `<div class="empty-state">该会话在当前时间窗内无事件，拖动时间轴可加载更早记录。</div>`;
         return;
       }
-      box.innerHTML = state.activeEvents.map(ev => {
+      const orderedEvents = [...state.activeEvents].sort((a, b) => {
+        if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+        if (b.step_index !== a.step_index) return b.step_index - a.step_index;
+        return b.turn_index - a.turn_index;
+      });
+      box.innerHTML = orderedEvents.map(ev => {
         const isSel = ev.id === state.selectedEventId ? 'selected' : '';
         const isChild = ev.correlation_level === 'L3_proctree' ? 'child-corr' : '';
         const badge = ev.protocol === 'systemone'
@@ -1317,7 +1326,10 @@
         return `<span class="pill"><strong>${esc(k)}</strong>: OK ${m.ok} / Warn ${m.warn} / Err ${m.error}</span>`;
       }).join('');
 
-      const evs = data.events || [];
+      const evs = [...(data.events || [])].sort((a, b) => {
+        if (b.ts !== a.ts) return b.ts - a.ts;
+        return b.seq - a.seq;
+      });
       document.getElementById('smEventList').innerHTML = evs.map(e => {
         const color = e.status === 'ok' ? 'var(--teal)' : (e.status === 'warn' ? 'var(--amber)' : 'var(--coral)');
         return `
