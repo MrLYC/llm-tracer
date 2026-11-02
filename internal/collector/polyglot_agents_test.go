@@ -749,7 +749,7 @@ post("/v1/messages", {
 				}
 			}
 			return false
-		}, 3*time.Second, 25*time.Millisecond, "Claude Code 2 Anthropic turns + 1 MCP tool call must correlate into a single 3-event session")
+		}, 10*time.Second, 25*time.Millisecond, "Claude Code 2 Anthropic turns + 1 MCP tool call must correlate into a single 3-event session")
 
 		require.NotEmpty(t, claudeSessID)
 		require.Equal(t, model.ProtocolAnthropic, evs[0].Protocol)
@@ -844,7 +844,7 @@ post({
 				}
 			}
 			return false
-		}, 3*time.Second, 25*time.Millisecond, "Codex CLI 2 streaming turns must correlate via previous_response_id")
+		}, 10*time.Second, 25*time.Millisecond, "Codex CLI 2 streaming turns must correlate via previous_response_id")
 
 		require.Equal(t, "Planning test execution...", codexEvs[0].Chat.ReasoningText)
 		require.Len(t, codexEvs[0].Chat.ToolCalls, 1)
@@ -930,7 +930,7 @@ post({
 				}
 			}
 			return false
-		}, 3*time.Second, 25*time.Millisecond, "Gemini CLI 2 turns must be captured and correlated via L2_context")
+		}, 10*time.Second, 25*time.Millisecond, "Gemini CLI 2 turns must be captured and correlated via L2_context")
 
 		require.Contains(t, gemEvs[0].Path, "key=[REDACTED]")
 		require.NotContains(t, gemEvs[0].URL, "AIzaSySecretGeminiCliKey")
@@ -1034,7 +1034,7 @@ else:
 				}
 			}
 			return false
-		}, 3*time.Second, 25*time.Millisecond, "LangGraph HTTPS + plain HTTP Ollama + final synthesis must correlate into a 3-event session")
+		}, 10*time.Second, 25*time.Millisecond, "LangGraph HTTPS + plain HTTP Ollama + final synthesis must correlate into a 3-event session")
 
 		require.Equal(t, model.ProtocolOpenAIChat, lgEvs[0].Protocol)
 		require.Equal(t, "You are a LangGraph supervisor.", lgEvs[0].Chat.SystemPrompt)

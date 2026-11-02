@@ -123,6 +123,7 @@ func NewCollector(
 	mon *selfmon.Monitor,
 ) (*Collector, error) {
 	tracker := NewProcessTracker(scope, mon)
+	tracker.SetDisappearedGrace(5 * time.Second)
 	c := &Collector{
 		cacheDir:         cacheDir,
 		channelTargetUID: -1,

@@ -28,23 +28,29 @@ func InspectProcess(pid int) model.ProcessInfo {
 	if os.Geteuid() != 0 && kp.Eproc.Ucred.Uid != uint32(os.Geteuid()) {
 		return info
 	}
-	if out, err := exec.Command("ps", "-o", "ppid=,comm=,args=", "-p", strconv.Itoa(pid)).Output(); err == nil {
-		line := strings.TrimSpace(string(out))
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			if ppid, err := strconv.Atoi(fields[0]); err == nil && info.PPID == 0 {
-				info.PPID = ppid
+	if out, err := exec.Command("ps", "-o", "ppid=", "-o", "comm=", "-o", "command=", "-p", strconv.Itoa(pid)).Output(); err == nil {
+		for _, rawLine := range strings.Split(string(out), "\n") {
+			line := strings.TrimSpace(rawLine)
+			if line == "" || strings.HasPrefix(line, "PPID") {
+				continue
 			}
-			if info.Exe == "" && strings.HasPrefix(fields[1], "/") {
-				info.Exe = fields[1]
-			}
-			if info.Comm == "" {
-				info.Comm = filepath.Base(fields[1])
-			}
-			if len(fields) >= 3 {
-				info.Cmdline = selfmon.RedactCmdArgs(fields[2:])
-			} else {
-				info.Cmdline = selfmon.RedactCmdline(fields[1])
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if ppid, err := strconv.Atoi(fields[0]); err == nil && info.PPID == 0 {
+					info.PPID = ppid
+				}
+				if info.Exe == "" && strings.HasPrefix(fields[1], "/") {
+					info.Exe = fields[1]
+				}
+				if info.Comm == "" {
+					info.Comm = filepath.Base(fields[1])
+				}
+				if len(fields) >= 3 {
+					info.Cmdline = selfmon.RedactCmdArgs(fields[2:])
+				} else {
+					info.Cmdline = selfmon.RedactCmdline(fields[1])
+				}
+				break
 			}
 		}
 	}

@@ -48,8 +48,8 @@ func TestShortLived60SubprocessesCapture(t *testing.T) {
 
 		// Poll to ensure childPID is visible in OS process table and resolves to selfPID before caching
 		require.Eventually(t, func() bool {
-			return readPPID(childPID) == selfPID
-		}, 2*time.Second, 10*time.Millisecond, "child process PPID must resolve to selfPID")
+			return readPPID(childPID) == selfPID && readProcessStartTime(childPID) > 0
+		}, 3*time.Second, 10*time.Millisecond, "child process PPID and non-zero startTime must resolve")
 
 		// First sight of childPID while alive caches its ancestor chain (childPID -> selfPID)
 		_, _ = col.tracker.MatchAndEnrich(childPID, model.ProcessInfo{PID: childPID})

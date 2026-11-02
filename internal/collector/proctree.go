@@ -27,19 +27,21 @@ type procKey struct {
 }
 
 type ProcessTracker struct {
-	mu             sync.RWMutex
-	scope          model.ScopeFilter
-	rootPIDs       map[int]bool
-	rootStartTimes map[int]uint64    // rootPID -> startTime observed when registered
-	trackedPIDs    map[procKey]int   // (pid, startTime) -> rootPID
-	ancestryCache  map[procKey][]int // (pid, startTime) -> [ppid, pppid, ..., rootPID]
-	procCache      map[procKey]model.ProcessInfo
-	lastSeenStart  map[int]uint64 // pid -> most recent observed startTime
-	activeRoots    map[int]rootLifecycle
-	mon            *selfmon.Monitor
-	watchOnce      sync.Once
-	stopCh         chan struct{}
-	stopOnce       sync.Once
+	mu               sync.RWMutex
+	scope            model.ScopeFilter
+	rootPIDs         map[int]bool
+	rootStartTimes   map[int]uint64    // rootPID -> startTime observed when registered
+	trackedPIDs      map[procKey]int   // (pid, startTime) -> rootPID
+	ancestryCache    map[procKey][]int // (pid, startTime) -> [ppid, pppid, ..., rootPID]
+	procCache        map[procKey]model.ProcessInfo
+	lastSeenStart    map[int]uint64 // pid -> most recent observed startTime
+	activeRoots      map[int]rootLifecycle
+	mon              *selfmon.Monitor
+	watchOnce        sync.Once
+	disappearedAt    map[int]time.Time
+	disappearedGrace time.Duration
+	stopCh           chan struct{}
+	stopOnce         sync.Once
 }
 
 func NewProcessTracker(scope model.ScopeFilter, mon *selfmon.Monitor) *ProcessTracker {
@@ -52,6 +54,7 @@ func NewProcessTracker(scope model.ScopeFilter, mon *selfmon.Monitor) *ProcessTr
 		procCache:      make(map[procKey]model.ProcessInfo),
 		lastSeenStart:  make(map[int]uint64),
 		activeRoots:    make(map[int]rootLifecycle),
+		disappearedAt:  make(map[int]time.Time),
 		mon:            mon,
 		stopCh:         make(chan struct{}),
 	}
@@ -76,7 +79,19 @@ func inspectLiveIdentity(pid int) (startTime uint64, alive bool) {
 	return 0, false
 }
 
+func (pt *ProcessTracker) SetDisappearedGrace(d time.Duration) {
+	if pt == nil {
+		return
+	}
+	pt.mu.Lock()
+	pt.disappearedGrace = d
+	pt.mu.Unlock()
+}
+
 func (pt *ProcessTracker) evictPIDLocked(pid int) {
+	if pt.disappearedAt != nil {
+		delete(pt.disappearedAt, pid)
+	}
 	if prevStart, ok := pt.lastSeenStart[pid]; ok {
 		k := procKey{pid: pid, startTime: prevStart}
 		delete(pt.trackedPIDs, k)
@@ -108,6 +123,9 @@ func (pt *ProcessTracker) evictPIDLocked(pid int) {
 // syncLiveKeyLocked updates the observed startTime for a live PID and evicts any
 // cached state from an earlier process generation if the PID was reused.
 func (pt *ProcessTracker) syncLiveKeyLocked(pid int, liveStart uint64) procKey {
+	if pt.disappearedAt != nil {
+		delete(pt.disappearedAt, pid)
+	}
 	if prevStart, ok := pt.lastSeenStart[pid]; ok && prevStart != liveStart {
 		pt.evictPIDLocked(pid)
 	} else if liveStart == 0 {
@@ -501,6 +519,20 @@ func (pt *ProcessTracker) pruneDisappearedLocked(ppidMap map[int]int) {
 		liveStart, alive := inspectLiveIdentity(pid)
 		if !alive {
 			if _, inScan := ppidMap[pid]; !inScan {
+				if pt.disappearedGrace > 0 {
+					if pt.disappearedAt == nil {
+						pt.disappearedAt = make(map[int]time.Time)
+					}
+					disAt, seenBefore := pt.disappearedAt[pid]
+					if !seenBefore {
+						pt.disappearedAt[pid] = time.Now()
+						continue
+					}
+					if time.Since(disAt) < pt.disappearedGrace {
+						continue
+					}
+					delete(pt.disappearedAt, pid)
+				}
 				pt.evictPIDLocked(pid)
 				continue
 			}
