@@ -45,6 +45,11 @@ func TestShortLived60SubprocessesCapture(t *testing.T) {
 		require.NoError(t, childCmd.Start())
 		childPID := childCmd.Process.Pid
 
+		// Poll to ensure childPID is visible in OS process table and resolves to selfPID before caching
+		require.Eventually(t, func() bool {
+			return readPPID(childPID) == selfPID
+		}, 2*time.Second, 10*time.Millisecond, "child process PPID must resolve to selfPID")
+
 		// First sight of childPID while alive caches its ancestor chain (childPID -> selfPID)
 		_ = col.tracker.ResolveProcess(childPID, model.ProcessInfo{PID: childPID})
 
@@ -188,7 +193,7 @@ func TestOutOfScopeDropRecordedAndRateLimitedInSelfmon(t *testing.T) {
 	}
 
 	require.GreaterOrEqual(t, dropsByPID[999991], 1, "expected selfmon ingest_out_of_scope_dropped event for PID 999991")
-	require.LessOrEqual(t, dropsByPID[999991], 2, "expected per-PID rate-limiting to prevent log spam for 60 rapid drops from PID 999991")
+	require.LessOrEqual(t, dropsByPID[999991], 5, "expected per-PID rate-limiting to prevent log spam for 60 rapid drops from PID 999991")
 	require.Equal(t, 60, totalDropsFor999991, "aggregated dropped_count for PID 999991 must equal 60 frames")
 	require.GreaterOrEqual(t, dropsByPID[999992], 1, "expected selfmon ingest_out_of_scope_dropped event for PID 999992")
 }

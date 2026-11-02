@@ -232,6 +232,7 @@ func TestStreamReassemblerDefaultNoHeadersAndHTTP2(t *testing.T) {
 func TestQueryKeyRedactionKeepAliveAndH2Streaming(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	var events []*model.TraceEvent
 	sr := NewStreamReassembler(false, nil, mon, func(ev *model.TraceEvent) {
@@ -314,6 +315,7 @@ func TestQueryKeyRedactionKeepAliveAndH2Streaming(t *testing.T) {
 func TestIdleConnEviction(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	var events []*model.TraceEvent
 	sr := NewStreamReassembler(false, nil, mon, func(ev *model.TraceEvent) {
@@ -432,6 +434,7 @@ func TestIdleConnEviction(t *testing.T) {
 func TestConnBufferTruncation(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	var events []*model.TraceEvent
 	sr := NewStreamReassembler(false, nil, mon, func(ev *model.TraceEvent) {
@@ -595,6 +598,7 @@ func TestConnBufferTruncation(t *testing.T) {
 func TestUnknownProtocolWarnAndDropToggle(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	var captured []*model.TraceEvent
 	sr := NewStreamReassembler(false, nil, mon, func(ev *model.TraceEvent) {

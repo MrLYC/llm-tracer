@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -196,7 +197,9 @@ func TestRedactSensitiveDetailAndFileMode0600(t *testing.T) {
 
 	info, err := os.Stat(jsonlPath)
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "selfmon jsonl file permissions must be 0600")
+	if runtime.GOOS != "windows" {
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "selfmon jsonl file permissions must be 0600")
+	}
 
 	rawBytes, err := os.ReadFile(jsonlPath)
 	require.NoError(t, err)
@@ -503,6 +506,9 @@ func TestRedactSensitivePathReplacesHomeDirWithTilde(t *testing.T) {
 }
 
 func TestSelfHealReopensRemovedOrReplacedLogFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows: windows mandatory file locks disallow removing an open log file")
+	}
 	dir := t.TempDir()
 	m, err := NewMonitor(dir)
 	require.NoError(t, err)

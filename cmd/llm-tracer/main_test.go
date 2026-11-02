@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -163,6 +164,7 @@ func TestListenLoopbackWarningAndVersionFormatting(t *testing.T) {
 	dir := t.TempDir()
 	mon, err := selfmon.NewMonitor(dir)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	noTOTPGuard, err := totp.NewGuard("")
 	require.NoError(t, err)
@@ -958,6 +960,9 @@ func TestViewSubcommand(t *testing.T) {
 	})
 
 	t.Run("readonly_preserves_tmp_files_and_never_chmods_symlinks", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping POSIX symlink & chmod permission assertions on Windows")
+		}
 		origListen := listenViewTCP
 		t.Cleanup(func() { listenViewTCP = origListen })
 

@@ -45,6 +45,7 @@ func TestCollectorLayerHeaderGating_IngestDirectExchange(t *testing.T) {
 	dir := t.TempDir()
 	mon, err := selfmon.NewMonitor(dir)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
 	defer st.Close()

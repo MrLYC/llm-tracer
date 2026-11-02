@@ -50,6 +50,7 @@ func buildH2ExchangeFrames(t *testing.T, authHeader, totpHeader, cookieHeader st
 func TestParserLayerHeaderGating_H2StreamReassembler(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	clientBytes, serverBytes := buildH2ExchangeFrames(
 		t,
@@ -141,6 +142,7 @@ func TestParserLayerHeaderGating_H2StreamReassembler(t *testing.T) {
 func TestParserLayerHeaderGating_H1StreamReassembler(t *testing.T) {
 	mon, err := selfmon.NewMonitor(t.TempDir())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	reqBody := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping h1"}]}`
 	rawReq := "POST /v1/chat/completions HTTP/1.1\r\n" +

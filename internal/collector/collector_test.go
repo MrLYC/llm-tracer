@@ -48,6 +48,7 @@ func TestPIDSubtreeVsPIDOnlyAndExeFilter(t *testing.T) {
 	dir := t.TempDir()
 	mon, err := selfmon.NewMonitor(dir)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 
 	myPID := os.Getpid()
 	selfExe, err := os.Executable()
@@ -87,6 +88,7 @@ func TestCollectorLaunchCommandAndOpenSSLSymbols(t *testing.T) {
 	dir := t.TempDir()
 	mon, err := selfmon.NewMonitor(dir)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
 	defer func() { _ = st.Close() }()
@@ -167,6 +169,7 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 	dir := t.TempDir()
 	mon, err := selfmon.NewMonitor(dir)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
 	st, err := store.NewStore(dir, 10*time.Minute, mon)
 	require.NoError(t, err)
 	defer func() { _ = st.Close() }()

@@ -634,15 +634,7 @@ func runCleanWithIO(in io.Reader, out io.Writer, cacheDir, olderThan string, all
 			return nil
 		}
 	}
-	mon, err := selfmon.NewMonitor(cacheDir)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = mon.Flush()
-		_ = mon.Close()
-	}()
-	st, err := store.NewStore(cacheDir, store.DefaultHotWindow, mon)
+	st, err := store.NewStore(cacheDir, store.DefaultHotWindow, nil)
 	if err != nil {
 		return err
 	}
