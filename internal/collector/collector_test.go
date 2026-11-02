@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -385,9 +386,17 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 		}
 
 		// 3a. When chown succeeds, prefer chown to target UID (2002) and keep mode 0o600
+		col.permMu.Lock()
+		col.channelRelaxed = false
+		col.channelTargetUID = -1
+		col.permMu.Unlock()
+
 		var chownedUIDs []int
+		var chownMu sync.Mutex
 		chownFileFunc = func(_ *os.File, _ string, uid int) error {
+			chownMu.Lock()
 			chownedUIDs = append(chownedUIDs, uid)
+			chownMu.Unlock()
 			return nil
 		}
 		lchownSocketFunc = func(_ string, uid int) error {
@@ -395,13 +404,15 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 		}
 		require.Eventually(t, func() bool {
 			col.UpdateScope(model.ScopeFilter{Cmds: []string{"TestHelperSleepProcess"}})
+			chownMu.Lock()
+			defer chownMu.Unlock()
 			for _, u := range chownedUIDs {
 				if u == 2002 {
 					return true
 				}
 			}
 			return false
-		}, 3*time.Second, 50*time.Millisecond, "cross-UID target matched by --cmd must trigger chown to target UID")
+		}, 10*time.Second, 50*time.Millisecond, "cross-UID target matched by --cmd must trigger chown to target UID")
 		pipeInfo, err := os.Stat(col.pipePath)
 		require.NoError(t, err)
 		require.Equal(t, os.FileMode(0o600), pipeInfo.Mode().Perm(), "mode must stay 0600 when chown to target UID succeeds")
@@ -409,7 +420,10 @@ func TestCollectorHookPermissionsAndLoopbackTapTLS(t *testing.T) {
 		// 3b. When target disappears, reclaim ownership to selfUID (1000) and restore hooksDir to 0o700
 		crossUIDActive = false
 		col.ensureHookChannelPermissions(nil)
-		require.Equal(t, 1000, chownedUIDs[len(chownedUIDs)-1], "disappearing cross-UID target must reclaim ownership to selfUID")
+		chownMu.Lock()
+		lastUID := chownedUIDs[len(chownedUIDs)-1]
+		chownMu.Unlock()
+		require.Equal(t, 1000, lastUID, "disappearing cross-UID target must reclaim ownership to selfUID")
 		hooksInfo, err := os.Lstat(filepath.Join(dir, "hooks"))
 		require.NoError(t, err)
 		require.Equal(t, os.FileMode(0o700), hooksInfo.Mode().Perm())

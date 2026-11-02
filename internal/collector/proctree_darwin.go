@@ -3,11 +3,13 @@
 package collector
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mrlyc/llm-tracer/internal/model"
 	"github.com/mrlyc/llm-tracer/internal/selfmon"
@@ -28,7 +30,9 @@ func InspectProcess(pid int) model.ProcessInfo {
 	if os.Geteuid() != 0 && kp.Eproc.Ucred.Uid != uint32(os.Geteuid()) {
 		return info
 	}
-	if out, err := exec.Command("ps", "-o", "ppid=", "-o", "comm=", "-o", "command=", "-p", strconv.Itoa(pid)).Output(); err == nil {
+	psCtx, psCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer psCancel()
+	if out, err := exec.CommandContext(psCtx, "ps", "-o", "ppid=", "-o", "comm=", "-o", "command=", "-p", strconv.Itoa(pid)).Output(); err == nil {
 		for _, rawLine := range strings.Split(string(out), "\n") {
 			line := strings.TrimSpace(rawLine)
 			if line == "" || strings.HasPrefix(line, "PPID") {
@@ -54,7 +58,9 @@ func InspectProcess(pid int) model.ProcessInfo {
 			}
 		}
 	}
-	if out, err := exec.Command("lsof", "-n", "-P", "-a", "-p", strconv.Itoa(pid), "-d", "cwd,txt", "-Fn").Output(); err == nil {
+	lsofCtx, lsofCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer lsofCancel()
+	if out, err := exec.CommandContext(lsofCtx, "lsof", "-n", "-P", "-a", "-p", strconv.Itoa(pid), "-d", "cwd,txt", "-Fn").Output(); err == nil {
 		var curFD string
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.HasPrefix(line, "f") {

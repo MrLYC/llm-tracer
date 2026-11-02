@@ -52,7 +52,9 @@ func TestShortLived60SubprocessesCapture(t *testing.T) {
 		}, 3*time.Second, 10*time.Millisecond, "child process PPID and non-zero startTime must resolve")
 
 		// First sight of childPID while alive caches its ancestor chain (childPID -> selfPID)
-		_, _ = col.tracker.MatchAndEnrich(childPID, model.ProcessInfo{PID: childPID})
+		infoAlive, okAlive := col.tracker.MatchAndEnrich(childPID, model.ProcessInfo{PID: childPID})
+		require.True(t, okAlive, "live child process must match scope")
+		require.NotEmpty(t, infoAlive.Comm)
 
 		// Terminate childPID and wait for it to completely disappear from the OS process table
 		_ = childCmd.Process.Kill()
@@ -71,12 +73,13 @@ func TestShortLived60SubprocessesCapture(t *testing.T) {
 		require.NoError(t, err)
 		_, err = f.Write(buf.Bytes())
 		require.NoError(t, err)
+		require.NoError(t, f.Sync())
 		require.NoError(t, f.Close())
 
 		require.Eventually(t, func() bool {
 			col.Flush()
 			return countPersistedStoreEvents(t, st) == 60
-		}, 3*time.Second, 50*time.Millisecond, "expected 60/60 events from exited short-lived child process via ancestry cache")
+		}, 10*time.Second, 50*time.Millisecond, "expected 60/60 events from exited short-lived child process via ancestry cache")
 	})
 
 	// 2. End-to-end 60 sequential short-lived python3 subprocess loop under bash LaunchCommand

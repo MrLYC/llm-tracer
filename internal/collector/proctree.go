@@ -518,24 +518,22 @@ func (pt *ProcessTracker) pruneDisappearedLocked(ppidMap map[int]int) {
 	for pid := range seenPIDs {
 		liveStart, alive := inspectLiveIdentity(pid)
 		if !alive {
-			if _, inScan := ppidMap[pid]; !inScan {
-				if pt.disappearedGrace > 0 {
-					if pt.disappearedAt == nil {
-						pt.disappearedAt = make(map[int]time.Time)
-					}
-					disAt, seenBefore := pt.disappearedAt[pid]
-					if !seenBefore {
-						pt.disappearedAt[pid] = time.Now()
-						continue
-					}
-					if time.Since(disAt) < pt.disappearedGrace {
-						continue
-					}
-					delete(pt.disappearedAt, pid)
+			if pt.disappearedGrace > 0 {
+				if pt.disappearedAt == nil {
+					pt.disappearedAt = make(map[int]time.Time)
 				}
-				pt.evictPIDLocked(pid)
-				continue
+				disAt, seenBefore := pt.disappearedAt[pid]
+				if !seenBefore {
+					pt.disappearedAt[pid] = time.Now()
+					continue
+				}
+				if time.Since(disAt) < pt.disappearedGrace {
+					continue
+				}
+				delete(pt.disappearedAt, pid)
 			}
+			pt.evictPIDLocked(pid)
+			continue
 		}
 		if liveStart == 0 {
 			// Conservative fallback: evict when platform cannot provide startTime.
@@ -840,7 +838,16 @@ func (pt *ProcessTracker) DiscoverMatchingPIDs() []int {
 		if !alive {
 			continue
 		}
-		info := InspectProcess(pid)
+		k := procKey{pid: pid, startTime: liveStart}
+		pt.mu.RLock()
+		info, cached := pt.procCache[k]
+		pt.mu.RUnlock()
+		if !cached || (info.Comm == "" && info.Exe == "") {
+			info = InspectProcess(pid)
+			pt.mu.Lock()
+			pt.procCache[k] = info
+			pt.mu.Unlock()
+		}
 		if info.Comm == "llm_tracer_ptra" || strings.Contains(info.Exe, "llm_tracer_ptrace") {
 			continue
 		}
