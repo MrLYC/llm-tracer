@@ -1042,24 +1042,42 @@ func bpfLoadProgram(progType uint32, name string, insns []BPFInsn) (int, string,
 	if len(insns) == 0 {
 		return -1, "", fmt.Errorf("empty bpf program")
 	}
+	// Verbose verifier logs for these branched tracepoints exceed a small buffer and
+	// the kernel then fails BPF_PROG_LOAD with ENOSPC even when the program is valid.
+	fd, err := loadBPFProgram(progType, name, insns, nil)
+	if err == nil {
+		return fd, "", nil
+	}
+	logBuf := make([]byte, 1<<20)
+	fd, err = loadBPFProgram(progType, name, insns, logBuf)
+	verifierLog := strings.TrimRight(string(logBuf), "\x00")
+	if len(verifierLog) > 4000 {
+		verifierLog = verifierLog[len(verifierLog)-4000:]
+	}
+	if err != nil {
+		return -1, verifierLog, fmt.Errorf("BPF_PROG_LOAD(%s): %w (%s)", name, err, verifierLog)
+	}
+	return fd, verifierLog, nil
+}
+
+func loadBPFProgram(progType uint32, name string, insns []BPFInsn, logBuf []byte) (int, error) {
 	lic := []byte("GPL\x00")
-	logBuf := make([]byte, 65536)
 	var attr bpfProgLoadAttr
 	attr.ProgType = progType
 	attr.InsnCnt = uint32(len(insns))
 	attr.Insns = uint64(uintptr(unsafe.Pointer(&insns[0])))
 	attr.License = uint64(uintptr(unsafe.Pointer(&lic[0])))
-	attr.LogLevel = 1
-	attr.LogSize = uint32(len(logBuf))
-	attr.LogBuf = uint64(uintptr(unsafe.Pointer(&logBuf[0])))
 	copy(attr.ProgName[:], name)
-
-	fd, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_PROG_LOAD, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
-	verifierLog := strings.TrimRight(string(logBuf), "\x00")
-	if errno != 0 {
-		return -1, verifierLog, fmt.Errorf("BPF_PROG_LOAD(%s): %w (%s)", name, errno, verifierLog)
+	if len(logBuf) > 0 {
+		attr.LogLevel = 1
+		attr.LogSize = uint32(len(logBuf))
+		attr.LogBuf = uint64(uintptr(unsafe.Pointer(&logBuf[0])))
 	}
-	return int(fd), verifierLog, nil
+	fd, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_PROG_LOAD, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(fd), nil
 }
 
 // EBPFEngine manages kernel eBPF maps, uprobes/uretprobes, syscall tracepoints, and the mmap RingBuf consumer.
