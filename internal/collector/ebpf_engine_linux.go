@@ -113,7 +113,8 @@ const (
 
 // classifyPlainSocketPrefix mirrors the BPF state machine in appendPlainSocketStateFilter.
 // Existing is the current plain_flow value. The return value is the updated state and
-// whether this buffer should be copied to the ring buffer.
+// whether this buffer should be copied to the ring buffer. JSON and SSE continuations
+// are copied without promoting an unknown fd to HTTP.
 func classifyPlainSocketPrefix(prefix []byte, existing uint32) (uint32, bool) {
 	if existing == plainFlowTLSSkip {
 		return plainFlowTLSSkip, false
@@ -127,7 +128,22 @@ func classifyPlainSocketPrefix(prefix []byte, existing uint32) (uint32, bool) {
 	if isPlainHTTPPrefix(prefix) || containsPlainHTTPPath(prefix, 64) {
 		return plainFlowHTTP, true
 	}
+	if isPlainContinuationPrefix(prefix) {
+		return plainFlowUnknown, true
+	}
 	return plainFlowUnknown, false
+}
+
+// isPlainContinuationPrefix reports a JSON body or SSE fragment that can follow a
+// plaintext HTTP header. It must not by itself mark the socket as HTTP.
+func isPlainContinuationPrefix(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	if prefix[0] == '{' || prefix[0] == '[' {
+		return true
+	}
+	return len(prefix) >= 5 && string(prefix[:5]) == "data:"
 }
 
 func isTLSRecordPrefix(first, second byte) bool {
@@ -336,6 +352,20 @@ func appendPlainHTTPPathMatch(a *bpfAsm, prefixOff int16) {
 	}
 }
 
+// appendPlainContinuationMatch emits a JSON or SSE fragment without writing plain_flow.
+// Only a leading '{', '[' or the prefix "data:" qualifies. Other bytes fall through.
+func appendPlainContinuationMatch(a *bpfAsm, prefixOff int16) {
+	a.jmp(bpfJLT, bpfReg9, 1, "drop")
+	a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff))
+	a.jmp(bpfJEQ, bpfReg0, int32('{'), "emit")
+	a.jmp(bpfJEQ, bpfReg0, int32('['), "emit")
+	a.jmp(bpfJLT, bpfReg9, 5, "drop")
+	a.op(bpfLdXMemW(bpfReg0, bpfReg10, prefixOff))
+	a.jmp(bpfJNE, bpfReg0, 0x61746164, "drop") // "data" little-endian
+	a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff+4))
+	a.jmp(bpfJEQ, bpfReg0, int32(':'), "emit")
+}
+
 // appendPlainSocketStateFilter updates plain_flow for the socket tag in R7 using the
 // user buffer at R8 and its length in R9. It preserves R7, R8 and R9, and sets R0=1
 // to emit or R0=0 to drop. The map key is (tgid<<32)|low32(conn_tag), where conn_tag
@@ -397,6 +427,7 @@ func appendPlainSocketStateFilter(insns []BPFInsn, plainFlowMapFD int) []BPFInsn
 	a.label("after_method")
 
 	appendPlainHTTPPathMatch(a, prefixOff)
+	appendPlainContinuationMatch(a, prefixOff)
 	a.ja("drop")
 
 	a.label("store_http")

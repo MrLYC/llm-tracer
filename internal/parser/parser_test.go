@@ -719,6 +719,36 @@ func TestUnknownProtocolWarnAndDropToggle(t *testing.T) {
 	require.Equal(t, "HTTP/2.0", captured[1].HTTPVersion)
 }
 
+func TestPlainHTTPSplitWriteReassembly(t *testing.T) {
+	mon, err := selfmon.NewMonitor(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = mon.Close() })
+
+	var captured []*model.TraceEvent
+	sr := NewStreamReassembler(false, nil, mon, func(ev *model.TraceEvent) {
+		captured = append(captured, ev)
+	})
+
+	body := `{"model":"qwen","messages":[{"role":"user","content":"plain http split"}]}`
+	head := "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " +
+		strconv.Itoa(len(body)) + "\r\nConnection: close\r\n\r\n"
+	respBody := `{"model":"qwen","message":{"role":"assistant","content":"plain http split ok"},"done":true}`
+	resp := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+		strconv.Itoa(len(respBody)) + "\r\nConnection: close\r\n\r\n" + respBody
+
+	proc := model.ProcessInfo{PID: 160, Comm: "plain-http"}
+	sr.IngestChunk(RawTLSChunk{ConnKey: "160:ebpf_fd_4", Direction: DirWrite, Process: proc, Data: []byte(head)})
+	require.Empty(t, captured, "headers alone must wait for the JSON body")
+	sr.IngestChunk(RawTLSChunk{ConnKey: "160:ebpf_fd_4", Direction: DirWrite, Process: proc, Data: []byte(body)})
+	require.Empty(t, captured, "request must wait for the HTTP response")
+	sr.IngestChunk(RawTLSChunk{ConnKey: "160:ebpf_fd_4", Direction: DirRead, Process: proc, Data: []byte(resp)})
+
+	require.Len(t, captured, 1)
+	require.Equal(t, "ok", captured[0].Status)
+	require.NotNil(t, captured[0].Chat)
+	require.Equal(t, "plain http split ok", captured[0].Chat.ResponseText)
+}
+
 func writeH2Frame(buf *bytes.Buffer, ftype byte, flags byte, streamID uint32, payload []byte) {
 	l := len(payload)
 	hdr := []byte{

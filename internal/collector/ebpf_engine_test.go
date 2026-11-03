@@ -90,7 +90,10 @@ func TestClassifyPlainSocketPrefix(t *testing.T) {
 		{name: "body continuation follows fd state", prefix: []byte(`{"model":"qwen"}`), existing: plainFlowHTTP, wantState: plainFlowHTTP, wantEmit: true},
 		{name: "TLS record marks skip", prefix: []byte{0x17, 0x03, 0x03, 0x01, 0x02}, existing: plainFlowUnknown, wantState: plainFlowTLSSkip, wantEmit: false},
 		{name: "already TLS skips ciphertext", prefix: []byte{0x17, 0x03}, existing: plainFlowTLSSkip, wantState: plainFlowTLSSkip, wantEmit: false},
-		{name: "bare JSON is not HTTP", prefix: []byte(`{"unrelated":true}`), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
+		{name: "bare JSON is forwarded but not promoted", prefix: []byte(`{"unrelated":true}`), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: true},
+		{name: "JSON array continuation is forwarded", prefix: []byte(`[{"role":"user"}]`), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: true},
+		{name: "SSE data prefix is forwarded", prefix: []byte("data: {\"x\":1}\n\n"), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: true},
+		{name: "short data prefix is dropped", prefix: []byte("data"), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
 		{name: "unrelated bytes are dropped", prefix: []byte("not-http-or-json"), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
 	}
 	for _, tc := range cases {
