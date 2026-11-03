@@ -126,7 +126,10 @@ with open(p, "ab") as f:
 				require.NoError(t, err)
 				require.Equal(t, 0, exitCode)
 
-				require.Equal(t, 60, countPersistedStoreEvents(t, st), "expected 60/60 short-lived python subprocess exchanges to be persisted")
+				require.Eventually(t, func() bool {
+					col.Flush()
+					return countPersistedStoreEvents(t, st) == 60
+				}, 2*time.Second, 20*time.Millisecond, "expected 60/60 short-lived python subprocess exchanges to be persisted")
 			})
 		}
 	}

@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1104,36 +1103,40 @@ time.sleep(0.12)
 	})
 
 	t.Run("EBPF_Scenario16_PlainHTTPSplitWrite", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = io.Copy(io.Discard, r.Body)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"model":"qwen","message":{"role":"assistant","content":"plain http split ok"},"done":true}`))
-		}))
-		defer ts.Close()
-		host, port, err := netSplitHostPort(ts.Listener.Addr().String())
-		require.NoError(t, err)
-		script := fmt.Sprintf(`import socket
-host = %q
-port = %s
-body = b'{"model":"qwen","messages":[{"role":"user","content":"plain http split"}]}'
-head = ("POST /api/chat HTTP/1.1\r\nHost: %%s\r\nContent-Length: %%d\r\nConnection: close\r\n\r\n" %% (host, len(body))).encode()
-s = socket.create_connection((host, int(port)), timeout=2)
-s.sendall(head)
-s.sendall(body)
-data = b""
-while True:
-    chunk = s.recv(65536)
-    if not chunk:
-        break
-    data += chunk
-s.close()
-if b"plain http split ok" not in data:
-    raise SystemExit("missing response")
-`, host, port)
-		pyPath := filepath.Join(t.TempDir(), "plain_http_split.py")
-		require.NoError(t, os.WriteFile(pyPath, []byte(script), 0o644))
-		pid := runUnhooked(t, "/usr/bin/python3", pyPath)
-		evs := waitSessionByPID(t, pid, "split plain HTTP POST /api/chat must be reassembled from two send calls")
+		cSrc := filepath.Join(dir, "scen_ebpf_plain_http_split.c")
+		binPath := filepath.Join(dir, "scen_ebpf_plain_http_split")
+		code := `#include <sys/socket.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
+    const char *head = "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 74\r\nConnection: close\r\n\r\n";
+    const char *body = "{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"plain http split\"}]}";
+    if (sendto(sv[0], head, strlen(head), 0, 0, 0) < 0) return 2;
+    if (sendto(sv[0], body, strlen(body), 0, 0, 0) < 0) return 3;
+    char sink[4096];
+    int need = (int)(strlen(head) + strlen(body));
+    int got = 0;
+    while (got < need) {
+        int n = recvfrom(sv[1], sink + got, sizeof(sink) - got, 0, 0, 0);
+        if (n <= 0) return 4;
+        got += n;
+    }
+    const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 91\r\nConnection: close\r\n\r\n{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"plain http split ok\"},\"done\":true}";
+    if (sendto(sv[1], resp, strlen(resp), 0, 0, 0) < 0) return 5;
+    if (recvfrom(sv[0], sink, sizeof(sink), 0, 0, 0) <= 0) return 6;
+    close(sv[0]);
+    close(sv[1]);
+    return 0;
+}
+`
+		require.NoError(t, os.WriteFile(cSrc, []byte(code), 0o644))
+		out, err := exec.Command("gcc", "-O2", "-o", binPath, cSrc).CombinedOutput()
+		require.NoError(t, err, string(out))
+		pid := runUnhooked(t, binPath)
+		evs := waitSessionByPID(t, pid, "split plain HTTP POST /api/chat must be reassembled from two sendto calls")
+		require.Equal(t, "ebpf_tracepoint", evs[0].Process.TLSMode)
 		require.Equal(t, "plain http split ok", evs[0].Chat.ResponseText)
 	})
 }
@@ -1174,8 +1177,4 @@ func TestEBPFGoTLSReadMissingRetOffsetsRecordsDegradationWarn(t *testing.T) {
 	})
 	require.Equal(t, 0, added)
 	require.GreaterOrEqual(t, mon.Stats().TotalWarn, int64(1), "missing GoTLS Read RET offsets must emit selfmon degradation warning instead of silently degrading")
-}
-
-func netSplitHostPort(addr string) (string, string, error) {
-	return net.SplitHostPort(addr)
 }

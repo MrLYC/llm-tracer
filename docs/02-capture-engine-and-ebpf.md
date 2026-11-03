@@ -154,7 +154,7 @@
 13. `EBPF_Scenario13_ScopeFilters_Exe_Cwd_Cmd_And_HostFilter`（`--exe`、`--cwd`、`--cmd`、`--host` 组合范围过滤验证）
 14. `EBPF_Scenario14_ConcurrentMultiProcess_ParallelTLSStreams_And_Correlation`（多进程高并发 TLS 流采集与三级会话串联验证）
 15. `EBPF_Scenario15_LaunchCommand_SubprocessTree_And_SelfMonitoringAudit`（`LaunchPlannedCommand` 子进程树拉起与 `selfmon` 全链路审计验证）
-16. `EBPF_Scenario16_PlainHTTPSplitWrite`（明文 HTTP/1.1 经 `send`/`recv` syscall tracepoint 捕获，两次 `sendall` 拆包后重组）
+16. `EBPF_Scenario16_PlainHTTPSplitWrite`（明文 HTTP/1.1 经 `send`/`recv` syscall tracepoint 捕获，两次 `sendto` 拆包后重组）
 
 ---
 
