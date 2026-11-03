@@ -1150,18 +1150,21 @@ int main(void) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) return 1;
     const char *head = "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 74\r\nConnection: close\r\n\r\n";
     const char *body = "{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"plain http split\"}]}";
-    if (sendto(sv[0], head, strlen(head), 0, 0, 0) < 0) return 2;
-    if (sendto(sv[0], body, strlen(body), 0, 0, 0) < 0) return 3;
-    char sink[4096];
-    int need = (int)(strlen(head) + strlen(body));
+    const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 91\r\nConnection: close\r\n\r\n{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"plain http split ok\"},\"done\":true}";
+    char head_buf[256], body_buf[256], resp_buf[512], sink[4096];
+    memcpy(head_buf, head, strlen(head) + 1);
+    memcpy(body_buf, body, strlen(body) + 1);
+    memcpy(resp_buf, resp, strlen(resp) + 1);
+    if (sendto(sv[0], head_buf, strlen(head_buf), 0, 0, 0) < 0) return 2;
+    if (sendto(sv[0], body_buf, strlen(body_buf), 0, 0, 0) < 0) return 3;
+    int need = (int)(strlen(head_buf) + strlen(body_buf));
     int got = 0;
     while (got < need) {
         int n = recvfrom(sv[1], sink + got, sizeof(sink) - got, 0, 0, 0);
         if (n <= 0) return 4;
         got += n;
     }
-    const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 91\r\nConnection: close\r\n\r\n{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"plain http split ok\"},\"done\":true}";
-    if (sendto(sv[1], resp, strlen(resp), 0, 0, 0) < 0) return 5;
+    if (sendto(sv[1], resp_buf, strlen(resp_buf), 0, 0, 0) < 0) return 5;
     if (recvfrom(sv[0], sink, sizeof(sink), 0, 0, 0) <= 0) return 6;
     close(sv[0]);
     close(sv[1]);
@@ -1172,7 +1175,42 @@ int main(void) {
 		out, err := exec.Command("gcc", "-O2", "-o", binPath, cSrc).CombinedOutput()
 		require.NoError(t, err, string(out))
 		pid := runUnhooked(t, binPath)
-		evs := waitSessionByPID(t, pid, "split plain HTTP POST /api/chat must be reassembled from two sendto calls")
+		deadline := time.Now().Add(3 * time.Second)
+		var evs []model.TraceEvent
+		for time.Now().Before(deadline) {
+			col.Flush()
+			evs = nil
+			sessions, err := st.QuerySessions(store.SessionQuery{Limit: 100})
+			if err == nil {
+				for _, s := range sessions {
+					got, err := st.QuerySessionEvents(store.EventQuery{SessionID: s.ID})
+					if err != nil {
+						continue
+					}
+					for _, ev := range got {
+						if ev.Process.PID == pid && ev.Status == "ok" {
+							evs = append(evs, ev)
+						}
+					}
+				}
+			}
+			if len(evs) > 0 {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if len(evs) == 0 {
+			if recs, err := mon.QueryEvents(selfmon.Query{Limit: 40}); err == nil {
+				for _, ev := range recs {
+					msg := ev.Error
+					if len(msg) > 300 {
+						msg = msg[:300]
+					}
+					t.Logf("selfmon status=%s action=%s err=%s", ev.Status, ev.Action, msg)
+				}
+			}
+			t.Fatal("split plain HTTP POST /api/chat must be reassembled from two sendto calls")
+		}
 		require.Equal(t, "ebpf_tracepoint", evs[0].Process.TLSMode)
 		require.Equal(t, "plain http split ok", evs[0].Chat.ResponseText)
 	})
