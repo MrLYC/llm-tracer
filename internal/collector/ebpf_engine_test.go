@@ -1132,7 +1132,7 @@ if b"plain http split ok" not in data:
 `, host, port)
 		pyPath := filepath.Join(t.TempDir(), "plain_http_split.py")
 		require.NoError(t, os.WriteFile(pyPath, []byte(script), 0o644))
-		pid := runUnhooked(t, "python3", pyPath)
+		pid := runUnhooked(t, "/usr/bin/python3", pyPath)
 		evs := waitSessionByPID(t, pid, "split plain HTTP POST /api/chat must be reassembled from two send calls")
 		require.Equal(t, "plain http split ok", evs[0].Chat.ResponseText)
 	})
