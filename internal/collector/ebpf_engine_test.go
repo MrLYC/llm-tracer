@@ -34,7 +34,9 @@ func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 		"uprobe_gotls_write":       BuildWriteProbeProgram(3, 4, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false),
 		"uprobe_gotls_read_enter":  BuildGoTLSReadEnterProgram(4),
 		"uprobe_gotls_read_exit":   BuildGoTLSReadExitProgram(3, 4),
-		"tp_sys_enter_write":       BuildWriteProbeProgram(3, 4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true),
+		"tp_sys_enter_write":       BuildSyscallWriteEnterProgram(4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2),
+		"tp_sys_exit_write":        BuildSyscallWriteExitProgram(3, 4, 5, archPtRegsOffsets.SyscallRet),
+		"tp_sys_enter_write_emit":  BuildWriteProbeProgram(3, 4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true),
 		"tp_sys_enter_writev":      BuildWritevProbeProgram(3, 4),
 		"tp_sys_enter_sendmsg":     BuildSendmsgProbeProgram(3, 4, archPtRegsOffsets),
 		"tp_sys_enter_recvmsg":     BuildRecvmsgEnterProgram(4, archPtRegsOffsets),
@@ -156,14 +158,15 @@ func TestEBPFRingBufConsumerAndRecordDispatch(t *testing.T) {
 	doneCh := make(chan struct{}, 1)
 
 	eng := &EBPFEngine{
-		ringMapFD:       -1,
-		activeSSLReadFD: -1,
-		activeSysReadFD: -1,
-		plainFlowFD:     -1,
-		ringMaxBytes:    ringBytes,
-		consMmap:        consBuf,
-		prodMmap:        prodBuf,
-		stopCh:          make(chan struct{}),
+		ringMapFD:        -1,
+		activeSSLReadFD:  -1,
+		activeSysReadFD:  -1,
+		activeSysWriteFD: -1,
+		plainFlowFD:      -1,
+		ringMaxBytes:     ringBytes,
+		consMmap:         consBuf,
+		prodMmap:         prodBuf,
+		stopCh:           make(chan struct{}),
 		onEvent: func(pid, tid int, connID string, dir parser.Direction, payload []byte, mode string) {
 			gotPID = pid
 			gotConnID = connID
@@ -283,7 +286,8 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_re", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rxe", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rx", BuildReadExitProgram(ringFD, sslReadFD, plainFlowFD, archPtRegsOffsets.CRet, false)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w", BuildWriteProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w_ent", BuildSyscallWriteEnterProgram(col.ebpfEngine.activeSysWriteFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w_ext", BuildSyscallWriteExitProgram(ringFD, col.ebpfEngine.activeSysWriteFD, plainFlowFD, archPtRegsOffsets.SyscallRet)},
 		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_wv", BuildWritevProbeProgram(ringFD, plainFlowFD)},
 		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_sendmsg", BuildSendmsgProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets)},
 		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rm_ent", BuildRecvmsgEnterProgram(sysReadFD, archPtRegsOffsets)},
@@ -1184,6 +1188,7 @@ func TestEBPFGoTLSReadMissingRetOffsetsRecordsDegradationWarn(t *testing.T) {
 		ringMapFD:          -1,
 		activeSSLReadFD:    -1,
 		activeSysReadFD:    -1,
+		activeSysWriteFD:   -1,
 		plainFlowFD:        -1,
 		sslWriteProg:       -1,
 		sslReadEnterProg:   -1,

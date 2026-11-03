@@ -294,6 +294,10 @@ func bpfJmpImm(op uint8, dst uint8, imm int32, off int16) BPFInsn {
 	return makeInsn(bpfJMP|op|bpfK, dst, 0, off, imm)
 }
 
+func bpfJumpReg(op, dst, src uint8, off int16) BPFInsn {
+	return makeInsn(bpfJMP|op|bpfX, dst, src, off, 0)
+}
+
 func bpfJump(off int16) BPFInsn {
 	return makeInsn(bpfJMP|bpfK, 0, 0, off, 0)
 }
@@ -619,6 +623,113 @@ func BuildWriteProbeProgram(ringbufMapFD, plainFlowMapFD int, connOff, bufOff, l
 
 	// exit: R0 = 0; exit
 	insns = append(insns,
+		bpfMov64Imm(bpfReg0, 0),
+		bpfExit(),
+	)
+	return patchExitJumps(insns)
+}
+
+// BuildSyscallWriteEnterProgram saves {conn_tag, buf, len} for sys_exit_write/sendto.
+// The bytes are copied on exit: sys_enter runs before the kernel faults the user page in,
+// so bpf_probe_read_user of an untouched .rodata literal returns -EFAULT and the prefix
+// looks empty.
+func BuildSyscallWriteEnterProgram(activeWriteMapFD int, connOff, bufOff, lenOff int16) []BPFInsn {
+	selfPID := int32(os.Getpid())
+	insns := []BPFInsn{
+		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfRsh64Imm(bpfReg0, 32),
+		bpfJmpImm(bpfJEQ, bpfReg0, selfPID, -1),
+		bpfLdXMemDW(bpfReg7, bpfReg6, connOff),
+		bpfJmpImm(bpfJSLE, bpfReg7, 2, -1),
+		bpfAnd64Imm(bpfReg7, 0xffff),
+		bpfOr64Imm(bpfReg7, -0x80000000),
+		bpfLdXMemDW(bpfReg8, bpfReg6, bufOff),
+		bpfLdXMemDW(bpfReg9, bpfReg6, lenOff),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+		bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
+		bpfJmpImm(bpfJGT, bpfReg9, 0x0fffffff, -1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfStXMemDW(bpfReg10, bpfReg0, -8),
+		bpfStXMemDW(bpfReg10, bpfReg7, -32),
+		bpfStXMemDW(bpfReg10, bpfReg8, -24),
+		bpfStXMemDW(bpfReg10, bpfReg9, -16),
+	}
+	insns = append(insns, bpfLoadMapFD(bpfReg1, activeWriteMapFD)...)
+	insns = append(insns,
+		bpfMov64Reg(bpfReg2, bpfReg10),
+		bpfAdd64Imm(bpfReg2, -8),
+		bpfMov64Reg(bpfReg3, bpfReg10),
+		bpfAdd64Imm(bpfReg3, -32),
+		bpfMov64Imm(bpfReg4, 0),
+		bpfCall(bpfFuncMapUpdateElem),
+		bpfMov64Imm(bpfReg0, 0),
+		bpfExit(),
+	)
+	return patchExitJumps(insns)
+}
+
+// BuildSyscallWriteExitProgram copies the user buffer after the syscall has faulted it in.
+func BuildSyscallWriteExitProgram(ringbufMapFD, activeWriteMapFD, plainFlowMapFD int, retOff int16) []BPFInsn {
+	selfPID := int32(os.Getpid())
+	dirImm := int32(2) // syscall write
+	var insns []BPFInsn
+	insns = append(insns,
+		bpfLdXMemDW(bpfReg9, bpfReg1, retOff),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0),
+		bpfRsh64Imm(bpfReg1, 32),
+		bpfJmpImm(bpfJEQ, bpfReg1, selfPID, -1),
+		bpfStXMemDW(bpfReg10, bpfReg0, -8),
+	)
+	insns = append(insns, bpfLoadMapFD(bpfReg1, activeWriteMapFD)...)
+	insns = append(insns,
+		bpfMov64Reg(bpfReg2, bpfReg10),
+		bpfAdd64Imm(bpfReg2, -8),
+		bpfCall(bpfFuncMapLookupElem),
+		bpfJmpImm(bpfJEQ, bpfReg0, 0, -1),
+		bpfLdXMemDW(bpfReg7, bpfReg0, 0),
+		bpfLdXMemDW(bpfReg8, bpfReg0, 8),
+		bpfLdXMemDW(bpfReg6, bpfReg0, 16),
+	)
+	insns = append(insns, bpfLoadMapFD(bpfReg1, activeWriteMapFD)...)
+	insns = append(insns,
+		bpfMov64Reg(bpfReg2, bpfReg10),
+		bpfAdd64Imm(bpfReg2, -8),
+		bpfCall(bpfFuncMapDeleteElem),
+		bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
+		bpfJmpImm(bpfJGT, bpfReg9, 0x0fffffff, -1),
+		bpfJumpReg(bpfJLE, bpfReg9, bpfReg6, 1),
+		bpfMov64Reg(bpfReg9, bpfReg6),
+		bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1),
+		bpfMov64Imm(bpfReg9, ebpfMaxPayload),
+	)
+	insns = appendPlainSocketStateFilter(insns, plainFlowMapFD)
+	insns = append(insns, bpfJmpImm(bpfJEQ, bpfReg0, 0, -1))
+	insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
+	insns = append(insns,
+		bpfMov64Imm(bpfReg2, ebpfEventSize),
+		bpfMov64Imm(bpfReg3, 0),
+		bpfCall(bpfFuncRingbufReserve),
+		bpfJmpImm(bpfJEQ, bpfReg0, 0, -1),
+		bpfMov64Reg(bpfReg6, bpfReg0),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0),
+		bpfRsh64Imm(bpfReg1, 32),
+		bpfStMemW(bpfReg6, 0, 0x4c4c4d54),
+		bpfStXMemW(bpfReg6, bpfReg1, 4),
+		bpfStXMemW(bpfReg6, bpfReg0, 8),
+		bpfStXMemW(bpfReg6, bpfReg7, 12),
+		bpfStMemW(bpfReg6, 16, dirImm),
+		bpfStXMemW(bpfReg6, bpfReg9, 20),
+		bpfMov64Reg(bpfReg1, bpfReg6),
+		bpfAdd64Imm(bpfReg1, 24),
+		bpfMov64Reg(bpfReg2, bpfReg9),
+		bpfMov64Reg(bpfReg3, bpfReg8),
+		bpfCall(bpfFuncProbeReadUser),
+		bpfMov64Reg(bpfReg1, bpfReg6),
+		bpfMov64Imm(bpfReg2, 0),
+		bpfCall(bpfFuncRingbufSubmit),
 		bpfMov64Imm(bpfReg0, 0),
 		bpfExit(),
 	)
@@ -1135,6 +1246,7 @@ type EBPFEngine struct {
 	ringMapFD          int
 	activeSSLReadFD    int
 	activeSysReadFD    int
+	activeSysWriteFD   int
 	plainFlowFD        int
 	sslWriteProg       int
 	sslReadEnterProg   int
@@ -1210,17 +1322,25 @@ func StartEBPFEngine(
 		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD)
 		return nil, fmt.Errorf("create plain_flow hash map: %w", err)
 	}
+	sysWriteMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_LRU_HASH, 8, 24, 16384)
+	if err != nil {
+		sysWriteMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 16384)
+	}
+	if err != nil {
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD)
+		return nil, fmt.Errorf("create active_sys_write hash map: %w", err)
+	}
 
 	pageSize := os.Getpagesize()
 	consMmap, err := unix.Mmap(ringFD, 0, pageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD)
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD, sysWriteMapFD)
 		return nil, fmt.Errorf("mmap ringbuf consumer page: %w", err)
 	}
 	prodMmap, err := unix.Mmap(ringFD, int64(pageSize), pageSize+2*ringBytes, unix.PROT_READ, unix.MAP_SHARED)
 	if err != nil {
 		_ = unix.Munmap(consMmap)
-		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD)
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD, sysWriteMapFD)
 		return nil, fmt.Errorf("mmap ringbuf producer+data pages: %w", err)
 	}
 
@@ -1228,6 +1348,7 @@ func StartEBPFEngine(
 		ringMapFD:          ringFD,
 		activeSSLReadFD:    sslReadMapFD,
 		activeSysReadFD:    sysReadMapFD,
+		activeSysWriteFD:   sysWriteMapFD,
 		plainFlowFD:        plainFlowMapFD,
 		sslWriteProg:       -1,
 		sslReadEnterProg:   -1,
@@ -1309,6 +1430,9 @@ func (e *EBPFEngine) Close() {
 		}
 		if e.activeSysReadFD >= 0 {
 			_ = unix.Close(e.activeSysReadFD)
+		}
+		if e.activeSysWriteFD >= 0 {
+			_ = unix.Close(e.activeSysWriteFD)
 		}
 		if e.plainFlowFD >= 0 {
 			_ = unix.Close(e.plainFlowFD)
@@ -1467,8 +1591,10 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 		insns    []BPFInsn
 		required bool
 	}{
-		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), true},
-		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), false},
+		{"syscalls/sys_enter_write", "llmt_tp_w_ent", BuildSyscallWriteEnterProgram(e.activeSysWriteFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2), true},
+		{"syscalls/sys_exit_write", "llmt_tp_w_ext", BuildSyscallWriteExitProgram(e.ringMapFD, e.activeSysWriteFD, e.plainFlowFD, tpOffsets.SyscallRet), true},
+		{"syscalls/sys_enter_sendto", "llmt_tp_st_ent", BuildSyscallWriteEnterProgram(e.activeSysWriteFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2), false},
+		{"syscalls/sys_exit_sendto", "llmt_tp_st_ext", BuildSyscallWriteExitProgram(e.ringMapFD, e.activeSysWriteFD, e.plainFlowFD, tpOffsets.SyscallRet), false},
 		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets), false},
 		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), true},
 		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), false},
