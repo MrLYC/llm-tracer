@@ -1140,6 +1140,8 @@ time.sleep(0.12)
 	})
 
 	t.Run("EBPF_Scenario16_PlainHTTPSplitWrite", func(t *testing.T) {
+		// Scenario 15 registers the launched child as a root PID, which turns on the PID filter.
+		col.UpdateScope(model.ScopeFilter{})
 		cSrc := filepath.Join(dir, "scen_ebpf_plain_http_split.c")
 		binPath := filepath.Join(dir, "scen_ebpf_plain_http_split")
 		code := `#include <sys/socket.h>
