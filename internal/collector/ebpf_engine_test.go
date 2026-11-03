@@ -1112,16 +1112,24 @@ time.sleep(0.12)
 		defer ts.Close()
 		host, port, err := netSplitHostPort(ts.Listener.Addr().String())
 		require.NoError(t, err)
-		script := "import socket\n" +
-			"host = " + fmt.Sprintf("%q", host) + "\n" +
-			"port = " + port + "\n" +
-			"body = b'{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"plain http split\"}]}'\n" +
-			"head = ('POST /api/chat HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % (host, len(body))).encode()\n" +
-			"s = socket.create_connection((host, int(port)), timeout=2)\n" +
-			"s.sendall(head)\n" +
-			"s.sendall(body)\n" +
-			"s.recv(65536)\n" +
-			"s.close()\n"
+		script := fmt.Sprintf(`import socket
+host = %q
+port = %s
+body = b'{"model":"qwen","messages":[{"role":"user","content":"plain http split"}]}'
+head = ("POST /api/chat HTTP/1.1\r\nHost: %%s\r\nContent-Length: %%d\r\nConnection: close\r\n\r\n" %% (host, len(body))).encode()
+s = socket.create_connection((host, int(port)), timeout=2)
+s.sendall(head)
+s.sendall(body)
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+s.close()
+if b"plain http split ok" not in data:
+    raise SystemExit("missing response")
+`, host, port)
 		pyPath := filepath.Join(t.TempDir(), "plain_http_split.py")
 		require.NoError(t, os.WriteFile(pyPath, []byte(script), 0o644))
 		pid := runUnhooked(t, "python3", pyPath)
