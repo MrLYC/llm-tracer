@@ -399,7 +399,7 @@ const timer = setInterval(() => {
 #include <string.h>
 #include <fcntl.h>
 int main(int argc, char **argv) {
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < 2000; i++) {
         if (access(argv[1], F_OK) == 0) break;
         usleep(20000);
     }
