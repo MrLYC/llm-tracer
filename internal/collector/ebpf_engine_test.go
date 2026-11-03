@@ -71,6 +71,7 @@ func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 					}
 				}
 			}
+			require.Less(t, len(insns), 4096, "%s must stay loadable on kernels whose BPF_MAXINSNS is 4096", name)
 		})
 	}
 }
@@ -86,6 +87,7 @@ func TestClassifyPlainSocketPrefix(t *testing.T) {
 		{name: "POST starts HTTP", prefix: []byte("POST /api/chat HTTP/1.1\r\n"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
 		{name: "response status line starts HTTP", prefix: []byte("HTTP/1.1 200 OK\r\n"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
 		{name: "known path after non-HTTP prefix", prefix: []byte("x /v1/chat/completions"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
+		{name: "path outside the start window is not HTTP", prefix: []byte("xxxxxxxxxxxxxxxx/api/chat"), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
 		{name: "body continuation follows fd state", prefix: []byte(`{"model":"qwen"}`), existing: plainFlowHTTP, wantState: plainFlowHTTP, wantEmit: true},
 		{name: "TLS record marks skip", prefix: []byte{0x17, 0x03, 0x03, 0x01, 0x02}, existing: plainFlowUnknown, wantState: plainFlowTLSSkip, wantEmit: false},
 		{name: "already TLS skips ciphertext", prefix: []byte{0x17, 0x03}, existing: plainFlowTLSSkip, wantState: plainFlowTLSSkip, wantEmit: false},
@@ -219,6 +221,17 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 	t.Logf("EBPFEngine attached: total=%d uprobes=%d tracepoints=%d",
 		col.ebpfEngine.AttachedCount(), col.ebpfEngine.UprobeCount(), col.ebpfEngine.TracepointCount())
 	require.GreaterOrEqual(t, col.ebpfEngine.UprobeCount(), 4, "should attach libssl uprobes/uretprobes")
+	if col.ebpfEngine.TracepointCount() < 11 {
+		if evs, err := mon.QueryEvents(selfmon.Query{Limit: 20}); err == nil {
+			for _, ev := range evs {
+				msg := ev.Error
+				if len(msg) > 2000 {
+					msg = msg[:2000]
+				}
+				t.Logf("selfmon %s %s %s", ev.Status, ev.Action, msg)
+			}
+		}
+	}
 	require.GreaterOrEqual(t, col.ebpfEngine.TracepointCount(), 11, "should attach syscall tracepoints including sendmsg/recvmsg and connect reset")
 
 	// Explicitly verify all 11 eBPF bytecode programs pass the Linux kernel BPF_PROG_LOAD verifier

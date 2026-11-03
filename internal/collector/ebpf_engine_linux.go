@@ -106,6 +106,9 @@ const (
 	plainFlowUnknown uint32 = 0
 	plainFlowHTTP    uint32 = 1
 	plainFlowTLSSkip uint32 = 2
+	// plainHTTPPathScanStarts is how far into the first 64 bytes a path may begin.
+	// Full-path compares are unrolled, so this stays inside the 4096-insn BPF limit.
+	plainHTTPPathScanStarts = 16
 )
 
 // classifyPlainSocketPrefix mirrors the BPF state machine in appendPlainSocketStateFilter.
@@ -152,9 +155,15 @@ func containsPlainHTTPPath(prefix []byte, max int) bool {
 	if len(prefix) > max {
 		prefix = prefix[:max]
 	}
+	limit := plainHTTPPathScanStarts
+	if limit > len(prefix) {
+		limit = len(prefix)
+	}
 	for _, path := range plainHTTPPathLiterals {
-		if strings.Contains(string(prefix), path) {
-			return true
+		for off := 0; off < limit && off+len(path) <= len(prefix); off++ {
+			if string(prefix[off:off+len(path)]) == path {
+				return true
+			}
 		}
 	}
 	return false
@@ -275,6 +284,58 @@ func patchExitJumps(insns []BPFInsn) []BPFInsn {
 	return insns
 }
 
+func appendProbeReadConst(a *bpfAsm, dstOff int16, n int, srcOff int32) {
+	a.op(bpfMov64Reg(bpfReg1, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg1, int32(dstOff)))
+	a.op(bpfMov64Imm(bpfReg2, int32(n)))
+	a.op(bpfMov64Reg(bpfReg3, bpfReg8))
+	if srcOff != 0 {
+		a.op(bpfAdd64Imm(bpfReg3, srcOff))
+	}
+	a.op(bpfCall(bpfFuncProbeReadUser))
+}
+
+// appendCopyPlainPrefix copies min(R9, 64) bytes from R8 into fp+prefixOff.
+// Full 8-byte chunks use one helper call; a short tail stops the copy.
+func appendCopyPlainPrefix(a *bpfAsm, prefixOff int16) {
+	for off := 0; off < 64; off += 8 {
+		tail := fmt.Sprintf("pfx_tail_%d", off)
+		next := fmt.Sprintf("pfx_next_%d", off)
+		a.jmp(bpfJLT, bpfReg9, int32(off+8), tail)
+		appendProbeReadConst(a, prefixOff+int16(off), 8, int32(off))
+		a.ja(next)
+		a.label(tail)
+		for b := 0; b < 8; b++ {
+			skip := fmt.Sprintf("pfx_b_%d_%d", off, b)
+			a.jmp(bpfJLT, bpfReg9, int32(off+b+1), skip)
+			appendProbeReadConst(a, prefixOff+int16(off+b), 1, int32(off+b))
+			a.label(skip)
+		}
+		a.ja("pfx_done")
+		a.label(next)
+	}
+	a.label("pfx_done")
+}
+
+// appendPlainHTTPPathMatch looks for an LLM path whose first byte is inside
+// plainHTTPPathScanStarts. Later bytes may extend through the 64-byte prefix.
+func appendPlainHTTPPathMatch(a *bpfAsm, prefixOff int16) {
+	for off := 0; off < plainHTTPPathScanStarts; off++ {
+		for pi, path := range plainHTTPPathLiterals {
+			if off+len(path) > 64 {
+				continue
+			}
+			fail := fmt.Sprintf("ph_%d_%d", off, pi)
+			for bi := 0; bi < len(path); bi++ {
+				a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff+int16(off+bi)))
+				a.jmp(bpfJNE, bpfReg0, int32(path[bi]), fail)
+			}
+			a.ja("store_http")
+			a.label(fail)
+		}
+	}
+}
+
 // appendPlainSocketStateFilter updates plain_flow for the socket tag in R7 using the
 // user buffer at R8 and its length in R9. It preserves R7, R8 and R9, and sets R0=1
 // to emit or R0=0 to drop. The map key is (tgid<<32)|low32(conn_tag), where conn_tag
@@ -313,17 +374,7 @@ func appendPlainSocketStateFilter(insns []BPFInsn, plainFlowMapFD int) []BPFInsn
 	a.jmp(bpfJEQ, bpfReg0, int32(plainFlowTLSSkip), "drop")
 	a.jmp(bpfJEQ, bpfReg0, int32(plainFlowHTTP), "emit")
 
-	for i := 0; i < 64; i++ {
-		skip := fmt.Sprintf("copy_%d", i)
-		a.jmp(bpfJLT, bpfReg9, int32(i+1), skip)
-		a.op(bpfMov64Reg(bpfReg1, bpfReg10))
-		a.op(bpfAdd64Imm(bpfReg1, int32(prefixOff+int16(i))))
-		a.op(bpfMov64Imm(bpfReg2, 1))
-		a.op(bpfMov64Reg(bpfReg3, bpfReg8))
-		a.op(bpfAdd64Imm(bpfReg3, int32(i)))
-		a.op(bpfCall(bpfFuncProbeReadUser))
-		a.label(skip)
-	}
+	appendCopyPlainPrefix(a, prefixOff)
 
 	a.jmp(bpfJLT, bpfReg9, 2, "after_tls")
 	a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff))
@@ -345,17 +396,7 @@ func appendPlainSocketStateFilter(insns []BPFInsn, plainFlowMapFD int) []BPFInsn
 	}
 	a.label("after_method")
 
-	for pi, path := range plainHTTPPathLiterals {
-		for off := 0; off <= 64-len(path); off++ {
-			next := fmt.Sprintf("path_%d_%d", pi, off)
-			for bi := 0; bi < len(path); bi++ {
-				a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff+int16(off+bi)))
-				a.jmp(bpfJNE, bpfReg0, int32(path[bi]), next)
-			}
-			a.ja("store_http")
-			a.label(next)
-		}
-	}
+	appendPlainHTTPPathMatch(a, prefixOff)
 	a.ja("drop")
 
 	a.label("store_http")
