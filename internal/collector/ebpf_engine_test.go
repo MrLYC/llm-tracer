@@ -105,6 +105,36 @@ func TestClassifyPlainSocketPrefix(t *testing.T) {
 	}
 }
 
+func TestPlainTraceDirectionReclassifiesPeerSocket(t *testing.T) {
+	req := []byte("POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+	resp := []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+	body := []byte(`{"model":"qwen"}`)
+	require.Equal(t, parser.DirWrite, plainTraceDirection(req, parser.DirRead))
+	require.Equal(t, parser.DirRead, plainTraceDirection(resp, parser.DirWrite))
+	require.Equal(t, parser.DirWrite, plainTraceDirection(body, parser.DirWrite))
+	require.Equal(t, parser.DirRead, plainTraceDirection([]byte("data: {}\n\n"), parser.DirRead))
+
+	var gotDir parser.Direction
+	var gotPayload []byte
+	eng := &EBPFEngine{onEvent: func(pid, tid int, connID string, dir parser.Direction, payload []byte, mode string) {
+		gotDir = dir
+		gotPayload = append([]byte(nil), payload...)
+		require.Equal(t, "ebpf_tracepoint", mode)
+		require.Equal(t, "ebpf_fd_4", connID)
+	}}
+	raw := make([]byte, 24+len(req))
+	binary.NativeEndian.PutUint32(raw[0:4], 0x4c4c4d54)
+	binary.NativeEndian.PutUint32(raw[4:8], 4242)
+	binary.NativeEndian.PutUint32(raw[8:12], 4242)
+	binary.NativeEndian.PutUint32(raw[12:16], 0x80000004)
+	binary.NativeEndian.PutUint32(raw[16:20], 3) // syscall read
+	binary.NativeEndian.PutUint32(raw[20:24], uint32(len(req)))
+	copy(raw[24:], req)
+	eng.parseAndDispatchRecord(raw, os.Getpid())
+	require.Equal(t, parser.DirWrite, gotDir)
+	require.Equal(t, req, gotPayload)
+}
+
 func TestPlainHTTPPathLiterals(t *testing.T) {
 	require.Equal(t, []string{
 		"/v1/chat/completions", "/v1/messages", "/v1/responses",

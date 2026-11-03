@@ -134,6 +134,23 @@ func classifyPlainSocketPrefix(prefix []byte, existing uint32) (uint32, bool) {
 	return plainFlowUnknown, false
 }
 
+// plainTraceDirection corrects syscall read/write for plaintext HTTP.
+// A peer can recv the whole request and send the response, so read is not always
+// the response and write is not always the request. JSON and SSE fragments keep
+// the syscall direction and stay on the same fd buffer as the preceding header.
+func plainTraceDirection(payload []byte, dir parser.Direction) parser.Direction {
+	if len(payload) >= 5 && string(payload[:5]) == "HTTP/" {
+		return parser.DirRead
+	}
+	if len(payload) >= 4 {
+		switch string(payload[:4]) {
+		case "POST", "GET ", "PUT ", "HEAD", "DELE", "PATC":
+			return parser.DirWrite
+		}
+	}
+	return dir
+}
+
 // isPlainContinuationPrefix reports a JSON body or SSE fragment that can follow a
 // plaintext HTTP header. It must not by itself mark the socket as HTTP.
 func isPlainContinuationPrefix(prefix []byte) bool {
@@ -1726,6 +1743,7 @@ func (e *EBPFEngine) parseAndDispatchRecord(raw []byte, selfPID int) {
 				return
 			}
 		}
+		dir = plainTraceDirection(payload, dir)
 	}
 	e.onEvent(pid, tid, connID, dir, payload, mode)
 }
