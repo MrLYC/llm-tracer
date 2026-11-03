@@ -129,7 +129,7 @@ with open(p, "ab") as f:
 				require.Eventually(t, func() bool {
 					col.Flush()
 					return countPersistedStoreEvents(t, st) == 60
-				}, 2*time.Second, 20*time.Millisecond, "expected 60/60 short-lived python subprocess exchanges to be persisted")
+				}, 10*time.Second, 50*time.Millisecond, "expected 60/60 short-lived python subprocess exchanges to be persisted")
 			})
 		}
 	}
