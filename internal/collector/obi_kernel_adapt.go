@@ -81,6 +81,9 @@ func ResolveSyscallTracepointOffsets(baseOffsets ebpfPtRegsOffsets) ebpfPtRegsOf
 	if offset, ok := firstFieldOffset(enter, "count", "vlen"); ok {
 		baseOffsets.SyscallArg2 = offset
 	}
+	if offset, ok := firstFieldOffset(enter, "flags", "uservalue", "addrlen"); ok {
+		baseOffsets.SyscallArg3 = offset
+	}
 
 	if exit, err := readTracepointFormat(exitRead, exitReadDebug); err == nil {
 		if offset, ok := firstFieldOffset(exit, "ret"); ok {

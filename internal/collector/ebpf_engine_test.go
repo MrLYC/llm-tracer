@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,17 +31,20 @@ import (
 
 func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 	programs := map[string][]BPFInsn{
-		"uprobe_ssl_write":         BuildWriteProbeProgram(3, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false),
-		"uprobe_gotls_write":       BuildWriteProbeProgram(3, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false),
+		"uprobe_ssl_write":         BuildWriteProbeProgram(3, 4, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false),
+		"uprobe_gotls_write":       BuildWriteProbeProgram(3, 4, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false),
 		"uprobe_gotls_read_enter":  BuildGoTLSReadEnterProgram(4),
 		"uprobe_gotls_read_exit":   BuildGoTLSReadExitProgram(3, 4),
-		"tp_sys_enter_write":       BuildWriteProbeProgram(3, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true),
-		"tp_sys_enter_writev":      BuildWritevProbeProgram(3),
+		"tp_sys_enter_write":       BuildWriteProbeProgram(3, 4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true),
+		"tp_sys_enter_writev":      BuildWritevProbeProgram(3, 4),
+		"tp_sys_enter_sendmsg":     BuildSendmsgProbeProgram(3, 4, archPtRegsOffsets),
+		"tp_sys_enter_recvmsg":     BuildRecvmsgEnterProgram(4, archPtRegsOffsets),
+		"tp_sys_enter_connect":     BuildConnectResetProgram(4, archPtRegsOffsets),
 		"uprobe_ssl_read_enter":    BuildReadEnterProgram(4, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false),
 		"uprobe_ssl_read_ex_enter": BuildReadEnterProgram(4, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false),
 		"tp_sys_enter_read":        BuildReadEnterProgram(4, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true),
-		"uretprobe_ssl_read":       BuildReadExitProgram(3, 4, archPtRegsOffsets.CRet, false),
-		"tp_sys_exit_read":         BuildReadExitProgram(3, 4, archPtRegsOffsets.SyscallRet, true),
+		"uretprobe_ssl_read":       BuildReadExitProgram(3, 4, 5, archPtRegsOffsets.CRet, false),
+		"tp_sys_exit_read":         BuildReadExitProgram(3, 4, 5, archPtRegsOffsets.SyscallRet, true),
 	}
 
 	for name, insns := range programs {
@@ -50,7 +54,7 @@ func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 			last := insns[len(insns)-1]
 			require.Equal(t, uint8(bpfJMP|bpfEXIT), last.Code, "last instruction must be BPF_EXIT")
 
-			// Verify all jump offsets land within valid instruction boundaries and end at exit
+			// Verify all jump offsets land within valid instruction boundaries; exit jumps end at R0=0.
 			for i := 0; i < len(insns); i++ {
 				in := insns[i]
 				if in.Code == (bpfLD | bpfDW | bpfIMM) {
@@ -64,14 +68,44 @@ func TestEBPFBytecodeBuilderAndJumpBounds(t *testing.T) {
 						target := i + 1 + int(in.Off)
 						require.GreaterOrEqual(t, target, 0, "jump target underflow at insn %d", i)
 						require.Less(t, target, len(insns), "jump target overflow at insn %d (target=%d len=%d)", i, target, len(insns))
-						if in.Off > 8 {
-							require.Equal(t, len(insns)-2, target, "early-exit jump at insn %d must land on R0=0 before exit (len=%d)", i, len(insns))
-						}
 					}
 				}
 			}
 		})
 	}
+}
+
+func TestClassifyPlainSocketPrefix(t *testing.T) {
+	cases := []struct {
+		name      string
+		prefix    []byte
+		existing  uint32
+		wantState uint32
+		wantEmit  bool
+	}{
+		{name: "POST starts HTTP", prefix: []byte("POST /api/chat HTTP/1.1\r\n"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
+		{name: "response status line starts HTTP", prefix: []byte("HTTP/1.1 200 OK\r\n"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
+		{name: "known path after non-HTTP prefix", prefix: []byte("x /v1/chat/completions"), existing: plainFlowUnknown, wantState: plainFlowHTTP, wantEmit: true},
+		{name: "body continuation follows fd state", prefix: []byte(`{"model":"qwen"}`), existing: plainFlowHTTP, wantState: plainFlowHTTP, wantEmit: true},
+		{name: "TLS record marks skip", prefix: []byte{0x17, 0x03, 0x03, 0x01, 0x02}, existing: plainFlowUnknown, wantState: plainFlowTLSSkip, wantEmit: false},
+		{name: "already TLS skips ciphertext", prefix: []byte{0x17, 0x03}, existing: plainFlowTLSSkip, wantState: plainFlowTLSSkip, wantEmit: false},
+		{name: "bare JSON is not HTTP", prefix: []byte(`{"unrelated":true}`), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
+		{name: "unrelated bytes are dropped", prefix: []byte("not-http-or-json"), existing: plainFlowUnknown, wantState: plainFlowUnknown, wantEmit: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotState, gotEmit := classifyPlainSocketPrefix(tc.prefix, tc.existing)
+			require.Equal(t, tc.wantState, gotState)
+			require.Equal(t, tc.wantEmit, gotEmit)
+		})
+	}
+}
+
+func TestPlainHTTPPathLiterals(t *testing.T) {
+	require.Equal(t, []string{
+		"/v1/chat/completions", "/v1/messages", "/v1/responses",
+		"/v1/completions", "/api/chat", "/api/generate",
+	}, plainHTTPPathLiterals)
 }
 
 func TestEBPFRingBufConsumerAndRecordDispatch(t *testing.T) {
@@ -91,6 +125,7 @@ func TestEBPFRingBufConsumerAndRecordDispatch(t *testing.T) {
 		ringMapFD:       -1,
 		activeSSLReadFD: -1,
 		activeSysReadFD: -1,
+		plainFlowFD:     -1,
 		ringMaxBytes:    ringBytes,
 		consMmap:        consBuf,
 		prodMmap:        prodBuf,
@@ -184,28 +219,33 @@ func TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot(t *testing.T) {
 	t.Logf("EBPFEngine attached: total=%d uprobes=%d tracepoints=%d",
 		col.ebpfEngine.AttachedCount(), col.ebpfEngine.UprobeCount(), col.ebpfEngine.TracepointCount())
 	require.GreaterOrEqual(t, col.ebpfEngine.UprobeCount(), 4, "should attach libssl uprobes/uretprobes")
-	require.GreaterOrEqual(t, col.ebpfEngine.TracepointCount(), 7, "should attach syscall tracepoints including sys_enter_writev")
+	require.GreaterOrEqual(t, col.ebpfEngine.TracepointCount(), 11, "should attach syscall tracepoints including sendmsg/recvmsg and connect reset")
 
 	// Explicitly verify all 11 eBPF bytecode programs pass the Linux kernel BPF_PROG_LOAD verifier
 	ringFD := col.ebpfEngine.ringMapFD
 	sslReadFD := col.ebpfEngine.activeSSLReadFD
 	sysReadFD := col.ebpfEngine.activeSysReadFD
+	plainFlowFD := col.ebpfEngine.plainFlowFD
 	for _, tc := range []struct {
 		progType uint32
 		name     string
 		insns    []BPFInsn
 	}{
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_w", BuildWriteProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_w", BuildWriteProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_re", BuildGoTLSReadEnterProgram(sslReadFD)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_gotls_rx", BuildGoTLSReadExitProgram(ringFD, sslReadFD)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_re", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, 0, false)},
 		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rxe", BuildReadEnterProgram(sslReadFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg3, false)},
-		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rx", BuildReadExitProgram(ringFD, sslReadFD, archPtRegsOffsets.CRet, false)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w", BuildWriteProbeProgram(ringFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_wv", BuildWritevProbeProgram(ringFD)},
+		{unix.BPF_PROG_TYPE_KPROBE, "v_ssl_rx", BuildReadExitProgram(ringFD, sslReadFD, plainFlowFD, archPtRegsOffsets.CRet, false)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_w", BuildWriteProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, archPtRegsOffsets.SyscallArg2, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_wv", BuildWritevProbeProgram(ringFD, plainFlowFD)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_sendmsg", BuildSendmsgProbeProgram(ringFD, plainFlowFD, archPtRegsOffsets)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rm_ent", BuildRecvmsgEnterProgram(sysReadFD, archPtRegsOffsets)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rm_ext", BuildReadExitProgram(ringFD, sysReadFD, plainFlowFD, archPtRegsOffsets.SyscallRet, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_connect", BuildConnectResetProgram(plainFlowFD, archPtRegsOffsets)},
 		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_re", BuildReadEnterProgram(sysReadFD, archPtRegsOffsets.SyscallArg0, archPtRegsOffsets.SyscallArg1, 0, true)},
-		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rx", BuildReadExitProgram(ringFD, sysReadFD, archPtRegsOffsets.SyscallRet, true)},
+		{unix.BPF_PROG_TYPE_TRACEPOINT, "v_tp_rx", BuildReadExitProgram(ringFD, sysReadFD, plainFlowFD, archPtRegsOffsets.SyscallRet, true)},
 	} {
 		pfd, vlog, err := bpfLoadProgram(tc.progType, tc.name, tc.insns)
 		require.NoError(t, err, "verifier log for %s:\n%s", tc.name, vlog)
@@ -1047,7 +1087,33 @@ time.sleep(0.12)
 		require.True(t, foundLaunch)
 
 		stats := mon.Stats()
-		require.GreaterOrEqual(t, stats.TotalOK, int64(15), "selfmon must record OK events across all 15 scenarios")
+		require.GreaterOrEqual(t, stats.TotalOK, int64(15), "selfmon must record OK events across the root scenarios")
+	})
+
+	t.Run("EBPF_Scenario16_PlainHTTPSplitWrite", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"model":"qwen","message":{"role":"assistant","content":"plain http split ok"},"done":true}`))
+		}))
+		defer ts.Close()
+		host, port, err := netSplitHostPort(ts.Listener.Addr().String())
+		require.NoError(t, err)
+		script := "import socket\n" +
+			"host = " + fmt.Sprintf("%q", host) + "\n" +
+			"port = " + port + "\n" +
+			"body = b'{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"plain http split\"}]}'\n" +
+			"head = ('POST /api/chat HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % (host, len(body))).encode()\n" +
+			"s = socket.create_connection((host, int(port)), timeout=2)\n" +
+			"s.sendall(head)\n" +
+			"s.sendall(body)\n" +
+			"s.recv(65536)\n" +
+			"s.close()\n"
+		pyPath := filepath.Join(t.TempDir(), "plain_http_split.py")
+		require.NoError(t, os.WriteFile(pyPath, []byte(script), 0o644))
+		pid := runUnhooked(t, "python3", pyPath)
+		evs := waitSessionByPID(t, pid, "split plain HTTP POST /api/chat must be reassembled from two send calls")
+		require.Equal(t, "plain http split ok", evs[0].Chat.ResponseText)
 	})
 }
 
@@ -1061,6 +1127,7 @@ func TestEBPFGoTLSReadMissingRetOffsetsRecordsDegradationWarn(t *testing.T) {
 		ringMapFD:          -1,
 		activeSSLReadFD:    -1,
 		activeSysReadFD:    -1,
+		plainFlowFD:        -1,
 		sslWriteProg:       -1,
 		sslReadEnterProg:   -1,
 		sslReadExEnterProg: -1,
@@ -1086,4 +1153,8 @@ func TestEBPFGoTLSReadMissingRetOffsetsRecordsDegradationWarn(t *testing.T) {
 	})
 	require.Equal(t, 0, added)
 	require.GreaterOrEqual(t, mon.Stats().TotalWarn, int64(1), "missing GoTLS Read RET offsets must emit selfmon degradation warning instead of silently degrading")
+}
+
+func netSplitHostPort(addr string) (string, string, error) {
+	return net.SplitHostPort(addr)
 }

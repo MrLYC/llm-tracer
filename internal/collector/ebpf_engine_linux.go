@@ -41,13 +41,16 @@ const (
 
 	bpfADD  = 0x00
 	bpfMOV  = 0xb0
+	bpfXOR  = 0xa0
 	bpfRSH  = 0x70
 	bpfLSH  = 0x60
 	bpfOR   = 0x40
 	bpfAND  = 0x50
 	bpfK    = 0x00
 	bpfX    = 0x08
+	bpfJA   = 0x00
 	bpfJEQ  = 0x10
+	bpfJNE  = 0x50
 	bpfJGT  = 0x20
 	bpfJGE  = 0x30
 	bpfJSGT = 0x60
@@ -87,6 +90,75 @@ const (
 	ebpfMaxPayload = 4072
 	ebpfEventSize  = 24 + ebpfMaxPayload // 4096 bytes
 )
+
+var plainHTTPPathLiterals = []string{
+	"/v1/chat/completions",
+	"/v1/messages",
+	"/v1/responses",
+	"/v1/completions",
+	"/api/chat",
+	"/api/generate",
+}
+
+// plainFlowState is stored in BPF map plain_flow keyed by (tgid<<32)|conn_tag.
+// conn_tag is the same tagged fd used in events: 0x80000000|fd.
+const (
+	plainFlowUnknown uint32 = 0
+	plainFlowHTTP    uint32 = 1
+	plainFlowTLSSkip uint32 = 2
+)
+
+// classifyPlainSocketPrefix mirrors the BPF state machine in appendPlainSocketStateFilter.
+// Existing is the current plain_flow value. The return value is the updated state and
+// whether this buffer should be copied to the ring buffer.
+func classifyPlainSocketPrefix(prefix []byte, existing uint32) (uint32, bool) {
+	if existing == plainFlowTLSSkip {
+		return plainFlowTLSSkip, false
+	}
+	if len(prefix) >= 2 && isTLSRecordPrefix(prefix[0], prefix[1]) {
+		return plainFlowTLSSkip, false
+	}
+	if existing == plainFlowHTTP {
+		return plainFlowHTTP, true
+	}
+	if isPlainHTTPPrefix(prefix) || containsPlainHTTPPath(prefix, 64) {
+		return plainFlowHTTP, true
+	}
+	return plainFlowUnknown, false
+}
+
+func isTLSRecordPrefix(first, second byte) bool {
+	switch first {
+	case 0x14, 0x15, 0x16, 0x17:
+		return second == 0x03
+	default:
+		return false
+	}
+}
+
+func isPlainHTTPPrefix(prefix []byte) bool {
+	if len(prefix) < 4 {
+		return false
+	}
+	switch string(prefix[:4]) {
+	case "POST", "GET ", "PUT ", "HEAD", "DELE", "PATC", "HTTP":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsPlainHTTPPath(prefix []byte, max int) bool {
+	if len(prefix) > max {
+		prefix = prefix[:max]
+	}
+	for _, path := range plainHTTPPathLiterals {
+		if strings.Contains(string(prefix), path) {
+			return true
+		}
+	}
+	return false
+}
 
 // BPFInsn represents a single 8-byte Linux eBPF instruction (struct bpf_insn).
 type BPFInsn struct {
@@ -137,12 +209,20 @@ func bpfAnd64Imm(dst uint8, imm int32) BPFInsn {
 	return makeInsn(bpfALU64|bpfAND|bpfK, dst, 0, 0, imm)
 }
 
+func bpfXor64Imm(dst uint8, imm int32) BPFInsn {
+	return makeInsn(bpfALU64|bpfXOR|bpfK, dst, 0, 0, imm)
+}
+
 func bpfLdXMemDW(dst, src uint8, off int16) BPFInsn {
 	return makeInsn(bpfLDX|bpfDW|bpfMEM, dst, src, off, 0)
 }
 
 func bpfLdXMemW(dst, src uint8, off int16) BPFInsn {
 	return makeInsn(bpfLDX|bpfW|bpfMEM, dst, src, off, 0)
+}
+
+func bpfLdXMemB(dst, src uint8, off int16) BPFInsn {
+	return makeInsn(bpfLDX|bpfB|bpfMEM, dst, src, off, 0)
 }
 
 func bpfStXMemDW(dst, src uint8, off int16) BPFInsn {
@@ -172,6 +252,10 @@ func bpfJmpImm(op uint8, dst uint8, imm int32, off int16) BPFInsn {
 	return makeInsn(bpfJMP|op|bpfK, dst, 0, off, imm)
 }
 
+func bpfJump(off int16) BPFInsn {
+	return makeInsn(bpfJMP|bpfK, 0, 0, off, 0)
+}
+
 func bpfExit() BPFInsn {
 	return makeInsn(bpfJMP|bpfEXIT, 0, 0, 0, 0)
 }
@@ -191,27 +275,171 @@ func patchExitJumps(insns []BPFInsn) []BPFInsn {
 	return insns
 }
 
-// appendSyscallHTTPFilter reads the first 4 bytes of user buffer R8 onto stack [fp-24] before reserving ringbuf space.
-// Only HTTP requests/responses, SSE chunks, or JSON payloads on syscall tracepoints proceed to ringbuf reservation.
-func appendSyscallHTTPFilter(insns []BPFInsn) []BPFInsn {
-	return append(insns,
-		bpfStMemW(bpfReg10, -24, 0),
-		bpfMov64Reg(bpfReg1, bpfReg10),
-		bpfAdd64Imm(bpfReg1, -24),
-		bpfMov64Imm(bpfReg2, 4),
-		bpfMov64Reg(bpfReg3, bpfReg8),
-		bpfCall(bpfFuncProbeReadUser),
-		bpfLdXMemW(bpfReg0, bpfReg10, -24),
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x54534f50, 8), // "POST"
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x20544547, 7), // "GET "
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x20545550, 6), // "PUT "
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x454c4544, 5), // "DELE"
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x50545448, 4), // "HTTP"
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x61746164, 3), // "data"
-		bpfAnd64Imm(bpfReg0, 0xff),
-		bpfJmpImm(bpfJEQ, bpfReg0, 0x7b, 1), // '{'
-		bpfJmpImm(bpfJGE, bpfReg9, 0, -1),   // non-HTTP syscall payload -> exit without reserving ringbuf
+// appendPlainSocketStateFilter updates plain_flow for the socket tag in R7 using the
+// user buffer at R8 and its length in R9. It preserves R7, R8 and R9, and sets R0=1
+// to emit or R0=0 to drop. The map key is (tgid<<32)|low32(conn_tag), where conn_tag
+// is the tagged fd already in R7. Stack scratch lives at fp-176 and below so writev
+// can keep iovec bytes at fp-32. Keep the rules aligned with classifyPlainSocketPrefix.
+func appendPlainSocketStateFilter(insns []BPFInsn, plainFlowMapFD int) []BPFInsn {
+	const (
+		keyOff    int16 = -176
+		stateOff  int16 = -168
+		prefixOff int16 = -160
 	)
+	a := newBPFAsm(insns)
+	a.op(bpfCall(bpfFuncGetCurrentPidTgid))
+	a.op(bpfMov64Reg(bpfReg1, bpfReg0))
+	a.op(bpfRsh64Imm(bpfReg1, 32))
+	a.op(bpfLsh64Imm(bpfReg1, 32))
+	a.op(bpfMov64Reg(bpfReg2, bpfReg7))
+	a.op(bpfLsh64Imm(bpfReg2, 32))
+	a.op(bpfRsh64Imm(bpfReg2, 32))
+	a.op(bpfOr64Reg(bpfReg1, bpfReg2))
+	a.op(bpfStXMemDW(bpfReg10, bpfReg1, keyOff))
+	a.op(bpfMov64Imm(bpfReg0, 0))
+	a.op(bpfStXMemW(bpfReg10, bpfReg0, stateOff))
+	for i := 0; i < 16; i++ {
+		a.op(bpfStMemW(bpfReg10, prefixOff+int16(4*i), 0))
+	}
+	a.ops(bpfLoadMapFD(bpfReg1, plainFlowMapFD))
+	a.op(bpfMov64Reg(bpfReg2, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg2, int32(keyOff)))
+	a.op(bpfCall(bpfFuncMapLookupElem))
+	a.jmp(bpfJEQ, bpfReg0, 0, "no_state")
+	a.op(bpfLdXMemW(bpfReg0, bpfReg0, 0))
+	a.op(bpfStXMemW(bpfReg10, bpfReg0, stateOff))
+	a.label("no_state")
+	a.op(bpfLdXMemW(bpfReg0, bpfReg10, stateOff))
+	a.jmp(bpfJEQ, bpfReg0, int32(plainFlowTLSSkip), "drop")
+	a.jmp(bpfJEQ, bpfReg0, int32(plainFlowHTTP), "emit")
+
+	for i := 0; i < 64; i++ {
+		skip := fmt.Sprintf("copy_%d", i)
+		a.jmp(bpfJLT, bpfReg9, int32(i+1), skip)
+		a.op(bpfMov64Reg(bpfReg1, bpfReg10))
+		a.op(bpfAdd64Imm(bpfReg1, int32(prefixOff+int16(i))))
+		a.op(bpfMov64Imm(bpfReg2, 1))
+		a.op(bpfMov64Reg(bpfReg3, bpfReg8))
+		a.op(bpfAdd64Imm(bpfReg3, int32(i)))
+		a.op(bpfCall(bpfFuncProbeReadUser))
+		a.label(skip)
+	}
+
+	a.jmp(bpfJLT, bpfReg9, 2, "after_tls")
+	a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff))
+	a.op(bpfLdXMemB(bpfReg1, bpfReg10, prefixOff+1))
+	a.jmp(bpfJEQ, bpfReg0, 0x14, "tls_second")
+	a.jmp(bpfJEQ, bpfReg0, 0x15, "tls_second")
+	a.jmp(bpfJEQ, bpfReg0, 0x16, "tls_second")
+	a.jmp(bpfJEQ, bpfReg0, 0x17, "tls_second")
+	a.ja("after_tls")
+	a.label("tls_second")
+	a.jmp(bpfJNE, bpfReg1, 0x03, "after_tls")
+	a.ja("store_tls")
+	a.label("after_tls")
+
+	a.jmp(bpfJLT, bpfReg9, 4, "after_method")
+	a.op(bpfLdXMemW(bpfReg0, bpfReg10, prefixOff))
+	for _, word := range []int32{0x54534f50, 0x20544547, 0x20545550, 0x44414548, 0x454c4544, 0x43544150, 0x50545448} {
+		a.jmp(bpfJEQ, bpfReg0, word, "store_http")
+	}
+	a.label("after_method")
+
+	for pi, path := range plainHTTPPathLiterals {
+		for off := 0; off <= 64-len(path); off++ {
+			next := fmt.Sprintf("path_%d_%d", pi, off)
+			for bi := 0; bi < len(path); bi++ {
+				a.op(bpfLdXMemB(bpfReg0, bpfReg10, prefixOff+int16(off+bi)))
+				a.jmp(bpfJNE, bpfReg0, int32(path[bi]), next)
+			}
+			a.ja("store_http")
+			a.label(next)
+		}
+	}
+	a.ja("drop")
+
+	a.label("store_http")
+	a.op(bpfMov64Imm(bpfReg0, int32(plainFlowHTTP)))
+	a.op(bpfStXMemW(bpfReg10, bpfReg0, stateOff))
+	a.ops(bpfLoadMapFD(bpfReg1, plainFlowMapFD))
+	a.op(bpfMov64Reg(bpfReg2, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg2, int32(keyOff)))
+	a.op(bpfMov64Reg(bpfReg3, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg3, int32(stateOff)))
+	a.op(bpfMov64Imm(bpfReg4, 0))
+	a.op(bpfCall(bpfFuncMapUpdateElem))
+	a.label("emit")
+	a.op(bpfMov64Imm(bpfReg0, 1))
+	a.ja("done")
+
+	a.label("store_tls")
+	a.op(bpfMov64Imm(bpfReg0, int32(plainFlowTLSSkip)))
+	a.op(bpfStXMemW(bpfReg10, bpfReg0, stateOff))
+	a.ops(bpfLoadMapFD(bpfReg1, plainFlowMapFD))
+	a.op(bpfMov64Reg(bpfReg2, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg2, int32(keyOff)))
+	a.op(bpfMov64Reg(bpfReg3, bpfReg10))
+	a.op(bpfAdd64Imm(bpfReg3, int32(stateOff)))
+	a.op(bpfMov64Imm(bpfReg4, 0))
+	a.op(bpfCall(bpfFuncMapUpdateElem))
+	a.ja("drop")
+
+	a.label("drop")
+	a.op(bpfMov64Imm(bpfReg0, 0))
+	a.op(bpfJmpImm(bpfJA, 0, 0, -1))
+	a.label("done")
+	return a.done()
+}
+
+type bpfFix struct {
+	at    int
+	label string
+}
+
+type bpfAsm struct {
+	insns  []BPFInsn
+	labels map[string]int
+	fixes  []bpfFix
+}
+
+func newBPFAsm(insns []BPFInsn) *bpfAsm {
+	return &bpfAsm{insns: append([]BPFInsn(nil), insns...), labels: map[string]int{}}
+}
+
+func (a *bpfAsm) op(in BPFInsn) { a.insns = append(a.insns, in) }
+
+func (a *bpfAsm) ops(in []BPFInsn) { a.insns = append(a.insns, in...) }
+
+func (a *bpfAsm) label(name string) {
+	if _, ok := a.labels[name]; ok {
+		panic("duplicate bpf label " + name)
+	}
+	a.labels[name] = len(a.insns)
+}
+
+func (a *bpfAsm) jmp(op, dst uint8, imm int32, label string) {
+	a.fixes = append(a.fixes, bpfFix{at: len(a.insns), label: label})
+	a.op(bpfJmpImm(op, dst, imm, 0))
+}
+
+func (a *bpfAsm) ja(label string) {
+	a.fixes = append(a.fixes, bpfFix{at: len(a.insns), label: label})
+	a.op(bpfJump(0))
+}
+
+func (a *bpfAsm) done() []BPFInsn {
+	for _, fix := range a.fixes {
+		target, ok := a.labels[fix.label]
+		if !ok {
+			panic("missing bpf label " + fix.label)
+		}
+		off := target - (fix.at + 1)
+		if off < -32768 || off > 32767 {
+			panic(fmt.Sprintf("bpf jump to %s out of range: %d", fix.label, off))
+		}
+		a.insns[fix.at].Off = int16(off)
+	}
+	return a.insns
 }
 
 // BuildWriteProbeProgram constructs a verifier-safe eBPF program that reads (conn_tag, buf_ptr, len)
@@ -220,7 +448,7 @@ func appendSyscallHTTPFilter(insns []BPFInsn) []BPFInsn {
 //   - OpenSSL uprobe (SSL_write):        CArg0, CArg1, CArg2 (amd64: rdi/rsi/rdx 112/104/96; arm64: x0/x1/x2 0/8/16)
 //   - GoTLS uprobe (Conn.Write ABI):     GoArg0, GoArg1, GoArg2 (amd64: rax/rbx/rcx 80/40/88; arm64: r0/r1/r2 0/8/16)
 //   - Tracepoint sys_enter_write/sendto: SyscallArg0=16 (fd), SyscallArg1=24 (buf), SyscallArg2=32 (count)
-func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isSyscall bool) []BPFInsn {
+func BuildWriteProbeProgram(ringbufMapFD, plainFlowMapFD int, connOff, bufOff, lenOff int16, isSyscall bool) []BPFInsn {
 	dirImm := int32(0) // 0 = DirWrite (uprobe)
 	if isSyscall {
 		dirImm = 2 // 2 = DirWrite (syscall tracepoint)
@@ -255,7 +483,9 @@ func BuildWriteProbeProgram(ringbufMapFD int, connOff, bufOff, lenOff int16, isS
 	insns = append(insns, bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1))
 	insns = append(insns, bpfMov64Imm(bpfReg9, ebpfMaxPayload))
 	if isSyscall {
-		insns = appendSyscallHTTPFilter(insns)
+		insns = appendPlainSocketStateFilter(insns, plainFlowMapFD)
+		// The filter sets R0=1 only for frames that should reach the parser.
+		insns = append(insns, bpfJmpImm(bpfJEQ, bpfReg0, 0, -1))
 	}
 
 	// R0 = bpf_ringbuf_reserve(ringbufMapFD, ebpfEventSize, 0)
@@ -355,7 +585,7 @@ func BuildReadEnterProgram(activeReadMapFD int, connOff, bufOff, lenPtrOff int16
 }
 
 // BuildReadExitProgram looks up {conn_tag, buf_ptr, len_ptr} on uretprobe/sys_exit_read and emits received bytes to RingBuf.
-func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSyscall bool) []BPFInsn {
+func BuildReadExitProgram(ringbufMapFD, activeReadMapFD, plainFlowMapFD int, retOff int16, isSyscall bool) []BPFInsn {
 	dirImm := int32(1) // 1 = DirRead (uretprobe)
 	if isSyscall {
 		dirImm = 3 // 3 = DirRead (syscall tracepoint)
@@ -408,7 +638,8 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 		bpfMov64Imm(bpfReg9, ebpfMaxPayload),
 	)
 	if isSyscall {
-		insns = appendSyscallHTTPFilter(insns)
+		insns = appendPlainSocketStateFilter(insns, plainFlowMapFD)
+		insns = append(insns, bpfJmpImm(bpfJEQ, bpfReg0, 0, -1))
 	}
 	// Reserve ringbuf
 	insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
@@ -443,7 +674,7 @@ func BuildReadExitProgram(ringbufMapFD, activeReadMapFD int, retOff int16, isSys
 
 // BuildWritevProbeProgram constructs a verifier-safe eBPF tracepoint program for `syscalls/sys_enter_writev(fd, vec, vlen)`
 // that unrolls and captures up to 2 scatter-gather `struct iovec { void *base; size_t len; }` segments (e.g. HTTP Header + Body in Bun/uSockets).
-func BuildWritevProbeProgram(ringbufMapFD int, customOffsets ...ebpfPtRegsOffsets) []BPFInsn {
+func BuildWritevProbeProgram(ringbufMapFD, plainFlowMapFD int, customOffsets ...ebpfPtRegsOffsets) []BPFInsn {
 	off := archPtRegsOffsets
 	if len(customOffsets) > 0 {
 		off = customOffsets[0]
@@ -464,78 +695,162 @@ func BuildWritevProbeProgram(ringbufMapFD int, customOffsets ...ebpfPtRegsOffset
 		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
 		bpfLdXMemDW(bpfReg9, bpfReg6, off.SyscallArg2), // vlen
 		bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
-		// Zero-init 32 bytes on stack [fp-32 .. fp-1] for iov[0] and iov[1]
-		bpfStMemW(bpfReg10, -32, 0),
-		bpfStMemW(bpfReg10, -28, 0),
-		bpfStMemW(bpfReg10, -24, 0),
-		bpfStMemW(bpfReg10, -20, 0),
-		bpfStMemW(bpfReg10, -16, 0),
-		bpfStMemW(bpfReg10, -12, 0),
-		bpfStMemW(bpfReg10, -8, 0),
-		bpfStMemW(bpfReg10, -4, 0),
-		// bpf_probe_read_user(fp-32, 16, vec) -> iov[0]
-		bpfMov64Reg(bpfReg1, bpfReg10),
-		bpfAdd64Imm(bpfReg1, -32),
-		bpfMov64Imm(bpfReg2, 16),
-		bpfMov64Reg(bpfReg3, bpfReg8),
-		bpfCall(bpfFuncProbeReadUser),
-		// If vlen >= 2, bpf_probe_read_user(fp-16, 16, vec + 16) -> iov[1]
-		bpfJmpImm(bpfJLT, bpfReg9, 2, 6),
-		bpfMov64Reg(bpfReg1, bpfReg10),
-		bpfAdd64Imm(bpfReg1, -16),
-		bpfMov64Imm(bpfReg2, 16),
-		bpfMov64Reg(bpfReg3, bpfReg8),
-		bpfAdd64Imm(bpfReg3, 16),
-		bpfCall(bpfFuncProbeReadUser),
 	)
+	return appendWritevIOVs(insns, ringbufMapFD, plainFlowMapFD)
+}
 
-	// Emit iov[0] ([fp-32]=base0, [fp-24]=len0) and iov[1] ([fp-16]=base1, [fp-8]=len1)
-	for _, slot := range []struct {
-		baseOff int16
-		lenOff  int16
-	}{
-		{-32, -24},
-		{-16, -8},
-	} {
-		insns = append(insns,
-			bpfLdXMemDW(bpfReg8, bpfReg10, slot.baseOff),
-			bpfLdXMemDW(bpfReg9, bpfReg10, slot.lenOff),
-			bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
-			bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
-			bpfJmpImm(bpfJGT, bpfReg9, 0x0fffffff, -1),
-			bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1),
-			bpfMov64Imm(bpfReg9, ebpfMaxPayload),
-		)
-		insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
-		insns = append(insns,
-			bpfMov64Imm(bpfReg2, ebpfEventSize),
-			bpfMov64Imm(bpfReg3, 0),
-			bpfCall(bpfFuncRingbufReserve),
-			bpfJmpImm(bpfJEQ, bpfReg0, 0, -1),
-			bpfMov64Reg(bpfReg6, bpfReg0),
-			bpfCall(bpfFuncGetCurrentPidTgid),
-			bpfMov64Reg(bpfReg1, bpfReg0),
-			bpfRsh64Imm(bpfReg1, 32),
-			bpfStMemW(bpfReg6, 0, 0x4c4c4d54),
-			bpfStXMemW(bpfReg6, bpfReg1, 4),
-			bpfStXMemW(bpfReg6, bpfReg0, 8),
-			bpfStXMemW(bpfReg6, bpfReg7, 12),
-			bpfStMemW(bpfReg6, 16, 2), // dir = 2 (DirWrite syscall tracepoint)
-			bpfStXMemW(bpfReg6, bpfReg9, 20),
-			bpfMov64Reg(bpfReg1, bpfReg6),
-			bpfAdd64Imm(bpfReg1, 24),
-			bpfMov64Reg(bpfReg2, bpfReg9),
-			bpfMov64Reg(bpfReg3, bpfReg8),
-			bpfCall(bpfFuncProbeReadUser),
-			bpfMov64Reg(bpfReg1, bpfReg6),
-			bpfMov64Imm(bpfReg2, 0),
-			bpfCall(bpfFuncRingbufSubmit),
-		)
-	}
-
+func appendWritevIOVs(insns []BPFInsn, ringbufMapFD, plainFlowMapFD int) []BPFInsn {
 	insns = append(insns,
-		bpfMov64Imm(bpfReg0, 0),
-		bpfExit(),
+		bpfStMemW(bpfReg10, -32, 0), bpfStMemW(bpfReg10, -28, 0),
+		bpfStMemW(bpfReg10, -24, 0), bpfStMemW(bpfReg10, -20, 0),
+		bpfStMemW(bpfReg10, -16, 0), bpfStMemW(bpfReg10, -12, 0),
+		bpfStMemW(bpfReg10, -8, 0), bpfStMemW(bpfReg10, -4, 0),
+		bpfMov64Reg(bpfReg1, bpfReg10), bpfAdd64Imm(bpfReg1, -32),
+		bpfMov64Imm(bpfReg2, 16), bpfMov64Reg(bpfReg3, bpfReg8), bpfCall(bpfFuncProbeReadUser),
+		bpfJmpImm(bpfJLT, bpfReg9, 2, 6),
+		bpfMov64Reg(bpfReg1, bpfReg10), bpfAdd64Imm(bpfReg1, -16),
+		bpfMov64Imm(bpfReg2, 16), bpfMov64Reg(bpfReg3, bpfReg8), bpfAdd64Imm(bpfReg3, 16), bpfCall(bpfFuncProbeReadUser),
+		bpfLdXMemDW(bpfReg8, bpfReg10, -32), bpfLdXMemDW(bpfReg9, bpfReg10, -24),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1), bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
+		bpfJmpImm(bpfJGT, bpfReg9, 0x0fffffff, -1), bpfJmpImm(bpfJLE, bpfReg9, ebpfMaxPayload, 1),
+		bpfMov64Imm(bpfReg9, ebpfMaxPayload),
+	)
+	insns = appendPlainSocketStateFilter(insns, plainFlowMapFD)
+	insns = append(insns, bpfJmpImm(bpfJEQ, bpfReg0, 0, -1))
+	insns = appendEmitPlainWrite(insns, ringbufMapFD)
+
+	a := newBPFAsm(insns)
+	a.op(bpfLdXMemDW(bpfReg8, bpfReg10, -16))
+	a.op(bpfLdXMemDW(bpfReg9, bpfReg10, -8))
+	a.jmp(bpfJEQ, bpfReg8, 0, "skip_iov1")
+	a.jmp(bpfJSLE, bpfReg9, 0, "skip_iov1")
+	a.jmp(bpfJGT, bpfReg9, 0x0fffffff, "skip_iov1")
+	a.jmp(bpfJLE, bpfReg9, ebpfMaxPayload, "emit_iov1")
+	a.op(bpfMov64Imm(bpfReg9, ebpfMaxPayload))
+	a.label("emit_iov1")
+	for _, in := range appendEmitPlainWrite(nil, ringbufMapFD) {
+		a.op(in)
+	}
+	a.label("skip_iov1")
+	return patchExitJumps(append(a.done(), bpfMov64Imm(bpfReg0, 0), bpfExit()))
+}
+
+func appendEmitPlainWrite(insns []BPFInsn, ringbufMapFD int) []BPFInsn {
+	insns = append(insns, bpfLoadMapFD(bpfReg1, ringbufMapFD)...)
+	insns = append(insns,
+		bpfMov64Imm(bpfReg2, ebpfEventSize), bpfMov64Imm(bpfReg3, 0), bpfCall(bpfFuncRingbufReserve),
+		bpfJmpImm(bpfJEQ, bpfReg0, 0, -1), bpfMov64Reg(bpfReg6, bpfReg0), bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0), bpfRsh64Imm(bpfReg1, 32),
+		bpfStMemW(bpfReg6, 0, 0x4c4c4d54), bpfStXMemW(bpfReg6, bpfReg1, 4), bpfStXMemW(bpfReg6, bpfReg0, 8),
+		bpfStXMemW(bpfReg6, bpfReg7, 12), bpfStMemW(bpfReg6, 16, 2), bpfStXMemW(bpfReg6, bpfReg9, 20),
+		bpfMov64Reg(bpfReg1, bpfReg6), bpfAdd64Imm(bpfReg1, 24), bpfMov64Reg(bpfReg2, bpfReg9),
+		bpfMov64Reg(bpfReg3, bpfReg8), bpfCall(bpfFuncProbeReadUser),
+		bpfMov64Reg(bpfReg1, bpfReg6), bpfMov64Imm(bpfReg2, 0), bpfCall(bpfFuncRingbufSubmit),
+	)
+	return insns
+}
+
+// BuildRecvmsgEnterProgram records recvmsg's fd and iov[0] buffer for the matching exit probe.
+func BuildRecvmsgEnterProgram(activeReadMapFD int, off ebpfPtRegsOffsets) []BPFInsn {
+	selfPID := int32(os.Getpid())
+	var insns []BPFInsn
+	insns = append(insns,
+		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfLdXMemDW(bpfReg7, bpfReg6, off.SyscallArg0),
+		bpfJmpImm(bpfJSLE, bpfReg7, 2, -1),
+		bpfAnd64Imm(bpfReg7, 0xffff),
+		bpfOr64Imm(bpfReg7, -0x80000000),
+		bpfLdXMemDW(bpfReg8, bpfReg6, off.SyscallArg1),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+	)
+	for _, stackOff := range []int16{-96, -92, -88, -84, -80, -76, -72, -68, -64, -60, -56, -52} {
+		insns = append(insns, bpfStMemW(bpfReg10, stackOff, 0))
+	}
+	insns = append(insns,
+		bpfMov64Reg(bpfReg1, bpfReg10), bpfAdd64Imm(bpfReg1, -96),
+		bpfMov64Imm(bpfReg2, 32), bpfMov64Reg(bpfReg3, bpfReg8), bpfCall(bpfFuncProbeReadUser),
+		bpfLdXMemDW(bpfReg8, bpfReg10, -80),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+		bpfMov64Reg(bpfReg1, bpfReg10), bpfAdd64Imm(bpfReg1, -64),
+		bpfMov64Imm(bpfReg2, 16), bpfMov64Reg(bpfReg3, bpfReg8), bpfCall(bpfFuncProbeReadUser),
+		bpfLdXMemDW(bpfReg8, bpfReg10, -64),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+		bpfMov64Imm(bpfReg9, 0),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0), bpfRsh64Imm(bpfReg1, 32),
+		bpfJmpImm(bpfJEQ, bpfReg1, selfPID, -1),
+		bpfStXMemDW(bpfReg10, bpfReg0, -8),
+		bpfStXMemDW(bpfReg10, bpfReg7, -32),
+		bpfStXMemDW(bpfReg10, bpfReg8, -24),
+		bpfStXMemDW(bpfReg10, bpfReg9, -16),
+	)
+	insns = append(insns, bpfLoadMapFD(bpfReg1, activeReadMapFD)...)
+	insns = append(insns,
+		bpfMov64Reg(bpfReg2, bpfReg10), bpfAdd64Imm(bpfReg2, -8),
+		bpfMov64Reg(bpfReg3, bpfReg10), bpfAdd64Imm(bpfReg3, -32),
+		bpfMov64Imm(bpfReg4, 0), bpfCall(bpfFuncMapUpdateElem),
+		bpfMov64Imm(bpfReg0, 0), bpfExit(),
+	)
+	return patchExitJumps(insns)
+}
+
+// BuildSendmsgProbeProgram reads the first two iovecs from sendmsg's user_msghdr.
+// user_msghdr on LP64 is msg_name@0, msg_namelen@8, msg_iov@16, msg_iovlen@24.
+func BuildSendmsgProbeProgram(ringbufMapFD, plainFlowMapFD int, off ebpfPtRegsOffsets) []BPFInsn {
+	selfPID := int32(os.Getpid())
+	var insns []BPFInsn
+	insns = append(insns,
+		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfRsh64Imm(bpfReg0, 32),
+		bpfJmpImm(bpfJEQ, bpfReg0, selfPID, -1),
+		bpfLdXMemDW(bpfReg7, bpfReg6, off.SyscallArg0),
+		bpfJmpImm(bpfJSLE, bpfReg7, 2, -1),
+		bpfAnd64Imm(bpfReg7, 0xffff),
+		bpfOr64Imm(bpfReg7, -0x80000000),
+		bpfLdXMemDW(bpfReg8, bpfReg6, off.SyscallArg1),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+	)
+	for _, stackOff := range []int16{-96, -92, -88, -84, -80, -76, -72, -68} {
+		insns = append(insns, bpfStMemW(bpfReg10, stackOff, 0))
+	}
+	insns = append(insns,
+		bpfMov64Reg(bpfReg1, bpfReg10), bpfAdd64Imm(bpfReg1, -96),
+		bpfMov64Imm(bpfReg2, 32), bpfMov64Reg(bpfReg3, bpfReg8), bpfCall(bpfFuncProbeReadUser),
+		bpfLdXMemDW(bpfReg8, bpfReg10, -80),
+		bpfJmpImm(bpfJEQ, bpfReg8, 0, -1),
+		bpfLdXMemDW(bpfReg9, bpfReg10, -72),
+		bpfJmpImm(bpfJSLE, bpfReg9, 0, -1),
+	)
+	return appendWritevIOVs(insns, ringbufMapFD, plainFlowMapFD)
+}
+
+// BuildConnectResetProgram deletes plain_flow state when an fd is connected anew.
+// The key matches appendPlainSocketStateFilter: (tgid<<32)|tagged_fd.
+func BuildConnectResetProgram(plainFlowMapFD int, off ebpfPtRegsOffsets) []BPFInsn {
+	selfPID := int32(os.Getpid())
+	var insns []BPFInsn
+	insns = append(insns,
+		bpfMov64Reg(bpfReg6, bpfReg1),
+		bpfCall(bpfFuncGetCurrentPidTgid),
+		bpfMov64Reg(bpfReg1, bpfReg0),
+		bpfRsh64Imm(bpfReg1, 32),
+		bpfJmpImm(bpfJEQ, bpfReg1, selfPID, -1),
+		bpfLsh64Imm(bpfReg1, 32),
+		bpfLdXMemDW(bpfReg2, bpfReg6, off.SyscallArg0),
+		bpfJmpImm(bpfJSLE, bpfReg2, 2, -1),
+		bpfAnd64Imm(bpfReg2, 0xffff),
+		bpfOr64Imm(bpfReg2, -0x80000000),
+		bpfLsh64Imm(bpfReg2, 32),
+		bpfRsh64Imm(bpfReg2, 32),
+		bpfOr64Reg(bpfReg1, bpfReg2),
+		bpfStXMemDW(bpfReg10, bpfReg1, -8),
+	)
+	insns = append(insns, bpfLoadMapFD(bpfReg1, plainFlowMapFD)...)
+	insns = append(insns,
+		bpfMov64Reg(bpfReg2, bpfReg10), bpfAdd64Imm(bpfReg2, -8),
+		bpfCall(bpfFuncMapDeleteElem),
+		bpfMov64Imm(bpfReg0, 0), bpfExit(),
 	)
 	return patchExitJumps(insns)
 }
@@ -660,6 +975,14 @@ type bpfProgLoadAttr struct {
 	ProgName    [16]byte
 }
 
+func closeBPFFDs(fds ...int) {
+	for _, fd := range fds {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+	}
+}
+
 func bpfCreateMap(mapType, keySize, valueSize, maxEntries uint32) (int, error) {
 	attr := bpfMapCreateAttr{
 		MapType:    mapType,
@@ -705,6 +1028,7 @@ type EBPFEngine struct {
 	ringMapFD          int
 	activeSSLReadFD    int
 	activeSysReadFD    int
+	plainFlowFD        int
 	sslWriteProg       int
 	sslReadEnterProg   int
 	sslReadExEnterProg int
@@ -760,7 +1084,7 @@ func StartEBPFEngine(
 		sslReadMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 16384)
 	}
 	if err != nil {
-		_ = unix.Close(ringFD)
+		closeBPFFDs(ringFD)
 		return nil, fmt.Errorf("create active_ssl_read hash map: %w", err)
 	}
 	sysReadMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_LRU_HASH, 8, 24, 16384)
@@ -768,25 +1092,28 @@ func StartEBPFEngine(
 		sysReadMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 24, 16384)
 	}
 	if err != nil {
-		_ = unix.Close(ringFD)
-		_ = unix.Close(sslReadMapFD)
+		closeBPFFDs(ringFD, sslReadMapFD)
 		return nil, fmt.Errorf("create active_sys_read hash map: %w", err)
+	}
+	plainFlowMapFD, err := bpfCreateMap(unix.BPF_MAP_TYPE_LRU_HASH, 8, 4, 32768)
+	if err != nil {
+		plainFlowMapFD, err = bpfCreateMap(unix.BPF_MAP_TYPE_HASH, 8, 4, 32768)
+	}
+	if err != nil {
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD)
+		return nil, fmt.Errorf("create plain_flow hash map: %w", err)
 	}
 
 	pageSize := os.Getpagesize()
 	consMmap, err := unix.Mmap(ringFD, 0, pageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		_ = unix.Close(ringFD)
-		_ = unix.Close(sslReadMapFD)
-		_ = unix.Close(sysReadMapFD)
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD)
 		return nil, fmt.Errorf("mmap ringbuf consumer page: %w", err)
 	}
 	prodMmap, err := unix.Mmap(ringFD, int64(pageSize), pageSize+2*ringBytes, unix.PROT_READ, unix.MAP_SHARED)
 	if err != nil {
 		_ = unix.Munmap(consMmap)
-		_ = unix.Close(ringFD)
-		_ = unix.Close(sslReadMapFD)
-		_ = unix.Close(sysReadMapFD)
+		closeBPFFDs(ringFD, sslReadMapFD, sysReadMapFD, plainFlowMapFD)
 		return nil, fmt.Errorf("mmap ringbuf producer+data pages: %w", err)
 	}
 
@@ -794,6 +1121,7 @@ func StartEBPFEngine(
 		ringMapFD:          ringFD,
 		activeSSLReadFD:    sslReadMapFD,
 		activeSysReadFD:    sysReadMapFD,
+		plainFlowFD:        plainFlowMapFD,
 		sslWriteProg:       -1,
 		sslReadEnterProg:   -1,
 		sslReadExEnterProg: -1,
@@ -875,6 +1203,9 @@ func (e *EBPFEngine) Close() {
 		if e.activeSysReadFD >= 0 {
 			_ = unix.Close(e.activeSysReadFD)
 		}
+		if e.plainFlowFD >= 0 {
+			_ = unix.Close(e.plainFlowFD)
+		}
 	})
 }
 
@@ -889,7 +1220,7 @@ func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
 	}
 
 	sslWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_write",
-		BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false))
+		BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, archPtRegsOffsets.CArg0, archPtRegsOffsets.CArg1, archPtRegsOffsets.CArg2, false))
 	if err != nil {
 		return err
 	}
@@ -914,7 +1245,7 @@ func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
 
 	if archCapabilities.UretprobeSupported {
 		sslReadExitProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_ssl_r_ext",
-			BuildReadExitProgram(e.ringMapFD, e.activeSSLReadFD, archPtRegsOffsets.CRet, false))
+			BuildReadExitProgram(e.ringMapFD, e.activeSSLReadFD, e.plainFlowFD, archPtRegsOffsets.CRet, false))
 		if err != nil {
 			return err
 		}
@@ -928,7 +1259,7 @@ func (e *EBPFEngine) attachUprobeTargets(targets []ProbeTarget) error {
 
 	if archCapabilities.GoTLSUprobeSupported {
 		goTLSWriteProg, _, err := bpfLoadProgram(unix.BPF_PROG_TYPE_KPROBE, "llmt_gotls_w",
-			BuildWriteProbeProgram(e.ringMapFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false))
+			BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, archPtRegsOffsets.GoArg0, archPtRegsOffsets.GoArg1, archPtRegsOffsets.GoArg2, false))
 		if err == nil {
 			e.goTLSWriteProg = goTLSWriteProg
 			e.progFDs = append(e.progFDs, goTLSWriteProg)
@@ -1029,13 +1360,17 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 		insns    []BPFInsn
 		required bool
 	}{
-		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), true},
-		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), false},
-		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD, tpOffsets), false},
+		{"syscalls/sys_enter_write", "llmt_tp_write", BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), true},
+		{"syscalls/sys_enter_sendto", "llmt_tp_sendto", BuildWriteProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, tpOffsets.SyscallArg2, true), false},
+		{"syscalls/sys_enter_writev", "llmt_tp_writev", BuildWritevProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets), false},
 		{"syscalls/sys_enter_read", "llmt_tp_r_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), true},
 		{"syscalls/sys_enter_recvfrom", "llmt_tp_rf_ent", BuildReadEnterProgram(e.activeSysReadFD, tpOffsets.SyscallArg0, tpOffsets.SyscallArg1, 0, true), false},
-		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, tpOffsets.SyscallRet, true), true},
-		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, tpOffsets.SyscallRet, true), false},
+		{"syscalls/sys_exit_read", "llmt_tp_r_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, e.plainFlowFD, tpOffsets.SyscallRet, true), true},
+		{"syscalls/sys_exit_recvfrom", "llmt_tp_rf_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, e.plainFlowFD, tpOffsets.SyscallRet, true), false},
+		{"syscalls/sys_enter_sendmsg", "llmt_tp_sendmsg", BuildSendmsgProbeProgram(e.ringMapFD, e.plainFlowFD, tpOffsets), false},
+		{"syscalls/sys_enter_recvmsg", "llmt_tp_rm_ent", BuildRecvmsgEnterProgram(e.activeSysReadFD, tpOffsets), false},
+		{"syscalls/sys_exit_recvmsg", "llmt_tp_rm_ext", BuildReadExitProgram(e.ringMapFD, e.activeSysReadFD, e.plainFlowFD, tpOffsets.SyscallRet, true), false},
+		{"syscalls/sys_enter_connect", "llmt_tp_connect", BuildConnectResetProgram(e.plainFlowFD, tpOffsets), false},
 	}
 
 	for _, sp := range specs {
@@ -1044,6 +1379,11 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 			if sp.required {
 				return err
 			}
+			if e.mon != nil {
+				e.mon.RecordWarn(selfmon.StageProbe, "ebpf_tracepoint_load", err.Error(), map[string]any{
+					"tracepoint": sp.tpName,
+				})
+			}
 			continue
 		}
 		e.progFDs = append(e.progFDs, progFD)
@@ -1051,6 +1391,10 @@ func (e *EBPFEngine) attachSyscallTracepoints() error {
 			e.perfFDs = append(e.perfFDs, pfds...)
 			e.tracepointCount++
 			e.attachedCount++
+		} else if e.mon != nil {
+			e.mon.RecordWarn(selfmon.StageProbe, "ebpf_tracepoint_attach", err.Error(), map[string]any{
+				"tracepoint": sp.tpName,
+			})
 		}
 	}
 	return nil

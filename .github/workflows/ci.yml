@@ -83,16 +83,16 @@ jobs:
       - name: Run race detector on the full module
         run: go test -race -count=1 ./...
 
-      - name: Run Real Kernel eBPF (11 Programs, 19 Hooks, 15 Scenarios) & All Runtime Compatibility Scenarios (Root)
+      - name: Run Real Kernel eBPF (Plain HTTP Tracepoints, 16 Scenarios) & All Runtime Compatibility Scenarios (Root)
         run: |
           GO_BIN="$(which go)"
           set -o pipefail
           sudo -E env "PATH=$PATH" "$GO_BIN" test -v -count=1 ./internal/collector \
             -run 'TestEBPFBytecodeBuilderAndJumpBounds|TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot|TestCompatibilityMatrixAllRuntimeScenarios|TestCrossPlatform|TestPolyglotLanguagesCapture|TestAgentFrameworksAndAgentCLIsScenarios' \
-            2>&1 | tee /tmp/ebpf-15-scenarios.log
-          if grep -q -- '--- SKIP' /tmp/ebpf-15-scenarios.log; then
-            echo "::error::Root eBPF 15 场景及运行时兼容矩阵存在被跳过的子场景，root 环境下不允许 SKIP:"
-            grep -- '--- SKIP' /tmp/ebpf-15-scenarios.log
+            2>&1 | tee /tmp/ebpf-root-scenarios.log
+          if grep -q -- '--- SKIP' /tmp/ebpf-root-scenarios.log; then
+            echo "::error::Root eBPF 场景及运行时兼容矩阵存在被跳过的子场景，root 环境下不允许 SKIP:"
+            grep -- '--- SKIP' /tmp/ebpf-root-scenarios.log
             exit 1
           fi
 

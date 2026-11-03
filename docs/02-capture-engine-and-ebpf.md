@@ -8,7 +8,7 @@
 
 | 典型客户端 / 运行时 | 二进制链接特征 | TLS / 网络栈实现 | 单一 `eCapture` 默认表现 | 传统 `LD_PRELOAD` (`SSL_*` + `send/recv`) 表现 | `llm-tracer` 覆盖方案 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `curl`、系统 `python3` | 动态链接 `libc.so.6` + `libssl.so.3` | 系统 OpenSSL 3 (`SSL_write`/`SSL_read`) | 需 Root 抓 HTTPS；**明文 HTTP 漏抓** | 可抓 HTTPS；若用 `write`/`read` 发 HTTP 则漏抓 | Layer 0 (eBPF Uprobe + Tracepoint) / Layer 1+2 (`LD_PRELOAD`) |
+| `curl`、系统 `python3` | 动态链接 `libc.so.6` + `libssl.so.3` | 系统 OpenSSL 3 (`SSL_write`/`SSL_read`) | 需 Root 抓 HTTPS；明文 HTTP 走 syscall tracepoint | 可抓 HTTPS；明文 HTTP 依赖 `write`/`read` 等 Hook，覆盖面弱于内核 tracepoint | Layer 0 (eBPF Uprobe + Tracepoint) / Layer 1+2 (`LD_PRELOAD`) |
 | **Claude Code (`claude.exe`)** | Bun 单文件 ELF，动态链接 `libc.so.6` | **静态内嵌 BoringSSL（符号已 strip）** + `uSockets/libuv` (`writev`) | **完全失效**：无 `libssl.so` 依赖且符号已 strip | `SSL_write` 不触发；未拦 `writev` 则漏抓 | Layer 0 (`sys_enter_writev`) + Layer 2 (`writev` 展平) + Layer 4 (`BUN_OPTIONS`) |
 | **Hermes / `uv` 独立版 Python** | `python-build-standalone` | **静态内嵌 OpenSSL（局部符号 `t`）** + `asyncio` `ssl.MemoryBIO` | **默认失效**：`MemoryBIO` 下 `SSL_get_fd(ssl) == -1` | **HTTPS 失效**：`SSL_write` 为模块内部局部调用 | Layer 0 (`_ssl_MemoryBIO_*` Uprobe) + Layer 3 (`sitecustomize.py`) |
 | **Node.js (v20 ~ v24+)** | 动态链接 `libc.so.6` | **静态内嵌 OpenSSL 3** + `undici`/`TLSSocket` | **默认失效**：不经过系统 `libssl.so` | **HTTPS 失效**：内部静态调用 `SSL_write` | Layer 0 (静态 OpenSSL Uprobe) + Layer 4 (`--require node_hook.cjs` / `SIGUSR1`) |
@@ -24,17 +24,20 @@
 ### Layer 0：Linux 原生 eBPF 引擎 (`internal/collector/ebpf_engine_linux.go`)
 
 1. **纯 Go 原生 BPF 指令集构造**：
-   - 无需外部 `clang`/`llvm`/内核头文件，直接在 Go 中按目标架构寄存器约定（`internal/collector/ebpf_arch_amd64.go` / `internal/collector/ebpf_arch_arm64.go`）通过指令构造器（`BuildWriteProbeProgram`、`BuildReadEnterProgram`、`BuildReadExitProgram`、`BuildWritevProbeProgram`、`BuildGoTLSReadEnterProgram`、`BuildGoTLSReadExitProgram`）构建 eBPF 字节码程序（内核加载名含 `llmt_ssl_write`、`llmt_ssl_r_ent`、`llmt_ssl_rx_en`、`llmt_ssl_r_ext`、`llmt_gotls_w`、`llmt_gotls_re`、`llmt_gotls_rx`、`llmt_tp_write`、`llmt_tp_sendto`、`llmt_tp_writev`、`llmt_tp_r_ent`、`llmt_tp_rf_ent`、`llmt_tp_r_ext`、`llmt_tp_rf_ext`），并通过 `unix.SYS_BPF` (`BPF_PROG_LOAD`) 注入内核。
-   - 共挂载 **19 个内核探针**：
+   - 无需外部 `clang`/`llvm`/内核头文件，直接在 Go 中按目标架构寄存器约定（`internal/collector/ebpf_arch_amd64.go` / `internal/collector/ebpf_arch_arm64.go`）通过指令构造器（`BuildWriteProbeProgram`、`BuildReadEnterProgram`、`BuildReadExitProgram`、`BuildWritevProbeProgram`、`BuildSendmsgProbeProgram`、`BuildConnectResetProgram`、`BuildGoTLSReadEnterProgram`、`BuildGoTLSReadExitProgram`）构建 eBPF 字节码程序（内核加载名含 `llmt_ssl_write`、`llmt_ssl_r_ent`、`llmt_ssl_rx_en`、`llmt_ssl_r_ext`、`llmt_gotls_w`、`llmt_gotls_re`、`llmt_gotls_rx`、`llmt_tp_write`、`llmt_tp_sendto`、`llmt_tp_writev`、`llmt_tp_sendmsg`、`llmt_tp_r_ent`、`llmt_tp_rf_ent`、`llmt_tp_r_ext`、`llmt_tp_rf_ext`、`llmt_tp_connect`），并通过 `unix.SYS_BPF` (`BPF_PROG_LOAD`) 注入内核。
+   - 共挂载 **多组内核探针**：
      - OpenSSL Uprobes/Uretprobes：`SSL_write`、`SSL_write_ex`、`SSL_read` (entry + ret)、`SSL_read_ex` (entry + ret + `size_t *readbytes` 二次解引用)；
      - Python MemoryBIO Uprobes：`_ssl_MemoryBIO_write`、`_ssl_MemoryBIO_read`；
      - GoTLS Uprobes（含 OBI 风格三级符号恢复与 ABI 门禁）：校验目标二进制 `buildinfo.GoVersion`（`amd64 >= go1.17`、`arm64 >= go1.18` 才启用寄存器 ABI），通过 `.symtab` + DWARF `.debug_info` + `.gopclntab` 三级通道解析 `crypto/tls.(*Conn).Write` 与 `crypto/tls.(*Conn).Read`，并支持大栈帧序言（`sub %rsp; mov %rbp, off(%rsp)` / ARM64 `STP X29, X30`）与多种尾声（`add %rsp; pop %rbp; ret`、`pop %rbp; add %rsp; ret`、`leave; ret`、无帧指针 `add %rsp; ret`）的偏移扫描；
-     - Syscall Tracepoints：`sys_enter_write`、`sys_enter_writev`（内核态展开 `iov[0..1]`）、`sys_enter_sendto`、`sys_enter_read`、`sys_exit_read`、`sys_enter_recvfrom`、`sys_exit_recvfrom`（启动时通过 `ResolveSyscallTracepointOffsets` 自动读取 `/sys/kernel/tracing/events/syscalls/*/format` 动态解析内核字段偏移，无权限时回退架构默认值）。
-2. **三 Map 隔离架构与 16 MiB RingBuf (`internal/collector/ebpf_engine_linux.go` `StartEBPFEngine`)**：
+     - Syscall Tracepoints：`sys_enter_write`、`sys_enter_writev`（内核态展开 `iov[0..1]`）、`sys_enter_sendto`、`sys_enter_read`、`sys_exit_read`、`sys_enter_recvfrom`、`sys_exit_recvfrom`（启动时通过 `ResolveSyscallTracepointOffsets` 自动读取 `/sys/kernel/tracing/events/syscalls/*/format` 动态解析内核字段偏移，无权限时回退架构默认值）；`sys_enter_sendmsg` 从 `user_msghdr` 读取前两个 iovec，`recvmsg` enter/exit 记录 `iov[0]` 并按实际返回长度发射，`sys_enter_connect` 仅重置 `plain_flow` 状态。`sendmsg` / `recvmsg` / `connect` 为非必需探针，加载或 attach 失败只记录 warning，不影响引擎启动。
+   - **明文 HTTP/1.1 走 syscall tracepoint，而不是 `kprobe`/`fentry` `tcp_sendmsg`**：Ollama、vLLM、llama.cpp、内网网关这类 `http://` 直连不进入 `crypto/tls` 或 `SSL_write`，因此在套接字系统调用层捕获；HTTPS 仍保留 OpenSSL/GoTLS uprobe，不替换、不重复解析。同一 `pid+fd` 一旦在前两字节看到 TLS record（`0x14/0x15/0x16/0x17` 且第二字节 `0x03`），`plain_flow` 标记为 TLS 后直接丢弃后续密文分片；请求行/状态行或前 64 字节包含目标 LLM 路径时标记为 HTTP，同一 `pid+fd` 后续拆包 body、SSE 分片继续发送到重组器。未知且不像 HTTP/TLS 的流量不会进入 RingBuf。
+2. **四 Map 隔离架构与 16 MiB RingBuf (`internal/collector/ebpf_engine_linux.go` `StartEBPFEngine`)**：
    - `ringbuf` (`BPF_MAP_TYPE_RINGBUF`, **`16 MiB` = `16 << 20` 字节**)：采用双倍虚拟内存镜像 `mmap` 零拷贝消费，避免高并发 SSE 流式输出或大上下文 Prompt 突发写入导致 RingBuf 丢包；单次提交帧载荷上限 `ebpfMaxPayload = 4072` 字节，连同 24 字节头共 `ebpfEventSize = 4096` 字节对齐；
    - `active_ssl_read` (`BPF_MAP_TYPE_LRU_HASH`, `maxEntries = 16384`, Key `8B`, Value `24B`)：供 OpenSSL `SSL_read` / `SSL_read_ex`（以 `pid_tgid` 为 Key）与 GoTLS `crypto/tls.(*Conn).Read`（以 `(pid<<32)|uint32(g)` 为 Key）保存读缓冲区指针 `(conn_tag, buf_ptr, len_ptr)`；LRU 自动淘汰异常未闭合条目，彻底消除 Map 泄漏；
    - `active_sys_read` (`BPF_MAP_TYPE_LRU_HASH`, `maxEntries = 16384`, Key `8B`, Value `24B`)：专供 `sys_enter_read` / `sys_enter_recvfrom` 使用，与 `active_ssl_read` 物理隔离，防止 `SSL_read` 内部触发系统调用 `read` 密文时覆盖外层 TLS 明文缓冲区指针。
-3. **多核 CPU `perf_event_open` 保活机制**：
+   - `plain_flow` (`BPF_MAP_TYPE_LRU_HASH`, 失败回退 `HASH`, `maxEntries = 32768`, Key `8B = (tgid<<32)|tagged_fd`，`tagged_fd = 0x80000000|fd`，与事件里的 conn tag 以及 `connect` 重置使用同一把钥匙, Value `4B`)：共享给写路径与读路径，保存 `0=unknown / 1=plain HTTP / 2=TLS skip` 状态；`sys_enter_connect` 删除旧状态以避免 fd 复用。
+3. **明文 HTTP 边界**：`plain_flow` 状态机覆盖 `write`、`sendto`、`writev`、`sendmsg`、`read`、`recvfrom`、`recvmsg`。`writev` 与 `sendmsg` 用 `iov[0]` 分类，只有 HTTP（或该 fd 已是 HTTP）才发射 `iov[0]` 和 `iov[1]`，TLS 则两者都丢弃；`sendmsg` 的 iovec 从 `user_msghdr.msg_iov` 读取，而不是误把 syscall 第二参数当作 iovec。`sendfile`、`io_uring`、明文 HTTP/2 h2c 不支持。
+4. **多核 CPU `perf_event_open` 保活机制**：
    - 对每个在线 CPU 核心打开 `perf_event_open` 并执行 `PERF_EVENT_IOC_ENABLE`；当 CPU `1..N` 调用 `PERF_EVENT_IOC_SET_BPF` 返回 `EEXIST`（同一 `tracepoint` `tp_event` 已在 CPU 0 绑定 BPF 程序）时，保持 CPU `1..N` 的 `perf_event` FD 开启且处于 `ENABLED` 状态，确保进程跨核调度时 100% 捕获事件。
 
 ### Layer 1 & Layer 2：C 预加载 Hook (`internal/collector/preload_hook.go` & `assets/c/ssl_hook.c`)
@@ -133,9 +136,9 @@
 | **Scenario 5** | **Node.js `tls.TLSSocket` + `gzip` 压缩 JSON 响应** | 验证 `node_hook.cjs` 拦截 Node.js 内部静态 OpenSSL 的 TLS 明文并自动解压 `Content-Encoding: gzip` |
 | **Scenario 6** | **HTTP/2 (h2) 多路复用并发流 + HPACK 头部压缩 (`--record-headers`)** | 验证单条连接上交错的 `HEADERS`/`DATA` 帧按 `StreamID` 独立重组，且敏感 `Authorization` 头自动掩码为 `Bearer sk-***...` |
 
-### 2. Root 内核态 eBPF 15 场景全矩阵 (`internal/collector/ebpf_engine_test.go`)
+### 2. Root 内核态 eBPF 16 场景全矩阵 (`internal/collector/ebpf_engine_test.go`)
 
-在具备 Root / `CAP_BPF` 权限的 Linux 环境下，`TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot` 真实加载 11 个 eBPF 程序、挂载 19 个内核探针并执行 15 个子场景端到端验证（CI 通过 `tee` 保存日志并执行 `grep -q -- '--- SKIP'` 零跳过门禁断言）：
+在具备 Root / `CAP_BPF` 权限的 Linux 环境下，`TestRealKernelEBPFVerifierAndRingBufCaptureWhenRoot` 真实加载全部内置 eBPF 程序、挂载必需与非必需内核探针并执行多个子场景端到端验证（CI 通过 `tee` 保存日志并执行 `grep -q -- '--- SKIP'` 零跳过门禁断言）：
 1. `EBPF_Scenario1_DynamicLibSSL_TLS13_MultiTurn_And_SSE`（动态 `libssl.so.3` TLS 1.3 多轮对话与 SSE 捕获）
 2. `EBPF_Scenario2_PythonMemoryBIO_NoSocketFD_SystemOneJEV`（Python `_ssl` 模块 `_ssl_MemoryBIO_write/read` 无 FD 捕获 `systemone` JEV）
 3. `EBPF_Scenario3_StaticLocalOpenSSLSymbols_InExecutable`（静态内嵌 OpenSSL 局部符号 `.symtab` Uprobe 捕获）
@@ -151,6 +154,7 @@
 13. `EBPF_Scenario13_ScopeFilters_Exe_Cwd_Cmd_And_HostFilter`（`--exe`、`--cwd`、`--cmd`、`--host` 组合范围过滤验证）
 14. `EBPF_Scenario14_ConcurrentMultiProcess_ParallelTLSStreams_And_Correlation`（多进程高并发 TLS 流采集与三级会话串联验证）
 15. `EBPF_Scenario15_LaunchCommand_SubprocessTree_And_SelfMonitoringAudit`（`LaunchPlannedCommand` 子进程树拉起与 `selfmon` 全链路审计验证）
+16. `EBPF_Scenario16_PlainHTTPSplitWrite`（明文 HTTP/1.1 经 `send`/`recv` syscall tracepoint 捕获，两次 `sendall` 拆包后重组）
 
 ---
 

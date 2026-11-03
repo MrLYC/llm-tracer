@@ -45,6 +45,15 @@ field:size_t vlen;	offset:32;	size:8;	signed:0;
 			want: map[string]int16{"__syscall_nr": 8, "fd": 16, "vec": 24, "vlen": 32},
 		},
 		{
+			name: "sys_enter_sendmsg",
+			content: `field:long __syscall_nr;	offset:8;	size:8;	signed:1;
+field:unsigned int fd;	offset:16;	size:8;	signed:0;
+field:struct user_msghdr * msg;	offset:24;	size:8;	signed:0;
+field:unsigned int flags;	offset:32;	size:8;	signed:0;
+`,
+			want: map[string]int16{"__syscall_nr": 8, "fd": 16, "msg": 24, "flags": 32},
+		},
+		{
 			name: "sys_exit_read",
 			content: `field:long __syscall_nr;	offset:8;	size:8;	signed:1;
 field:long ret;	offset:16;	size:8;	signed:1;

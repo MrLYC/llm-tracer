@@ -97,7 +97,7 @@
 | **`pipeSource`** | `internal/collector/source_pipe.go` | `"pipe"` | 创建 `<cache_dir>/hooks/tls.bin`（权限 `0600`），后台运行 `tailLoop` 持续读取 24 字节 `LLMT` 帧并调用 `RecordUserHookPID(pid)`；读到 EOF 即 `Truncate(0)` 清空，强制 `defaultMaxPipeFileSize = 64 KiB` 硬上限，遇损帧通过 `findNextValidLLMTFrame` 重同步（`pipe_frame_resync`），`Stop()` 时通过 `O_NOFOLLOW` 截断并删除文件。 |
 | **`unixSockSource`** | `internal/collector/source_unixsock.go` | `"unixsock"` | 创建 `<cache_dir>/hooks/tls.sock` Unix 域流式套接字（当路径 `> 80` 字节超出 `sockaddr_un.sun_path` 安全阈值时，自动回退至 `/tmp/llmt-<pid>-<seq>.sock` 并在 `Stop()` 时清理），并发接收各语言 Hook 发来的 `LLMT` 帧。 |
 | **`tapSource`** | `internal/collector/source_tap.go` | `"loopback_tap"` | 封装 `LoopbackTap` 本地动态 ECDSA P-256 CA MITM 代理（`127.0.0.1:<random_port>`），将解密后的明文双向流直接回调送入 `StreamReassembler.IngestChunk`。 |
-| **`ebpfSource`** | `internal/collector/source_ebpf.go` | `"ebpf"` | 封装 Linux 内核态 `ebpfEngine`（`amd64` / `arm64`），管理 `BPF_PROG_LOAD`、19 个探针挂载与 `16 MiB` RingBuf 零拷贝读取协程。 |
+| **`ebpfSource`** | `internal/collector/source_ebpf.go` | `"ebpf"` | 封装 Linux 内核态 `ebpfEngine`（`amd64` / `arm64`），管理 `BPF_PROG_LOAD`、HTTPS uprobe 与明文 HTTP/1.1 syscall tracepoint 挂载，以及 `16 MiB` RingBuf 零拷贝读取协程。 |
 
 ### 2. D1 安全红线：`<cache_dir>/hooks/tls.bin` 完整生命周期、原子写帧与跨 UID 边界
 

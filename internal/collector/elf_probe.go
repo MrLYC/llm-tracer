@@ -68,6 +68,7 @@ type ebpfPtRegsOffsets struct {
 	SyscallArg0 int16
 	SyscallArg1 int16
 	SyscallArg2 int16
+	SyscallArg3 int16
 	SyscallRet  int16
 }
 
@@ -119,6 +120,7 @@ var amd64PtRegsOffsets = ebpfPtRegsOffsets{
 	SyscallArg0: 16,
 	SyscallArg1: 24,
 	SyscallArg2: 32,
+	SyscallArg3: 40,
 	SyscallRet:  16,
 }
 
@@ -147,6 +149,7 @@ var arm64PtRegsOffsets = ebpfPtRegsOffsets{
 	SyscallArg0: 16,
 	SyscallArg1: 24,
 	SyscallArg2: 32,
+	SyscallArg3: 40,
 	SyscallRet:  16,
 }
 
